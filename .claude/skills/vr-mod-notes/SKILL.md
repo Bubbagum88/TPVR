@@ -15217,3 +15217,20 @@ build/portable (APPIMAGE_EXTRACT_AND_RUN=1, libvulkan left to the host).
 Blocked on `sudo pacman -S podman`. Baseline = glibc 2.39/GLIBCXX_3.4.32
 (SteamOS 3.x, Ubuntu 24.04+, Mint 22+, Fedora 40+, Arch); Ubuntu 22.04 /
 Debian 12 not covered (upstream's own baseline).
+
+**UPDATE same day — portable x86_64 AppImage BUILT**:
+`build/portable/Dusklight_VR_(TPVR)-linux-vr-9b296d8d15-x86_64.AppImage`,
+needs GLIBC_2.39 / GLIBCXX_3.4.32, no libopenxr dependency; smoke-tested on
+CachyOS (starts, Vulkan, static loader correctly reports "no active runtime"
+with WiVRn closed). VR from this AppImage not yet tested in-headset. Script
+fixes needed in the container: podman `--network=host` (rootless pasta
+needs /dev/net/tun, not loaded here), `libxxf86vm-dev` (OpenXR SDK's
+openxr-gfxwrapper), `python3-jinja2` (SDK's vendored jinja2 breaks on
+markupsafe 2.1), dropped `CMAKE_LINKER_TYPE` (CMake 3.28 ignores it). Real
+code fix: `extern/aurora/cmake/aurora_gx.cmake` links `atomic` on Linux —
+std::atomic<WorkerFrameStats> is not lock-free and GCC 13 needs libatomic
+(GCC 16 on CachyOS didn't). Incident: GitHub Desktop switched
+extern/aurora to the fork's `main` (a different, non-VR branch) and
+conflicted gpu.cpp; restored by switching to a local `aurora-vr` branch
+tracking origin/aurora-vr and popping GitHub Desktop's stash. Uncommitted
+aurora changes now: gpu.cpp + cmake/aurora_gx.cmake.
