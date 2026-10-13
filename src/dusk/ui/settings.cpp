@@ -938,11 +938,30 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         auto& leftPane = add_child<Pane>(content, Pane::Type::Controlled);
         auto& rightPane = add_child<Pane>(content, Pane::Type::Uncontrolled);
 
+        leftPane.add_section("Display");
+        config_bool_select(leftPane, rightPane, getSettings().game.vrScreenMode,
+            {
+                .key = "Giant Screen Mode",
+                .helpText = "Shows flat-camera gameplay on a large 16:9 screen about 5.3 m wide and 4.5 m away. "
+                            "The screen follows your head; the room stays black. Switches live."
+            });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrScreenModeStereo,
+            {
+                .key = "Stereoscopic 3D Screen",
+                .helpText = "When Giant Screen Mode is active, renders stereoscopic 3D onto the virtual display "
+                            "with depth converging on Link (like GalaxyQuest / 3D cinema). Turn off for 2D flat display.",
+                .isDisabled = [] { return !dusk::getSettings().game.vrScreenMode.getValue(); }
+            });
+        config_percent_select(leftPane, rightPane, getSettings().game.vrScreenModeDepth,
+            "3D Screen Depth",
+            "Amount of 3D depth on the virtual screen (50% .. 200%). Higher values make background scenery "
+            "recede farther into the screen and Link pop out toward you.",
+            20, 200, 10,
+            [] { return !dusk::getSettings().game.vrScreenMode.getValue() || !dusk::getSettings().game.vrScreenModeStereo.getValue(); });
 #if !VR_SETTINGS_STANDALONE
         // Standalone (Quest) has no desktop window to mirror to. The setting itself stays
         // registered and defaults ON there -- the mirror path also drives the Dusklight overlay's
         // scaling -- it's just not user-facing.
-        leftPane.add_section("Display");
         config_bool_select(leftPane, rightPane, getSettings().game.vrDesktopMirror,
             {
                 .key = "VR Desktop Mirror",
@@ -1172,6 +1191,23 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             "more GPU headroom on the standalone headset -- 90% cuts the pixel count "
             "by a fifth. Takes effect the next time the game starts.",
             50, 100, 5);
+#if VR_SETTINGS_STANDALONE
+        config_bool_select(leftPane, rightPane, getSettings().game.vrHighClocks,
+            {
+                .key = "High Clocks",
+                .helpText = "Asks the headset to run its CPU and GPU at a higher sustained speed, "
+                            "at the cost of more heat and battery. Off lets the headset choose. "
+                            "Takes effect the next time the game starts. On by default."
+            });
+        config_int_select(leftPane, rightPane, getSettings().game.vrDisplayRefreshRate,
+            "VR Refresh Rate",
+            "The headset's display refresh rate. The headset uses the highest rate it "
+            "supports at or below this value (72, 80 or 90 Hz; 120 Hz only if it is enabled "
+            "in the headset's own display settings). Higher rates look smoother but every "
+            "frame must render faster; if the game can't keep up the picture judders, so "
+            "only raise it if your area runs steadily. Applies immediately.",
+            72, 120, 2, {}, {}, " Hz");
+#endif
 
 #if !VR_SETTINGS_STANDALONE
         // Standalone renders through the native Quest runtime -- no SteamVR / Virtual Desktop /

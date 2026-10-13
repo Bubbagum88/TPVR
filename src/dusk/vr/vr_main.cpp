@@ -30,6 +30,7 @@
 #include "m_Do/m_Do_graphic.h"                  // mDoGph_gInf_c::captureHudBillboard
 #include "f_pc/f_pc_manager.h"                  // fpcM_DrawIterater, fpcM_Draw
 #include "dusk/game_clock.h"                    // dusk::game_clock::FrameTiming
+#include "dusk/interp/material.h" // replay_models_for_current_view()
 #include "dusk/settings.h"                      // dusk::getSettings().game.vrDesktopMirror
 #include "dusk/logging.h"                       // DuskLog
 #include <aurora/lib/thread.hpp>                // aurora::thread::native_thread_id_for -- Quest thread hints
@@ -87,12 +88,20 @@ extern "C" uint32_t g_duskVRCurrentEyeIndex = 0;
 // actual open eye pass -- g_duskVRRenderingToHeadset can't distinguish those
 // two cases, only this can.
 extern "C" bool g_duskVREyePassOpen = false;
+extern "C" bool g_duskVRScreenModePassOpen = false;
 
 // Per-eye image size actually rendered/submitted this session: the runtime's
 // recommended size scaled by game.vrRenderScale (see startup()). Every
 // per-frame size in tick()/submitFrame() derives from these two.
 static uint32_t g_eyeImageWidth = 0;
 static uint32_t g_eyeImageHeight = 0;
+
+// XR_FB_display_refresh_rate entry points, copied from the Bootstrap in
+// startup() (nullptr when the runtime doesn't advertise the extension), and
+// the game.vrDisplayRefreshRate value last applied (-1 = not yet).
+static PFN_xrEnumerateDisplayRefreshRatesFB g_enumerateDisplayRefreshRates = nullptr;
+static PFN_xrRequestDisplayRefreshRateFB g_requestDisplayRefreshRate = nullptr;
+static int g_appliedDisplayRefreshRateSetting = -1;
 
 namespace dusk::vr {
 
@@ -368,6 +377,7 @@ XrAction g_menuClickAction = XR_NULL_HANDLE;
 // PAD_BUTTON_START in tick() below -- see vr_xr_bootstrap.hpp's
 // HandActions::stickClickAction.
 XrAction g_stickClickAction = XR_NULL_HANDLE;
+XrAction g_hapticAction = XR_NULL_HANDLE;
 XrPath g_leftHandPath = XR_NULL_PATH;
 XrPath g_rightHandPath = XR_NULL_PATH;
 
@@ -461,8 +471,20 @@ bool isRenderingToHeadset() {
     return g_renderedToHeadsetThisFrame;
 }
 
+bool isVrScreenMode() {
+    return isRenderingToHeadset() && dusk::getSettings().game.vrScreenMode.getValue();
+}
+
+bool isImmersiveVr() {
+    return isRenderingToHeadset() && !isVrScreenMode();
+}
+
 bool isEyePassOpen() {
     return g_duskVREyePassOpen;
+}
+
+bool isProtectedVrPassOpen() {
+    return g_duskVREyePassOpen || g_duskVRScreenModePassOpen;
 }
 
 void getEyeSymmetricFov(float* fovyDeg, float* aspect) {
@@ -629,7 +651,7 @@ float* getVrListenerPosPtr() {
 }
 
 bool getVrAudioListener(float (*outViewMtx)[4], float outEye[3], float outCenter[3]) {
-    if (!g_vrAudioValid || !isRenderingToHeadset()) {
+    if (!g_vrAudioValid || !isImmersiveVr()) {
         return false;
     }
     std::memcpy(outViewMtx, g_vrAudioViewMtx, sizeof(Mtx));
@@ -641,7 +663,7 @@ bool getVrAudioListener(float (*outViewMtx)[4], float outEye[3], float outCenter
 }
 
 bool getVrViewEye(float outEye[3]) {
-    if (!g_vrLightCamValid || !isRenderingToHeadset()) {
+    if (!g_vrLightCamValid || !isImmersiveVr()) {
         return false;
     }
     for (int i = 0; i < 3; ++i) {
@@ -651,7 +673,7 @@ bool getVrViewEye(float outEye[3]) {
 }
 
 bool getVrLightingCamera(float outEye[3], float outCenter[3]) {
-    if (!g_vrLightCamValid || !isRenderingToHeadset() ||
+    if (!g_vrLightCamValid || !isImmersiveVr() ||
         getSettings().game.vrLightingMode.getValue() == VrLightingMode::Original) {
         return false;
     }
@@ -823,16 +845,16 @@ bool startup() {
         //    intermittent frame dips on Quest 3 are partly clock-related.
         //    BOOST exists too but is documented as short-term only (the
         //    runtime backs off from it on its own) -- SUSTAINED_HIGH is the
-        //    standard "this is a demanding app" request.
-        if (boot.hasPerformanceSettings && boot.xrPerfSettingsSetPerformanceLevelEXT_) {
+        //    standard "this is a demanding app" request. (The 2026-09-20
+        //    GPU BOOST experiment bought nothing measurable; both domains
+        //    are back on SUSTAINED_HIGH.) Gated by game.vrHighClocks.
+        if (!dusk::getSettings().game.vrHighClocks.getValue()) {
+            duskVrLog("[dusk::vr::startup] High Clocks off -- runtime default clocks\n");
+        } else if (boot.hasPerformanceSettings && boot.xrPerfSettingsSetPerformanceLevelEXT_) {
             const XrResult cpuRes = boot.xrPerfSettingsSetPerformanceLevelEXT_(
                 session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
-            // EXPERIMENT 2026-09-20: BOOST for the GPU (was SUSTAINED_HIGH).
-            // Meta's VrApi stats line showed GPU level 4 @ 640MHz with the
-            // app GPU-bound (App=13.6ms, GPU%=0.85) -- checking whether the
-            // top level is reachable and what it buys.
             const XrResult gpuRes = boot.xrPerfSettingsSetPerformanceLevelEXT_(
-                session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_BOOST_EXT);
+                session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
             char msg[192];
             std::snprintf(msg, sizeof(msg),
                           "[dusk::vr::startup] XR_EXT_performance_settings: SUSTAINED_HIGH cpu=%d gpu=%d\n",
@@ -884,6 +906,15 @@ bool startup() {
 #endif  // DUSK_VR_PLATFORM_ANDROID
 #endif
 
+        // 3. XR_FB_display_refresh_rate: tick() requests
+        //    game.vrDisplayRefreshRate once the session is running and
+        //    again whenever the setting changes.
+        if (boot.hasDisplayRefreshRate) {
+            g_enumerateDisplayRefreshRates = boot.xrEnumerateDisplayRefreshRatesFB_;
+            g_requestDisplayRefreshRate = boot.xrRequestDisplayRefreshRateFB_;
+            g_appliedDisplayRefreshRateSetting = -1;
+        }
+
         // FIXED this session: g_rightGripSpace/g_leftGripSpace had the exact
         // same problem as g_viewSpace did before it (see above) -- nothing
         // ever created an action set, let alone attached it or created
@@ -905,6 +936,7 @@ bool startup() {
         g_secondaryClickAction = handActions.secondaryClickAction;
         g_menuClickAction = handActions.menuClickAction;
         g_stickClickAction = handActions.stickClickAction;
+        g_hapticAction = handActions.hapticAction;
         g_leftHandPath = handActions.leftHandPath;
         g_rightHandPath = handActions.rightHandPath;
 
@@ -1450,6 +1482,123 @@ static bool spaceWarpEncodeFrame(const vr_render::StereoParams& sp, const aurora
 #endif  // DUSK_VR_XR_GRAPHICS_VULKAN
 }  // namespace
 
+// Requests the highest refresh rate the headset supports at or below
+// game.vrDisplayRefreshRate. Runs every tick but only calls into the
+// runtime when the setting changed, so changing it in the menu applies live.
+static void applyDisplayRefreshRate(XrSession session) {
+    if (g_requestDisplayRefreshRate == nullptr) {
+        return;
+    }
+    const int wanted = dusk::getSettings().game.vrDisplayRefreshRate.getValue();
+    if (wanted == g_appliedDisplayRefreshRateSetting) {
+        return;
+    }
+    g_appliedDisplayRefreshRateSetting = wanted;
+
+    uint32_t count = 0;
+    if (XR_FAILED(g_enumerateDisplayRefreshRates(session, 0, &count, nullptr)) || count == 0) {
+        return;
+    }
+    std::vector<float> rates(count);
+    if (XR_FAILED(g_enumerateDisplayRefreshRates(session, count, &count, rates.data()))) {
+        return;
+    }
+    float best = 0.f;
+    for (const float rate : rates) {
+        if (rate <= static_cast<float>(wanted) + 0.5f && rate > best) {
+            best = rate;
+        }
+    }
+    if (best == 0.f) {
+        return;
+    }
+    const XrResult res = g_requestDisplayRefreshRate(session, best);
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), "[dusk::vr] display refresh rate: setting %d Hz -> requested %.0f Hz res=%d\n",
+                  wanted, best, static_cast<int>(res));
+    duskVrLog(msg);
+}
+
+static aurora::gfx::ResolvedTargets renderScreenModeGamePass(uint32_t width, uint32_t height,
+                                                             bool menuVisible, int eye = 0) {
+    view_class* view = dComIfGd_getView();
+    if (view == nullptr) {
+        return {};
+    }
+
+    Mtx44 savedProjection;
+    Mtx44 savedProjectionView;
+    std::memcpy(savedProjection, view->projMtx, sizeof(savedProjection));
+    std::memcpy(savedProjectionView, view->projViewMtx, sizeof(savedProjectionView));
+    const float savedAspect = view->aspect;
+    const float screenAspect = 16.0f / 9.0f;
+
+    stage_stag_info_class* stagInfo = dComIfGp_getStageStagInfo();
+    const float cullFar = stagInfo == nullptr || (dComIfGp_getCameraAttentionStatus(0) & 8)
+        ? view->far_
+        : static_cast<float>(dStage_stagInfo_GetCullPoint(stagInfo));
+    auto restoreCamera = [&] {
+        view->aspect = savedAspect;
+        std::memcpy(view->projMtx, savedProjection, sizeof(savedProjection));
+        std::memcpy(view->projViewMtx, savedProjectionView, sizeof(savedProjectionView));
+        j3dSys.setViewMtx(view->viewMtx);
+        GXSetProjection(view->projMtx, GX_PERSPECTIVE);
+        mDoLib_clipper::setup(view->fovy, savedAspect, view->near_, cullFar);
+    };
+
+    view->aspect = screenAspect;
+    C_MTXPerspective(view->projMtx, view->fovy, screenAspect, view->near_, view->far_);
+#if WIDESCREEN_SUPPORT
+    mDoGph_gInf_c::setWideZoomProjection(view->projMtx);
+#endif
+
+    // Stereoscopic 3D on Giant Screen (GalaxyQuest model):
+    // Offsets camera projection horizontally by ±shear based on IPD and convergence on Link.
+    const bool stereo = dusk::getSettings().game.vrScreenModeStereo.getValue();
+    if (stereo && eye != 0) {
+        const float depthMultiplier = std::clamp(dusk::getSettings().game.vrScreenModeDepth.getValue(), 0.2f, 3.0f);
+        // eye == 1 is right eye: shift projection right (+shear); left eye (eye == 0) shifts left (-shear).
+        const float shearDir = (eye == 1) ? 0.025f : -0.025f;
+        const float shear = shearDir * depthMultiplier;
+        // In perspective projection matrix, m0[2] (m[0][2]) offsets the optical center horizontally.
+        view->projMtx[0][2] += shear;
+    } else if (stereo) {
+        const float depthMultiplier = std::clamp(dusk::getSettings().game.vrScreenModeDepth.getValue(), 0.2f, 3.0f);
+        const float shear = -0.025f * depthMultiplier;
+        view->projMtx[0][2] += shear;
+    }
+
+    cMtx_concatProjView(view->projMtx, view->viewMtx, view->projViewMtx);
+    mDoLib_clipper::setup(view->fovy, screenAspect, view->near_, cullFar);
+
+    j3dSys.setViewMtx(view->viewMtx);
+    GXSetProjection(view->projMtx, GX_PERSPECTIVE);
+    // Image-shadow generation opens its own GX framebuffer, so do it before
+    // the protected scene pass; the shadow draw itself stays in that pass.
+    if (stagInfo != nullptr) {
+        dComIfGd_imageDrawShadow(view->viewMtx);
+    }
+
+    if (!vr_render::beginScreenModePass(width, height)) {
+        restoreCamera();
+        return {};
+    }
+
+    g_duskVRScreenModePassOpen = true;
+    j3dSys.setViewMtx(view->viewMtx);
+    GXSetProjection(view->projMtx, GX_PERSPECTIVE);
+    dusk::interp::material::replay_models_for_current_view();
+    fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
+    cAPIGph_Painter();
+    if (menuVisible) {
+        vr_render::drawMenuScreenOverlay();
+    }
+    aurora::gfx::ResolvedTargets targets = vr_render::endScreenModePass();
+    g_duskVRScreenModePassOpen = false;
+    restoreCamera();
+    return targets;
+}
+
 void tick(const dusk::game_clock::FrameTiming& pacing) {
     g_perfTickStart = PerfClock::now();
     g_perfAfterAcquire = g_perfTickStart;
@@ -1480,6 +1629,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     g_renderedToHeadsetThisFrame = false;
     g_duskVRRenderingToHeadset = false;
     g_duskVREyePassOpen = false;
+    g_duskVRScreenModePassOpen = false;
     // Recomputed further down on frames that read controller input; an early
     // return must not leave a stale "sword is swinging" armed.
     g_physicalSwordSwingActive = false;
@@ -1572,6 +1722,9 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
                         XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     g_sessionRunning =
                         XR_SUCCEEDED(xrBeginSession(g_session->session(), &resumeInfo));
+                    // The runtime may drop the requested rate across a
+                    // stop/start; ask again on the next tick.
+                    g_appliedDisplayRefreshRateSetting = -1;
                 }
             } else if (stateEvent.state == XR_SESSION_STATE_EXITING ||
                        stateEvent.state == XR_SESSION_STATE_LOSS_PENDING) {
@@ -1598,6 +1751,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         logTickReasonOnChange("session-not-running");
         return;
     }
+
+    applyDisplayRefreshRate(g_session->session());
 
     // --- wait for the runtime to tell us the predicted display time for this frame ---
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
@@ -1673,6 +1828,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     logTickReasonOnChange("rendering-normally");
     g_renderedToHeadsetThisFrame = true;
     g_duskVRRenderingToHeadset = true;
+    const bool screenMode = dusk::getSettings().game.vrScreenMode.getValue();
 
     const XrTime time = g_session->predictedDisplayTime();
     const XrSpace base = g_session->localSpace();
@@ -1941,13 +2097,15 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // rather than a true single-frame one.
     constexpr double kSwingButtonHoldSec = 0.1;
     static double s_leftSwingButtonHoldRemaining = 0.0;
-    if (leftSwingEvent.triggered) {
+    if (screenMode) {
+        s_leftSwingButtonHoldRemaining = 0.0;
+    } else if (leftSwingEvent.triggered) {
         s_leftSwingButtonHoldRemaining = kSwingButtonHoldSec;
     } else {
         s_leftSwingButtonHoldRemaining =
             std::max(0.0, s_leftSwingButtonHoldRemaining - static_cast<double>(pacing.dt));
     }
-    const bool physicalSword = dusk::getSettings().game.vrPhysicalSword.getValue();
+    const bool physicalSword = !screenMode && dusk::getSettings().game.vrPhysicalSword.getValue();
     // Physical sword mode: the swing gesture no longer presses B. Instead the
     // sword's own hitbox is live while the sword hand is moving fast (see
     // daAlink_c::setAtCollision()). The real B button still attacks.
@@ -2041,24 +2199,25 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     constexpr double kThrustHoldSec = 0.1;
     static double s_rightThrustForceReleaseRemaining = 0.0;
     static double s_rightThrustHoldRemaining = 0.0;
-    if (rightThrustEvent.triggered) {
+    if (screenMode) {
+        s_rightThrustForceReleaseRemaining = 0.0;
+        s_rightThrustHoldRemaining = 0.0;
+    } else if (rightThrustEvent.triggered) {
         s_rightThrustForceReleaseRemaining = kThrustForceReleaseSec;
-        s_rightThrustHoldRemaining = 0.0;  // restart the release phase even if a
-                                            // previous pulse's hold was still running
+        s_rightThrustHoldRemaining = 0.0; // restart release phase even if previous pulse's hold was still running
     } else {
         const double dtSec = static_cast<double>(pacing.dt);
         if (s_rightThrustForceReleaseRemaining > 0.0) {
             s_rightThrustForceReleaseRemaining = std::max(0.0, s_rightThrustForceReleaseRemaining - dtSec);
             if (s_rightThrustForceReleaseRemaining <= 0.0) {
-                s_rightThrustHoldRemaining = kThrustHoldSec;  // release window just
-                                                                // elapsed -- start the assert window
+                s_rightThrustHoldRemaining = kThrustHoldSec;
             }
         } else if (s_rightThrustHoldRemaining > 0.0) {
             s_rightThrustHoldRemaining = std::max(0.0, s_rightThrustHoldRemaining - dtSec);
         }
     }
-    const bool rightThrustForceRelease = s_rightThrustForceReleaseRemaining > 0.0;
-    const bool rightThrustForceHold = s_rightThrustHoldRemaining > 0.0;
+    const bool rightThrustForceRelease = !screenMode && s_rightThrustForceReleaseRemaining > 0.0;
+    const bool rightThrustForceHold = !screenMode && s_rightThrustHoldRemaining > 0.0;
 
     // FISHING HOOKSET (2026-08-14) -- user report: "the fish bite and when
     // I pull they just let go." Traced the real minigame code first (see
@@ -2081,13 +2240,13 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // sim-tick periods guarantees at least one real read catches it.
     constexpr double kRodYankStickHoldSec = 0.15;
     static double s_rodYankStickHoldRemaining = 0.0;
-    if (rightThrustEvent.triggered && dusk::vr::isFishingHookInWater()) {
+    if (!screenMode && rightThrustEvent.triggered && dusk::vr::isFishingHookInWater()) {
         s_rodYankStickHoldRemaining = kRodYankStickHoldSec;
     } else {
         s_rodYankStickHoldRemaining =
             std::max(0.0, s_rodYankStickHoldRemaining - static_cast<double>(pacing.dt));
     }
-    const bool rodYankForceStickDown = s_rodYankStickHoldRemaining > 0.0;
+    const bool rodYankForceStickDown = !screenMode && s_rodYankStickHoldRemaining > 0.0;
 
     PADStatus padStatus{};
     padStatus.err = PAD_ERR_NONE;
@@ -2158,7 +2317,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // C-stick for camera turn while fishing either. The yank-gesture fix
     // from earlier this session is left in place, not reverted -- this is
     // an additional/alternative control, not a replacement.
-    if (dusk::vr::isFishingRodActive()) {
+    // Screen mode restores the right stick to the normal game-camera C-stick.
+    if (screenMode || dusk::vr::isFishingRodActive()) {
         if (std::abs(rightStick.x) > kStickDeadzone || std::abs(rightStick.y) > kStickDeadzone) {
             padStatus.substickX = static_cast<s8>(std::clamp(rightStick.x, -1.f, 1.f) * 127.f);
             padStatus.substickY = static_cast<s8>(std::clamp(rightStick.y, -1.f, 1.f) * 127.f);
@@ -2228,6 +2388,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // to the jump-cut block. C-stick orbit input never reaches the game
     // camera in VR (dCamera_c::updatePad()), so every delta here is the
     // camera's own follow/scripted movement, not the player's stick.
+    if (!screenMode) {
     {
         static bool s_followWasActive = false;
         static s16 s_followLastCamYawS = 0;
@@ -2553,6 +2714,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
             }
         }
     }
+    }
 
     // See g_headMoveAngleS's declaration comment for the bug this fixes.
     // Computed here (once per frame, not per eye) rather than lazily in
@@ -2639,6 +2801,32 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         PADClearVirtualStatus(kVrPadPort);
     }
 
+    // Game rumble (port 0 motor, toggled per game frame by rumble patterns)
+    // -> both Touch controllers. Each pulse lasts about one refresh and is
+    // renewed while the motor stays on, so pattern gaps still read as gaps.
+    {
+        static bool s_hapticOn = false;
+        const bool on = JUTGamePad::CRumble::mStatus[kVrPadPort] != 0;
+        if (on || s_hapticOn) {
+            for (const XrPath hand : {g_leftHandPath, g_rightHandPath}) {
+                XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
+                info.action = g_hapticAction;
+                info.subactionPath = hand;
+                if (on) {
+                    XrHapticVibration vib{XR_TYPE_HAPTIC_VIBRATION};
+                    vib.duration = 25'000'000;  // ns
+                    vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+                    vib.amplitude = 0.6f;
+                    xrApplyHapticFeedback(g_session->session(), &info,
+                                          reinterpret_cast<const XrHapticBaseHeader*>(&vib));
+                } else {
+                    xrStopHapticFeedback(g_session->session(), &info);
+                }
+            }
+        }
+        s_hapticOn = on;
+    }
+
     // --- Link head hide + hand matrix mapping ---
     vr_link::FrameInput frameInput{hmdPose, rightPose, leftPose, rightAimPose, leftAimPose,
                                     dusk::vr::getSmoothTurnYawRad()};
@@ -2654,6 +2842,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // per-eye call site (d_a_alink.cpp, inside daAlink_c::draw()) was
     // proven, via a full-session [dusk::vr::eyepasscheck] log capture, to
     // never actually run during a real VR eye pass -- this call site does.
+    if (!screenMode) {
     if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
         dusk::vr::refreshTrackedHandDrawMtxLive(link->getHandModel());
     }
@@ -2701,6 +2890,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // deliberately not touched this round -- see
     // refreshTrackedHookshotMtxLive()'s own comment).
     dusk::vr::refreshTrackedHookshotMtxLive();
+    }
     perfLap(3);
 
     // World-space point both eyes anchor their view matrix to this frame --
@@ -2714,8 +2904,9 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // camera-only 6DOF positional tracking -- see getVrCameraEyeAnchor()'s
     // own comment. No-op when the setting is off or before the first real
     // HMD sample this session.
+    const float renderYaw = screenMode ? 0.0f : dusk::vr::getSmoothTurnYawRad();
     const cXyz vrCameraEyeAnchor = vr_link::getVrCameraEyeAnchor(
-        currentView->lookat.eye, &hmdPose.position, dusk::vr::getSmoothTurnYawRad());
+        currentView->lookat.eye, &hmdPose.position, renderYaw);
 
     // Lighting viewpoint -- see getVrLightingCamera(). Exponential ease of
     // the head yaw toward its current value, frame-rate independent.
@@ -2740,7 +2931,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // Audio listener -- see getVrAudioListener(). Head-centre view, same
     // construction as beginStereoPass()'s V_c.
     {
-        const float yaw = dusk::vr::getSmoothTurnYawRad();
+        const float yaw = renderYaw;
         vr_render::eyePoseToViewMtx(g_vrAudioViewMtx, hmdPose, hmdPose.position,
                                     vrCameraEyeAnchor, vr_render::kEyePosScale, yaw);
         const cXyz fwd = vr_render::computeHeadWorldForward(hmdPose, yaw);
@@ -2858,7 +3049,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     g_session->spaceWarpNewFrame();
     bool spaceWarpFrame = false;
     {
-        const bool wanted = kSpaceWarpEnabled && dusk::getSettings().game.vrSpaceWarp.getValue() &&
+        const bool wanted = !screenMode && kSpaceWarpEnabled &&
+                            dusk::getSettings().game.vrSpaceWarp.getValue() &&
                             dusk::getSettings().game.vrSinglePassStereo.getValue() && viewCount == 2;
         const bool available = g_session->spaceWarpAvailable();
         static int s_loggedState = -1;
@@ -2895,7 +3087,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // (not per eye) -- see vr_stereo_render.hpp's updateHudSmoothing()/
     // computeHudPose() comments. Added per user feedback that the
     // head-locked panel felt "really shaky" with raw per-frame tracking.
-    vr_render::updateHudSmoothing(hmdPose, dusk::vr::getSmoothTurnYawRad());
+    vr_render::updateHudSmoothing(hmdPose, renderYaw);
 
     // CONFIRMED this session (first HUD-billboard in-headset test came back
     // solid black): mDoGph_drawHud2D() draws nothing until fpcM_DrawIterater()
@@ -2916,6 +3108,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // traversal to do) -- under 2-4% of a single frame's budget even at the
     // worst observed moment against a 72-90Hz VR target. Not a measurable
     // perf concern; not worth optimizing further absent new evidence.
+    // Screen mode needs this too: captureMapCopy2D() below draws from these
+    // lists, and the minimap cannot render inside the protected screen pass.
     fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
 
     // Capture the flat 2D HUD into a shared offscreen texture ONCE, before
@@ -2940,7 +3134,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // destination) so the eyes keep sampling the last capture in between.
     // ~60% of those draws gone at 72Hz, nothing visible changes.
     const bool captureThisFrame = pacing.numSimTicks > 0;
-    if (captureThisFrame) {
+    if (!screenMode && captureThisFrame) {
         mDoGph_gInf_c::captureHudBillboard();
     }
     // The minimap render is the single most expensive thing on the Quest's
@@ -2986,6 +3180,26 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         vr_render::ensureAndCopyMenuBillboardTexture();
     }
 
+    if (screenMode) {
+        const uint32_t screenHeight = std::max(720u, (g_eyeImageHeight / 2u / 9u) * 9u);
+        const uint32_t screenWidth = screenHeight * 16u / 9u;
+        const bool stereo = dusk::getSettings().game.vrScreenModeStereo.getValue();
+
+        if (stereo) {
+            // Left eye (eye 0)
+            const aurora::gfx::ResolvedTargets leftTargets =
+                renderScreenModeGamePass(screenWidth, screenHeight, menuVisible, 0);
+            vr_render::copyScreenModeTexture(leftTargets, screenWidth, screenHeight, 0);
+            // Right eye (eye 1)
+            const aurora::gfx::ResolvedTargets rightTargets =
+                renderScreenModeGamePass(screenWidth, screenHeight, menuVisible, 1);
+            vr_render::copyScreenModeTexture(rightTargets, screenWidth, screenHeight, 1);
+        } else {
+            const aurora::gfx::ResolvedTargets screenTargets =
+                renderScreenModeGamePass(screenWidth, screenHeight, menuVisible, 0);
+            vr_render::copyScreenModeTexture(screenTargets, screenWidth, screenHeight, 0);
+        }
+    }
     // Desktop mirror: captured from eye 0 (left) inside the loop below,
     // applied once after it. See aurora::gfx::set_present_source_mirror()'s
     // own comment for the mechanism; this is just where VR code decides
@@ -3000,7 +3214,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // CPU-side positions (aim dot, HUD/menu billboards) are computed
     // against the head-center view and get their disparity from the
     // shader's per-eye correction.
-    if (dusk::getSettings().game.vrSinglePassStereo && viewCount == 2) {
+    if (!screenMode && dusk::getSettings().game.vrSinglePassStereo && viewCount == 2) {
         const uint32_t eyeWidth = g_eyeImageWidth;
         const uint32_t eyeHeight = g_eyeImageHeight;
         vr_render::StereoParams stereoParams{
@@ -3127,7 +3341,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
             g_eyeImageHeight,
             hmdPose.position,
             vrCameraEyeAnchor,
-            dusk::vr::getSmoothTurnYawRad(),
+            renderYaw,
         };
 
         // Safe to call unconditionally here: the isViewReady() check earlier
@@ -3145,6 +3359,11 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         PerfClock::time_point perfEyeT1 = PerfClock::now();
         g_perfEyeBeginMs += perfMs(perfEyeT0, perfEyeT1);
 
+        if (screenMode) {
+            const auto screenDrawStart = PerfClock::now();
+            vr_render::drawScreenModeBillboard(static_cast<int>(eye));
+            g_perfEyePainterMs += perfMs(screenDrawStart, PerfClock::now());
+        } else {
         fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
         PerfClock::time_point perfEyeT2 = PerfClock::now();
         g_perfEyeIterMs += perfMs(perfEyeT1, perfEyeT2);
@@ -3194,6 +3413,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
             }
             vr_render::drawMenuBillboard(&vr_render::g_menuBillboardTexObj,
                                           vr_render::g_menuBillboardAspectHeightOverWidth);
+        }
         }
 
         // TODO: inject hand mesh before resolving the pass:

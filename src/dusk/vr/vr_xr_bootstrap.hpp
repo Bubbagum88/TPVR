@@ -125,6 +125,13 @@ struct Bootstrap {
     // the recommended motion-vector image size) and Session's space-warp
     // path (vr_xr_submit.hpp). Never true on the D3D12/PC branch.
     bool hasSpaceWarp = false;
+    // XR_FB_display_refresh_rate (Meta standalone): enabled only if
+    // advertised. Lets vr_main.cpp request game.vrDisplayRefreshRate
+    // instead of the runtime's 72Hz default. Never true on the D3D12/PC
+    // branch.
+    bool hasDisplayRefreshRate = false;
+    PFN_xrEnumerateDisplayRefreshRatesFB xrEnumerateDisplayRefreshRatesFB_ = nullptr;
+    PFN_xrRequestDisplayRefreshRateFB xrRequestDisplayRefreshRateFB_ = nullptr;
     PFN_xrPerfSettingsSetPerformanceLevelEXT xrPerfSettingsSetPerformanceLevelEXT_ = nullptr;
 #if DUSK_VR_PLATFORM_ANDROID
     PFN_xrSetAndroidApplicationThreadKHR xrSetAndroidApplicationThreadKHR_ = nullptr;
@@ -259,6 +266,14 @@ inline Bootstrap initialize() {
     if (boot.hasSpaceWarp) {
         enabledExtensions.push_back(XR_FB_SPACE_WARP_EXTENSION_NAME);
     }
+#if DUSK_VR_PLATFORM_ANDROID
+    // Standalone only: on PC the runtime / streamer owns the refresh rate,
+    // and requesting the 72Hz default there would lower it.
+    boot.hasDisplayRefreshRate = instanceExtensionAvailable(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    if (boot.hasDisplayRefreshRate) {
+        enabledExtensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    }
+#endif
 
     XrInstanceCreateInfo instanceInfo{XR_TYPE_INSTANCE_CREATE_INFO};
 #if DUSK_VR_PLATFORM_ANDROID
@@ -324,6 +339,17 @@ inline Bootstrap initialize() {
         boot.xrSetAndroidApplicationThreadKHR_ = nullptr;
     }
 #endif
+    if (boot.hasDisplayRefreshRate &&
+        (XR_FAILED(xrGetInstanceProcAddr(
+             boot.instance, "xrEnumerateDisplayRefreshRatesFB",
+             reinterpret_cast<PFN_xrVoidFunction*>(&boot.xrEnumerateDisplayRefreshRatesFB_))) ||
+         XR_FAILED(xrGetInstanceProcAddr(
+             boot.instance, "xrRequestDisplayRefreshRateFB",
+             reinterpret_cast<PFN_xrVoidFunction*>(&boot.xrRequestDisplayRefreshRateFB_))))) {
+        boot.hasDisplayRefreshRate = false;
+        boot.xrEnumerateDisplayRefreshRatesFB_ = nullptr;
+        boot.xrRequestDisplayRefreshRateFB_ = nullptr;
+    }
 
     checkResult(
         boot.xrGetVulkanGraphicsRequirements2KHR_(boot.instance, boot.systemId,
@@ -817,6 +843,9 @@ struct HandActions {
     // click -> pause, left click -> D-pad right (added same day, see
     // vr_main.cpp's tick()).
     XrAction stickClickAction = XR_NULL_HANDLE;     // BOOL: thumbstick click, both hands
+    // Touch controller vibration, both hands; driven from the game's rumble
+    // motor state (JUTGamePad::CRumble::mStatus) in vr_main.cpp's tick().
+    XrAction hapticAction = XR_NULL_HANDLE;         // VIBRATION_OUTPUT, both hands
 
     XrPath leftHandPath = XR_NULL_PATH;
     XrPath rightHandPath = XR_NULL_PATH;
@@ -889,6 +918,7 @@ inline HandActions createHandActionSet(XrInstance instance) {
     createAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "secondary_click", "Secondary Button", &actions.secondaryClickAction);
     createAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "menu_click", "Menu", &actions.menuClickAction);
     createAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "stick_click", "Stick Click", &actions.stickClickAction);
+    createAction(XR_ACTION_TYPE_VIBRATION_OUTPUT, "haptic", "Rumble", &actions.hapticAction);
 
     XrPath leftBindingPath = XR_NULL_PATH;
     XrPath rightBindingPath = XR_NULL_PATH;
@@ -957,6 +987,9 @@ inline HandActions createHandActionSet(XrInstance instance) {
     xrStringToPath(instance, "/user/hand/left/input/menu/click", &leftMenuClickPath);
     xrStringToPath(instance, "/user/hand/right/input/thumbstick/click", &rightStickClickPath);
     xrStringToPath(instance, "/user/hand/left/input/thumbstick/click", &leftStickClickPath);
+    XrPath leftHapticPath = XR_NULL_PATH, rightHapticPath = XR_NULL_PATH;
+    xrStringToPath(instance, "/user/hand/left/output/haptic", &leftHapticPath);
+    xrStringToPath(instance, "/user/hand/right/output/haptic", &rightHapticPath);
 
     XrActionSuggestedBinding touchBindings[] = {
         {actions.gripPoseAction, leftBindingPath},
@@ -976,8 +1009,11 @@ inline HandActions createHandActionSet(XrInstance instance) {
         {actions.menuClickAction, leftMenuClickPath},
         {actions.stickClickAction, rightStickClickPath},
         {actions.stickClickAction, leftStickClickPath},
+        {actions.hapticAction, leftHapticPath},
+        {actions.hapticAction, rightHapticPath},
     };
-    suggestForProfile("/interaction_profiles/oculus/touch_controller", touchBindings, 17);
+    suggestForProfile("/interaction_profiles/oculus/touch_controller", touchBindings,
+                      static_cast<uint32_t>(std::size(touchBindings)));
 
     return actions;
 }

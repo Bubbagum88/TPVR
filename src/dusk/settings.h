@@ -289,6 +289,14 @@ struct UserSettings {
         // set_present_source_mirror()) -- no extra render pass, no CPU
         // readback, near-zero cost.
         ConfigVar<bool> vrDesktopMirror;
+        // Renders flat-camera gameplay onto a large 16:9 screen in the headset.
+        // It can be toggled live; immersive VR behavior is disabled while selected.
+        ConfigVar<bool> vrScreenMode;
+        // Stereoscopic 3D on the Giant Screen: each eye gets an offset view
+        // with convergence on Link, giving the virtual screen depth (like a 3D cinema).
+        ConfigVar<bool> vrScreenModeStereo;
+        // Stereoscopic 3D depth multiplier for the Giant Screen (0.2x .. 3.0x, default 1.0x).
+        ConfigVar<float> vrScreenModeDepth;
         // Renders both VR eyes in ONE scene pass (instanced per eye into a
         // double-wide target, see vr_render::beginStereoPass()) instead of
         // traversing and recording the whole scene twice per frame. The
@@ -302,6 +310,17 @@ struct UserSettings {
         // Read once at VR startup (sizes the swapchain), so it takes effect
         // on the next launch.
         ConfigVar<float> vrRenderScale;
+        // Standalone Quest (XR_EXT_performance_settings): request SUSTAINED_HIGH
+        // CPU and GPU levels at VR startup instead of the runtime's default.
+        // Off leaves the runtime's choice (cooler, longer battery). Read once
+        // at VR startup, so it takes effect on the next launch.
+        ConfigVar<bool> vrHighClocks;
+        // Display refresh rate requested on standalone Quest
+        // (XR_FB_display_refresh_rate), in Hz. The headset gets the highest
+        // rate it supports at or below this value; 72 is the runtime default.
+        // Applied live. Ignored where the runtime doesn't advertise the
+        // extension.
+        ConfigVar<int> vrDisplayRefreshRate;
         // Application SpaceWarp (XR_FB_space_warp, standalone Quest only):
         // the app submits per-eye motion vectors + depth alongside the
         // color image and the runtime synthesizes every other frame,
