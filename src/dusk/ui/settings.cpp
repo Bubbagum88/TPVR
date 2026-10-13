@@ -1199,14 +1199,13 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                             "at the cost of more heat and battery. Off lets the headset choose. "
                             "Takes effect the next time the game starts. On by default."
             });
-        config_int_select(leftPane, rightPane, getSettings().game.vrDisplayRefreshRate,
-            "VR Refresh Rate",
-            "The headset's display refresh rate. The headset uses the highest rate it "
-            "supports at or below this value (72, 80 or 90 Hz; 120 Hz only if it is enabled "
-            "in the headset's own display settings). Higher rates look smoother but every "
-            "frame must render faster; if the game can't keep up the picture judders, so "
-            "only raise it if your area runs steadily. Applies immediately.",
-            72, 120, 2, {}, {}, " Hz");
+        config_bool_select(leftPane, rightPane, getSettings().game.vrSuperResolution,
+            {
+                .key = "Super Resolution (Sharpening)",
+                .helpText = "Asks the headset to apply its own edge-aware sharpening to the picture, "
+                            "making distant scenery and textures look crisper. Applies immediately. "
+                            "On by default."
+            });
 #endif
 
 #if !VR_SETTINGS_STANDALONE

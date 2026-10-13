@@ -5633,7 +5633,7 @@ void daAlink_c::setBodyPartPos() {
         // which is real physics/collision state (read by dBomb_c's own
         // logic), not just a draw matrix -- deliberately not attempted
         // here; not yet explored.
-    if (dusk::vr::isImmersiveVr()) {
+        if (dusk::vr::isImmersiveVr()) {
             float lx, ly, lz, rx, ry, rz;
             if (dusk::vr::getTrackedHandWorldPos(true, lx, ly, lz) &&
                 dusk::vr::getTrackedHandWorldPos(false, rx, ry, rz)) {
@@ -12676,7 +12676,7 @@ int daAlink_c::checkNextAction(int param_0) {
         // yours. In VR the player's head IS Link's facing. Ground-only; the
         // ride/swim/vine/magnet states keep their own facing rules.
         if (dusk::getSettings().game.vrInstantStartFacing.getValue() &&
-        checkZeroSpeedF() && checkInputOnR() && dusk::vr::isImmersiveVr() &&
+            checkZeroSpeedF() && checkInputOnR() && dusk::vr::isImmersiveVr() &&
             dusk::vr::isVrFirstPerson(this) && !checkEventRun() && !checkMagneBootsOn() &&
             !checkModeFlg(MODE_SWIMMING | MODE_VINE_CLIMB | MODE_RIDING))
         {
@@ -20146,7 +20146,7 @@ int daAlink_c::draw() {
         // "Third Person" VR setting (2026-08-19 follow-up): also gated on
         // isVrFirstPerson(this) now -- see its comment (vr_main.hpp) and
         // the matching fix on the tracked-hand call site above.
-    if (dusk::vr::isImmersiveVr() && dusk::vr::isVrFirstPerson(this)) {
+        if (dusk::vr::isImmersiveVr() && dusk::vr::isVrFirstPerson(this)) {
             dusk::vr::applyTrackedItemMtx(mSwordModel, mShieldModel,
                                            mpLinkModel->getAnmMtx(mLeftItemJntNo),
                                            mpLinkModel->getAnmMtx(mLeftHandJntNo),
@@ -20283,7 +20283,7 @@ int daAlink_c::draw() {
         // NOTE: setting renamed/inverted from "Hide Body" (vrHideBody) to
         // "Experimental: Show Link's Body" (vrShowBody), now off by default
         // -- same underlying mechanism, just flipped sense and default.
-    const BOOL hideBodyForVr = dusk::vr::isImmersiveVr() &&
+        const BOOL hideBodyForVr = dusk::vr::isImmersiveVr() &&
                                     !dusk::getSettings().game.vrShowBody.getValue() &&
                                     !dusk::getSettings().game.vrThirdPerson.getValue() &&
                                     !dusk::vr::isRealCutsceneRunning();

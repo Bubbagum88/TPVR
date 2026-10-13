@@ -46,14 +46,14 @@ public:
             // backdrop instead, so skipping the WHOLE thing left the VR eye
             // with nothing drawn into it at all (a black frame), even after
             // the pass-corruption itself got fixed elsewhere. Now only the
-    // live capture (GXCopyTex) is skipped during immersive VR; mTexObj is
+            // live capture (GXCopyTex) is skipped during immersive VR; mTexObj is
             // still initialized below regardless -- GXInitTexObj just
             // describes an existing persistent GPU texture, it doesn't
             // touch the framebuffer, so it's safe to always run, and the
             // backdrop draw (the `else` branch, a plain textured quad, no
             // framebuffer copy) can then always run too, using whatever
-    // pixel data there (fresh outside immersive VR, stale/from prior
-    // non-immersive capture while rendering immersive VR) rather than nothing.
+            // pixel data there (fresh outside immersive VR, stale/from prior
+            // non-immersive capture while rendering immersive VR) rather than nothing.
             bool skipCapture = false;
 #ifdef TARGET_PC
             skipCapture = dusk::vr::isImmersiveVr();
@@ -96,7 +96,7 @@ public:
             // dialogue) -- the reported "black screen" was actually this
             // overlay blending garbage/uninitialized texture content over
             // the real scene at whatever this dialogue's darken alpha is,
-    // visually swamping it. Fix: for immersive VR, pull overlay's color
+            // visually swamping it. Fix: for immersive VR, pull overlay's color
             // from the TEV constant register (already set to plain black
             // below) instead of the texture -- same darkening effect, zero
             // dependency on the capture.

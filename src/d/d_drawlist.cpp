@@ -1145,7 +1145,7 @@ void dDlst_shadowReal_c::draw() {
     // session. Disabling here COMPLETES, rather than reverses, the
     // existing "shadows disabled in VR" intent already applied to Simple
     // shadows -- not a new exception.
-        if (dusk::vr::isImmersiveVr()) {
+    if (dusk::vr::isImmersiveVr()) {
         return;
     }
 #endif
@@ -1451,7 +1451,7 @@ void dDlst_shadowSimple_c::draw() {
     // system (dComIfGd_drawShadow in m_Do_graphic.cpp) -- see that guard's
     // comment for why. Re-disabled after a mistaken re-enable confirmed the
     // stretching persists post-fix; do not re-enable without new evidence.
-        if (dusk::vr::isImmersiveVr()) {
+    if (dusk::vr::isImmersiveVr()) {
         return;
     }
 #endif
@@ -1466,7 +1466,7 @@ void dDlst_shadowSimple_c::draw() {
     // the top of this function. The stretching was root-caused in an earlier
     // session: re-concatenating an interpolated world-space matrix with
     // whichever view matrix is live at draw time breaks under VR's rapidly
-    // alternating per-eye matrices. Those no longer reach all in VR, so
+    // alternating per-eye matrices. That code is no longer reached in immersive VR, so
     // get_simple_shadow_mtx()'s unconditional concat below is safe: the
     // construction is flatscreen-only; the helper itself is unaware of VR.
     Mtx volumeMtx;

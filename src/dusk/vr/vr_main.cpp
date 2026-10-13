@@ -102,6 +102,8 @@ static uint32_t g_eyeImageHeight = 0;
 static PFN_xrEnumerateDisplayRefreshRatesFB g_enumerateDisplayRefreshRates = nullptr;
 static PFN_xrRequestDisplayRefreshRateFB g_requestDisplayRefreshRate = nullptr;
 static int g_appliedDisplayRefreshRateSetting = -1;
+// XR_FB_composition_layer_settings available this session (Super Resolution).
+static bool g_hasLayerSettings = false;
 
 namespace dusk::vr {
 
@@ -906,14 +908,19 @@ bool startup() {
 #endif  // DUSK_VR_PLATFORM_ANDROID
 #endif
 
+#if DUSK_VR_XR_GRAPHICS_VULKAN
         // 3. XR_FB_display_refresh_rate: tick() requests
         //    game.vrDisplayRefreshRate once the session is running and
-        //    again whenever the setting changes.
+        //    again whenever the setting changes. Also XR_FB_composition_layer_
+        //    settings (Super Resolution). Both only exist on the Vulkan
+        //    Bootstrap (and are only enabled on standalone).
+        g_hasLayerSettings = boot.hasLayerSettings;
         if (boot.hasDisplayRefreshRate) {
             g_enumerateDisplayRefreshRates = boot.xrEnumerateDisplayRefreshRatesFB_;
             g_requestDisplayRefreshRate = boot.xrRequestDisplayRefreshRateFB_;
             g_appliedDisplayRefreshRateSetting = -1;
         }
+#endif
 
         // FIXED this session: g_rightGripSpace/g_leftGripSpace had the exact
         // same problem as g_viewSpace did before it (see above) -- nothing
@@ -3715,6 +3722,13 @@ void submitFrame() {
     projLayer.space = g_pendingSubmit.base;
     projLayer.viewCount = g_pendingSubmit.viewCount;
     projLayer.views = g_pendingSubmit.projViews.data();
+    // Super Resolution (game.vrSuperResolution, standalone): runtime-side
+    // edge-aware sharpening of this layer.
+    XrCompositionLayerSettingsFB layerSettings{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
+    layerSettings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
+    if (g_hasLayerSettings && dusk::getSettings().game.vrSuperResolution.getValue()) {
+        projLayer.next = &layerSettings;
+    }
 
     const XrCompositionLayerBaseHeader* layers[] = {
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer)};

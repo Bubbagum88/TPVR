@@ -321,6 +321,11 @@ struct UserSettings {
         // Applied live. Ignored where the runtime doesn't advertise the
         // extension.
         ConfigVar<int> vrDisplayRefreshRate;
+        // Meta Quest Super Resolution / sharpening (XR_FB_composition_layer_settings,
+        // standalone only): chains XrCompositionLayerSettingsFB with the normal
+        // sharpening flag onto the projection layer. Applied live. Ignored where
+        // the runtime doesn't advertise the extension.
+        ConfigVar<bool> vrSuperResolution;
         // Application SpaceWarp (XR_FB_space_warp, standalone Quest only):
         // the app submits per-eye motion vectors + depth alongside the
         // color image and the runtime synthesizes every other frame,

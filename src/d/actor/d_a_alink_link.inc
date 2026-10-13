@@ -129,7 +129,7 @@ BOOL daAlink_c::setBodyAngleToCamera() {
         // gyro/touch branches below already apply, kept for consistency
         // even though an absolute controller-driven pitch is less likely
         // to need it in practice.
-    if (dusk::vr::isImmersiveVr()) {
+        if (dusk::vr::isImmersiveVr()) {
             s16 aimYawS, aimPitchS;
             // "Third Person" VR setting (2026-08-19 follow-up, explicit
             // user request: "tie the reticle aim location to the hmd
@@ -180,7 +180,7 @@ BOOL daAlink_c::setBodyAngleToCamera() {
         // Guarded off in VR -- see the isRenderingToHeadset() branch above,
         // which fully replaces stick/gyro/mouse/touch aim rather than
         // layering on top of them.
-    if (!dusk::vr::isImmersiveVr() &&
+        if (!dusk::vr::isImmersiveVr() &&
             (dusk::getSettings().game.enableGyroAim ||
              dusk::getSettings().game.enableMouseAim) &&
              checkAimInputContext())
@@ -215,7 +215,7 @@ BOOL daAlink_c::setBodyAngleToCamera() {
             }
         }
 
-    if (!dusk::vr::isImmersiveVr() &&
+        if (!dusk::vr::isImmersiveVr() &&
             dusk::getSettings().game.enableTouchControls && checkAimInputContext()) {
             f32 touchYawDp = 0.0f;
             f32 touchPitchDp = 0.0f;

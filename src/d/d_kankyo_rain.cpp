@@ -576,7 +576,7 @@ void dKyr_sun_move() {
         // Skip spawning it in VR entirely, same tradeoff already accepted
         // for the other two kagerou-family effects.
 #ifdef TARGET_PC
-    if (!dusk::vr::isImmersiveVr())
+        if (!dusk::vr::isImmersiveVr())
 #endif
         sun_packet->field_0x58 = dComIfGp_particle_set(sun_packet->field_0x58, 0x11C, &sp24, 0, 0);
     }

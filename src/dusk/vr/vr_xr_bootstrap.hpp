@@ -130,6 +130,11 @@ struct Bootstrap {
     // instead of the runtime's 72Hz default. Never true on the D3D12/PC
     // branch.
     bool hasDisplayRefreshRate = false;
+    // XR_FB_composition_layer_settings (Meta standalone, "Super Resolution"
+    // sharpening): enabled only if advertised. vr_main.cpp chains
+    // XrCompositionLayerSettingsFB onto the projection layer when
+    // game.vrSuperResolution is on. Never true on the D3D12/PC branch.
+    bool hasLayerSettings = false;
     PFN_xrEnumerateDisplayRefreshRatesFB xrEnumerateDisplayRefreshRatesFB_ = nullptr;
     PFN_xrRequestDisplayRefreshRateFB xrRequestDisplayRefreshRateFB_ = nullptr;
     PFN_xrPerfSettingsSetPerformanceLevelEXT xrPerfSettingsSetPerformanceLevelEXT_ = nullptr;
@@ -272,6 +277,10 @@ inline Bootstrap initialize() {
     boot.hasDisplayRefreshRate = instanceExtensionAvailable(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     if (boot.hasDisplayRefreshRate) {
         enabledExtensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    }
+    boot.hasLayerSettings = instanceExtensionAvailable(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
+    if (boot.hasLayerSettings) {
+        enabledExtensions.push_back(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
     }
 #endif
 
