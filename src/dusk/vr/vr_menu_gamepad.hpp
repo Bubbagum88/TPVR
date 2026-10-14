@@ -53,7 +53,11 @@
 #include <cstdio>
 
 #include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_joystick.h>
+#include <aurora/aurora.h>  // aurora_set_background_input
+
+#include "dusk/settings.h"  // game.allowBackgroundInput (restored on detach)
 
 #include "dusk/vr/vr_debug_log.hpp"  // duskVrLog/duskVrSnprintf
 
@@ -169,6 +173,24 @@ inline void updateVrMenuGamepadPlayerIndex() {
     }
     if (SDL_GetGamepadPlayerIndex(gamepad) != static_cast<int>(kVrMenuGamepadPort)) {
         SDL_SetGamepadPlayerIndex(gamepad, static_cast<int>(kVrMenuGamepadPort));
+    }
+}
+
+// Call once per real frame while attached. The virtual gamepad's
+// SDL_EVENT_GAMEPAD_* events are subject to the same window-focus filter
+// as a physical pad: with game.allowBackgroundInput off, SDL silently drops
+// them whenever the desktop window isn't focused -- which in VR is most of
+// the time (headset on, or the XR simulator window holding focus). Force
+// background joystick events on for the whole VR session instead; re-
+// asserted every frame so toggling "Allow Background Inputs" off in the
+// settings menu can't cut off the menu's own input mid-session.
+// detachVrMenuGamepad() restores the user's setting.
+inline void enforceVrMenuGamepadBackgroundInput() {
+    if (detail::g_vrMenuGamepadInstanceId == 0) {
+        return;
+    }
+    if (!SDL_GetHintBoolean(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, false)) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
 }
 
@@ -737,6 +759,8 @@ inline void detachVrMenuGamepad() {
     }
     SDL_DetachVirtualJoystick(detail::g_vrMenuGamepadInstanceId);
     detail::g_vrMenuGamepadInstanceId = 0;
+    // Undo enforceVrMenuGamepadBackgroundInput()'s override.
+    aurora_set_background_input(dusk::getSettings().game.allowBackgroundInput.getValue());
     duskVrLog("[dusk::vr::menugamepad] detached\n");
 }
 
