@@ -2034,7 +2034,6 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         s_menuWasVisibleLastRealFrame = menuVisible;
     }
     updateVrMenuGamepadPlayerIndex();
-    enforceVrMenuGamepadBackgroundInput();
     // RE-ENABLED 2026-08-18 to test vr_menu_gamepad.hpp's v8 navigation
     // redesign (dominant-axis selection + a pulse gate fully decoupled
     // from neutralizeVrMenuGamepadState() -- see that header's "Left-stick
