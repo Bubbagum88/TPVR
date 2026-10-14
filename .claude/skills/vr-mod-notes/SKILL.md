@@ -15308,3 +15308,216 @@ event checks.
 (item wheel, menus, file select, events all use the head-locked panel).
 Size/offset/angle constants left at their first-guess values; no tuning
 requested.
+
+### Object shadows re-enabled behind a "Shadows" VR setting — built 2026-10-14, NOT yet tested in-headset
+
+Per user request ("re implement AND fix object shadows with a toggle").
+`game.vrShadows` (default OFF), VR tab > Appearance > "Shadows". Only
+works with single-pass stereo (the default); two-pass leaves shadows off.
+
+**Root causes found by reading the code (not confirmed with a capture):**
+1. **Shadow maps never rendered in VR.** `dComIfGd_imageDrawShadow()`
+   (renders casters into the RGB5A3 shadow textures via its own
+   `GXCreateFrameBuffer`) was skipped in VR (`m_Do_graphic.cpp`) because it
+   runs inside the eye pass. So `dDlst_shadowReal_c` always sampled a
+   never-written texture.
+2. **Shadows registered several times per frame.** Actor `draw()` calls
+   `dComIfGd_setShadow()`; VR runs the draw traversal several times per
+   frame (pre-loop HUD iterate + in-pass iterate), but the shadow list is
+   only reset by the legacy per-sim-tick `fpcDw_Handler` pass, and
+   `setReal()` ignores its key and always allocates. Real shadows stacked
+   (up to 8 slots), simple shadows piled up to 128.
+3. **Interpolated matrices from the wrong frame/camera.**
+   `dDlst_shadowControl_c::draw()` swapped the passed view matrix for its
+   interp replacement (the flatscreen camera's), and `imageDraw()` used
+   interpolated light matrices while `draw()` (already) used the raw
+   receiver matrix in VR.
+
+**Fix:**
+- `vr_render::beginStereoPass()` split into `prepareStereoView()` (V_c,
+  j3dSys view, culling frustum; no GX) and `openStereoPass()`.
+- `vr_main.cpp` single-pass branch, setting on: prepareStereoView ->
+  `drawlist.resetShadow()` (new, `d_drawlist.h`) -> one
+  `fpcM_DrawIterater()` -> `dComIfGd_imageDrawShadow(view->viewMtx)` ->
+  `GXSetProjection(view->projMtx)` -> lock registration
+  (`isVrShadowRegistrationLocked()`, checked at the top of `setReal()`/
+  `setSimple()`) -> openStereoPass. Lock + `areVrShadowsActive()` cleared at
+  tick() start and after endStereoPass.
+- Draw gates: `dDlst_shadowReal_c::draw()`, `dDlst_shadowSimple_c::draw()`
+  and the painter's `dComIfGd_drawShadow` call now run in immersive VR when
+  `areVrShadowsActive()`. `shadowControl::draw()` and `shadowReal::imageDraw()`
+  skip interp replacements in immersive VR.
+- Cost: one extra draw traversal + the shadow-map render, only when on.
+
+**Watch for in-headset**: shadows lagging their casters slightly while
+moving (set() uses sim-tick `current.pos` while models draw interpolated —
+same as flatscreen); stencil/dst-alpha simple shadows misbehaving in the
+two-half stereo replay; any actor whose draw() behaves badly when called
+one more time per frame. If shadows still stretch, capture before guessing:
+log `mRealNum`/`mSimpleNum` at draw time and check the shadow texture in
+RenderDoc.
+
+**First in-headset test (2026-10-14): no shadows visible at all** (config
+confirmed: vrShadows on, single-pass on, screen mode off). A
+`[dusk::vr::shadowdiag]` count log was added, then removed before it was
+ever captured -- user paused the feature ("continue this fix later").
+Leading theory, NOT verified: actor `draw()` (which registers shadows)
+doesn't run in VR's per-frame `fpcM_DrawIterater()` at all -- section 20
+found `daAlink_c::draw()` only runs from the legacy per-sim-tick
+`fpcDw_Handler` pass -- so the shadow step's reset + iterate leaves the list
+empty. If confirmed, keep the list from the sim-tick pass instead of
+resetting it (and drop the extra iterate). Resume by re-adding a count of
+`mShadowControl.mRealNum/mSimpleNum` before reset, after the iterate, and
+draws performed, and capturing it once.
+
+### Full body IK ("Full Body" VR setting, default ON) — built 2026-10-14, NOT yet tested in-headset
+
+Per user request: show Link's whole body (not the head) in first person,
+arms following the tracked hands. `game.vrFullBody` (default true), VR tab >
+Appearance > "Full Body". The old "Experimental: Show Link's Body"
+(`vrShowBody`) toggle still exists; either one shows the body.
+- Body shown: `hideBodyForVr` in `d_a_alink.cpp` also requires
+  `!vrFullBody`. Arms shown: `updateFrame()` calls new `hideEarsShowArms()`
+  (Hero's Clothes: show 0,1,2,10, hide 7,8; Ordon: show 6 bl_skin_m, hide
+  1,2) instead of `hideArmsAndEars()`. Face/hat still hidden.
+- IK: `vr_link::refreshFullBodyIkLive()` (`vr_link_visibility.hpp`, the
+  "Full body IK" section), called from tick() right before
+  `refreshTrackedItemMtxLive()`. Gate `isFullBodyIkActive()`: setting on,
+  hand tracking valid, first person, not wolf/swimming/crawling/paused/
+  clothes-change. Steps: copy every joint's interpolated matrix
+  (`lookup_replacement(getAnmMtx(j))`) into the buffer, two-bone IK per arm
+  (hand joints 9/0xE; elbow/shoulder = parent chain skipping <3-unit helper
+  joints; pole = down + 0.6 outward + 0.3 back), forearm twist taken from the
+  tracked hand, hand joint = tracked hand matrix exactly, each step a rigid
+  delta on the subtree, then `calcWeightEnvelopeMtx()` +
+  `markModelJointsLive()`. Copying the interpolated pose first is what should
+  avoid round 7's 30Hz body stutter. Link is GPU-skinned (no SkinPosCpu /
+  J3DSkinDeform), so rebuilding envelopes is what moves the mesh.
+- One-shot `[dusk::vr::ik] arm chain ...` log prints the chain joint names
+  (verify elbow/shoulder are the real elbow/shoulder; remove once confirmed).
+Untested risks: the known "body ends up in front of me on rotation" bug
+(still open, see "Attach Body Rotation to Headset") is now visible by
+default; neck/collar/upper body may clip the camera; elbow pole direction
+and Link's arm length vs. the player's reach (out of reach = straight arm +
+stretched wrist); whether the body's own hand materials (al_handLA/RA)
+double up with mpLinkHandModel.
+
+**Follow-up (same day):** user confirmed the arms follow the hands well,
+but the body jittered while walking. Likely cause (not measured): the camera
+anchor is extrapolated a tick ahead (`kEyeAnchorExtrapolationGain`) while
+the body draws interpolated, so their gap changes every tick. Fix, plus the
+user's request to attach the neck to the headset: new
+`game.vrFullBodyHeadAnchor` ("Body Follows Headset", default ON). In
+`refreshFullBodyIkLive(cameraEye, headYawS)` (now takes the frame's
+`getVrCameraEyeAnchor()` result and `getHeadMoveAngleS()`), after the
+interpolated pose is copied in and before the arm IK, the whole skeleton
+gets one rigid transform: yaw by (head yaw - torso yaw from the shoulder
+line), and translate so the head joint's localEye point (12,-8,0, same as
+`setBodyPartPos()`) lands on the camera. Stored as `s_bodyAnchorDelta`
+and also applied (`applyBodyAnchorToModel()`) to the resting sword/shield,
+the lantern resting pose, and the sheath (new `getSheathModel()`; given a
+`refreshRestingPoseSmoothed()` + live mark only while the anchor is on).
+Also: the interpolated-pose copy is now all-or-nothing (bail if any joint
+has no replacement) so solved poses can't compound between sim ticks.
+Visual-only: `current`/`shape_angle` untouched. Expected side effects:
+legs follow the head (lean/duck moves the whole body; strafing runs
+"forward"); body pitch doesn't follow head pitch by design.
+
+**Follow-up 2 (same day): ROOT CAUSE of the 30fps body jitter found by
+reading `frame_interpolation.cpp`:** `mark_live_this_frame()` keys are only
+cleared in `begin_record()` (a sim tick starting), NOT every presentation
+frame, and `lookup_replacement()` refuses live keys. So after the IK marked
+the body live, every following frame until the next tick failed the
+all-or-nothing interpolated lookup, bailed, and the body stayed frozen at the
+last solved pose -> updates only right after each sim tick. Same bail left
+`s_bodyAnchorValid` false on those frames, so the resting shield wasn't
+anchored and swung to its unrotated spot (in front of you when running
+backwards). Fix: new `dusk::interp::lookup_interpolated()` (ignores the live
+set), used by the IK copy. **Lesson for any future per-frame overwrite of an
+interpolated matrix: "live" lasts until the next sim tick, not one frame --
+read the interpolated value with lookup_interpolated().** Built, NOT yet
+retested in-headset.
+
+**CONFIRMED FIXED IN-HEADSET 2026-10-14** -- user: "That fixed both
+issues" (smooth body while walking/running, stowed shield stays on the
+back). Full Body + Body Follows Headset both confirmed working. The
+one-shot `[dusk::vr::ik]` arm-chain log was removed. Still unchecked:
+neck/collar clipping into the camera, and how the legs read while
+strafing/backing up (they follow the head yaw by design).
+
+### Arm stretching for Full Body — built 2026-10-14, NOT yet tested in-headset
+
+Reaching past Link's arm length detached the hands (hand joint snapped to
+the controller, wrist skin stretched, visible gap). User chose to try
+stretching before any height/arm-length calibration. `ikSolveArm()` now
+takes `maxStretch`: stretch k = clamp(dist(shoulder,target)/(L1+L2), 1,
+maxStretch); both bones are solved at L1*k, L2*k. After the upper-arm swing,
+`ikStretchDelta()` (3x3 = I + (k-1)uu^T about the shoulder, along the new
+bone direction) is applied to the shoulder subtree; the forearm step's
+pure-rotation newF drops that scale from the forearm subtree, then the
+forearm gets its own stretch about the elbow along (target - elbow). The
+hand snap removes all scale from the hand subtree. k = 1 (normal reach)
+changes nothing. Setting `game.vrArmStretchMax` (float, default 1.25), VR
+tab > Appearance > "Arm Stretch Limit" 100-150%. Past the limit the old
+behavior (wrist stretch) remains. Possible artifacts: shading on stretched
+skin (non-uniform scale with GPU-skinned normals), shoulder region
+stretching with the upper arm.
+
+### Full Body follow-ups (2026-10-14) — built, NOT yet tested in-headset
+
+User report from testing, four fixes:
+1. **Rolling orbited the body around the camera** (head anchored to the
+   camera, roll animation spins the head). `isFullBodyTumbleProc()`
+   (FRONT_ROLL, FRONT_ROLL_CRASH, FRONT_ROLL_SUCCESS, SIDE_ROLL, BACK_JUMP,
+   ROLL_JUMP): while active with the head anchor on, `refreshFullBodyIkLive()`
+   keeps the last pose from before the move (`s_ikInterp`, now only updated
+   from a complete fresh lookup via `s_ikScratch`). Anchor + arm IK still
+   run on it. Body-mounted models get `s_bodyAnchorItemDelta` = anchor delta
+   * (frozen root * inv(real interpolated root)), so they ride the frozen
+   pose. The game's actual roll (movement, timing) is untouched.
+2. **Hit lag froze the body but not the hands.** Hit lag stops game time
+   (`aurora::time::scale()` 0 -> `game_clock` bumps the presentation epoch
+   -> `begin_frame()` clears interpolation history), so the all-or-nothing
+   interpolated lookup failed and the IK bailed. Inferred, not captured.
+   Now the last good pose is reused when no fresh one exists, so
+   anchor/IK keep running.
+3. **Wrist HUD in third person**: `vr_main.cpp` `drawHudBillboard()` forward
+   also requires `isVrFirstPerson(link)`.
+4. **Third person carried objects went to the controllers**: the
+   `setBodyPartPos()` mLeftHandPos/mRightHandPos tracked override
+   (`d_a_alink.cpp`, bombs/carry) now also requires `isVrFirstPerson(this)`.
+
+**Follow-up (same day)** — user: all four fixed, two new issues; both fixed, built, NOT yet retested:
+1. **Stowed sword/shield still rotated during rolls.** The root-joint
+   correction missed it: the roll animates the spine/back joints they hang
+   from. Now `applyBodyAnchorToModel()` picks the body joint nearest the
+   model's base position in the REAL interpolated pose (`s_ikActual`,
+   looked up only while a tumble is frozen, `s_ikFreezeActive`) and applies
+   frozen_j * inv(actual_j) before the anchor delta.
+   `s_bodyAnchorItemDelta` removed.
+2. **Carried objects lagged/stepped in first person.** Not new: they were
+   always placed once per sim tick from the previous frame's hand
+   midpoint; now obvious next to frame-rate hands/arms. New
+   `vr_link::refreshCarriedItemLive()` (tick(), after
+   `refreshTrackedItemMtxLive()`): captures the carried model's base once
+   per sim tick, then each frame translates it by (fresh tracked hand
+   midpoint - the midpoint `setBodyPartPos()` used, reported via new
+   `dusk::vr::noteTrackedHandMidpoint()`), calc + live. Only daObjCarry_c
+   (pots/barrels/boxes/skulls), daNbomb_c (bombs), daObjStone_c (small
+   rocks), and only while the object is within 60 units of the midpoint.
+   Not re-running daObjCarry_c's setBaseMtx: it accumulates a rotation per
+   call. Assumes the object builds its base after Link's execute in the same
+   tick; if it's one tick behind, look there.
+
+**Follow-up (same day):** carried objects CONFIRMED fixed. Hidden stowed gear CONFIRMED in-headset ("hidden when sheathed now"). Stowed
+sword/shield during rolls still bothered the user, so per request they're
+now simply hidden when stowed: `d_a_alink.cpp` draw has
+`hideStowedGearForVr = hideBodyForVr || (isImmersiveVr() &&
+isVrFirstPerson(this))`, used for the stowed sword (`!checkItemSwordEquip()`),
+stowed shield (`!checkShieldHandAttached()`) and the sheath (always).
+Third person and third-person cutscenes still show them. The nearest-joint
+roll correction in `applyBodyAnchorToModel()` stays (harmless; still
+applies to the lantern). Also removed the "Experimental: Show Link's Body"
+menu toggle; `vrShowBody` is no longer read by `hideBodyForVr` (ConfigVar
+still registered, inert), and the Third Person help text no longer refers
+to it.

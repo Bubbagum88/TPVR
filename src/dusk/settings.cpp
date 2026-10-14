@@ -107,6 +107,10 @@ UserSettings g_userSettings = {
         .vrSpaceWarpDebugRawProbe {"game.vrSpaceWarpDebugRawProbe", false},
         .vrShowBody {"game.vrShowBody", false},
         .vrHudOnLeftArm {"game.vrHudOnLeftArm", false},
+        .vrShadows {"game.vrShadows", false},
+        .vrFullBody {"game.vrFullBody", true},
+        .vrFullBodyHeadAnchor {"game.vrFullBodyHeadAnchor", true},
+        .vrArmStretchMax {"game.vrArmStretchMax", 1.25f},
         .vrThirdPerson {"game.vrThirdPerson", false},
         .vrThirdPersonFollowCameraYaw {"game.vrThirdPersonFollowCameraYaw", true},
         .vrZTargetCameraFocus {"game.vrZTargetCameraFocus", true},
@@ -435,6 +439,10 @@ void registerSettings() {
     Register(g_userSettings.game.vrSpaceWarpDebugRawProbe);
     Register(g_userSettings.game.vrShowBody);
     Register(g_userSettings.game.vrHudOnLeftArm);
+    Register(g_userSettings.game.vrShadows);
+    Register(g_userSettings.game.vrFullBody);
+    Register(g_userSettings.game.vrFullBodyHeadAnchor);
+    Register(g_userSettings.game.vrArmStretchMax);
     Register(g_userSettings.game.vrThirdPerson);
     Register(g_userSettings.game.vrThirdPersonFollowCameraYaw);
     Register(g_userSettings.game.vrZTargetCameraFocus);

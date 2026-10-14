@@ -486,6 +486,17 @@ bool isEyePassOpen() {
     return g_duskVREyePassOpen;
 }
 
+static bool g_vrShadowsActive = false;
+static bool g_vrShadowRegistrationLocked = false;
+
+bool areVrShadowsActive() {
+    return g_vrShadowsActive;
+}
+
+bool isVrShadowRegistrationLocked() {
+    return g_vrShadowRegistrationLocked;
+}
+
 bool isProtectedVrPassOpen() {
     return g_duskVREyePassOpen || g_duskVRScreenModePassOpen;
 }
@@ -505,8 +516,10 @@ void drawHudBillboard(TGXTexObj* hudTex) {
     //    collection/pause (3), maps (4/5), save, Agitha, etc.
     //  - pause flag: set by the dMw_c menu capture, kept as a backstop
     //  - any running event: dialogue text boxes, cutscenes, doors
+    //  - third person (the hands aren't tracked there)
+    auto* hudLink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
     if (dusk::getSettings().game.vrHudOnLeftArm.getValue() &&
-        dComIfGp_getLinkPlayer() != nullptr && dMeter2Info_getWindowStatus() == 0 &&
+        hudLink != nullptr && dusk::vr::isVrFirstPerson(hudLink) && dMeter2Info_getWindowStatus() == 0 &&
         !dComIfGp_isPauseFlag() && !dComIfGp_event_runCheck()) {
         cXyz hand, backNormal;
         if (vr_link::getTrackedHandWorldPos(true, hand.x, hand.y, hand.z) &&
@@ -564,6 +577,10 @@ void applyTrackedItemMtx(J3DModel* swordModel, J3DModel* shieldModel,
     vr_link::applyTrackedItemMtx(swordModel, shieldModel,
                                   leftItemJointMtx, leftHandJointMtx,
                                   rightItemJointMtx, rightHandJointMtx);
+}
+
+void noteTrackedHandMidpoint(bool valid, float x, float y, float z) {
+    vr_link::noteTrackedHandMidpoint(valid, cXyz(x, y, z));
 }
 
 void refreshTrackedItemMtxLive() {
@@ -1658,6 +1675,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     g_duskVRRenderingToHeadset = false;
     g_duskVREyePassOpen = false;
     g_duskVRScreenModePassOpen = false;
+    g_vrShadowsActive = false;
+    g_vrShadowRegistrationLocked = false;
     // Recomputed further down on frames that read controller input; an early
     // return must not leave a stale "sword is swinging" armed.
     g_physicalSwordSwingActive = false;
@@ -2889,10 +2908,21 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // live fix here.
     dusk::vr::logVrBodyRotationDiagLive(dusk::vr::getHeadMoveAngleS());
 
+    // Full body IK: poses the body's arms onto the tracked hands. Before
+    // the item refreshes, which read the body's item joints.
+    if (view_class* ikView = dComIfGd_getView()) {
+        vr_link::refreshFullBodyIkLive(
+            vr_link::getVrCameraEyeAnchor(ikView->lookat.eye, &hmdPose.position,
+                                          screenMode ? 0.0f : dusk::vr::getSmoothTurnYawRad()),
+            dusk::vr::getHeadMoveAngleS());
+    }
+
     // Same fix, same reason, extended to sword/shield (2026-08-09 follow-up
     // -- user-confirmed hands fixed, sword/shield still laggy, same root
     // cause). See refreshTrackedItemMtxLive()'s own comment.
     dusk::vr::refreshTrackedItemMtxLive();
+    // Carried pots/bombs/rocks follow the hands at frame rate.
+    vr_link::refreshCarriedItemLive();
 
     // Same fix, extended further to mHeldItemModel/mpKanteraModel (bow,
     // bottles, lantern, etc.). See refreshTrackedHeldItemMtxLive()'s own
@@ -3266,7 +3296,29 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         g_duskVRCurrentEyeIndex = 0;
         g_perfPreLoopMs = perfMs(g_perfMark, PerfClock::now());
         PerfClock::time_point perfT0 = PerfClock::now();
-        vr_render::beginStereoPass(stereoParams, directRender ? &directTarget : nullptr);
+        // VR object shadows. The game registers shadows from actor draw(),
+        // which VR runs several times a frame with nothing clearing the list
+        // in between (only the legacy per-sim-tick pass resets it), and it
+        // renders the shadow maps in mDoGph_Painter(), inside the eye pass,
+        // where a nested framebuffer isn't allowed -- so in VR the maps were
+        // never written and shadows stacked up. Instead: set up this frame's
+        // view, rebuild the shadow list from one draw traversal, render the
+        // maps before the pass opens, then lock registration so the
+        // traversal inside the pass doesn't add them again.
+        const bool vrShadows = dusk::getSettings().game.vrShadows.getValue();
+        if (vrShadows) {
+            const vr_render::StereoViewSetup viewSetup = vr_render::prepareStereoView(stereoParams);
+            view_class* view = dComIfGd_getView();
+            g_dComIfG_gameInfo.drawlist.resetShadow();
+            fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
+            dComIfGd_imageDrawShadow(view->viewMtx);
+            GXSetProjection(view->projMtx, GX_PERSPECTIVE);
+            g_vrShadowRegistrationLocked = true;
+            g_vrShadowsActive = true;
+            vr_render::openStereoPass(stereoParams, viewSetup, directRender ? &directTarget : nullptr);
+        } else {
+            vr_render::beginStereoPass(stereoParams, directRender ? &directTarget : nullptr);
+        }
         g_duskVREyePassOpen = true;
         PerfClock::time_point perfT1 = PerfClock::now();
         g_perfEyeBeginMs += perfMs(perfT0, perfT1);
@@ -3295,6 +3347,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         aurora::gfx::ResolvedTargets targets =
             vr_render::endStereoPass(directRender ? &directTarget : nullptr, spaceWarpFrame);
         g_duskVREyePassOpen = false;
+        g_vrShadowsActive = false;
+        g_vrShadowRegistrationLocked = false;
         g_perfEyeEndMs += perfMs(perfT4, PerfClock::now());
 
 #if DUSK_VR_XR_GRAPHICS_VULKAN

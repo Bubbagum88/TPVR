@@ -716,8 +716,17 @@ inline XrFovf unionFov(const XrFovf& a, const XrFovf& b) {
 // ResolvedTargets simply refer to it. Measured reason (aurora GPU profiler,
 // 2026-09-20): the pooled-texture route cost a 0.6ms snapshot copy plus a
 // ~4ms identity gamma-compute + copy hand-off per frame on the Quest 3.
-inline aurora::gfx::ResolvedTargets beginStereoPass(const StereoParams& sp,
-                                                    const aurora::gfx::ExternalPassTarget* external = nullptr) {
+// beginStereoPass() in two halves. prepareStereoView() does all the
+// CPU-side view setup (V_c, j3dSys view, the per-eye correction, culling
+// frustum) and touches no GX state, so work that has to see this frame's
+// view but must run before the pass opens (VR shadow maps: their render
+// opens its own framebuffer) can sit between it and openStereoPass().
+struct StereoViewSetup {
+    float projVec[2][6];
+    Mtx   eyeT[2];
+};
+
+inline StereoViewSetup prepareStereoView(const StereoParams& sp) {
     view_class* view = dComIfGd_getView();
     assert(view != nullptr && "VR: no active view_class -- called outside gameplay?");
 
@@ -747,8 +756,9 @@ inline aurora::gfx::ResolvedTargets beginStereoPass(const StereoParams& sp,
     // setting.
     constexpr bool kStereoDebugMono = false;
 
-    float projVec[2][6];
-    Mtx   eyeT[2];
+    StereoViewSetup setup;
+    float (&projVec)[2][6] = setup.projVec;
+    Mtx (&eyeT)[2] = setup.eyeT;
     for (int eye = 0; eye < 2; ++eye) {
         Mtx eyeView;
         const int srcEye = kStereoDebugMono ? 0 : eye;
@@ -796,7 +806,11 @@ inline aurora::gfx::ResolvedTargets beginStereoPass(const StereoParams& sp,
         g_eyeSymmetricFovyDeg = clipperFovyDeg;
         g_eyeSymmetricAspect = clipperAspect;
     }
+    return setup;
+}
 
+inline aurora::gfx::ResolvedTargets openStereoPass(const StereoParams& sp, const StereoViewSetup& setup,
+                                                   const aurora::gfx::ExternalPassTarget* external = nullptr) {
     // Everything the FIFO thread needs rides the GX stream, in order: no
     // AuroraGXSync() drain here (beginEye() needed two per frame purely to
     // sequence the native-logical-size flag against queued commands --
@@ -804,7 +818,7 @@ inline aurora::gfx::ResolvedTargets beginStereoPass(const StereoParams& sp,
     // once, which is what processes these before the pass opens.
     GXFlush();
     GXSetOffscreenNativeLogicalSize(GX_TRUE);
-    GXSetStereo(GX_TRUE, projVec[0], projVec[1], &eyeT[0][0][0], &eyeT[1][0][0]);
+    GXSetStereo(GX_TRUE, setup.projVec[0], setup.projVec[1], &setup.eyeT[0][0][0], &setup.eyeT[1][0][0]);
 
     // One double-wide pass. The game's native-resolution GXSetViewport/
     // GXSetScissor calls scale up to the full double-wide extent (see
@@ -818,6 +832,12 @@ inline aurora::gfx::ResolvedTargets beginStereoPass(const StereoParams& sp,
     g_currentEyeColorView = aurora::gfx::current_pass_color_view();
     aurora::gfx::set_protected_offscreen_pass(g_currentEyePassId);
     return {};
+}
+
+inline aurora::gfx::ResolvedTargets beginStereoPass(const StereoParams& sp,
+                                                    const aurora::gfx::ExternalPassTarget* external = nullptr) {
+    const StereoViewSetup setup = prepareStereoView(sp);
+    return openStereoPass(sp, setup, external);
 }
 
 // `wantDepth`: also snapshot the pass's depth into an R32Float texture

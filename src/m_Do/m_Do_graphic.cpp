@@ -2573,22 +2573,11 @@ int mDoGph_Painter() {
             fapGm_HIO_c::startCpuTimer();
             #endif
 
-            // User request this session: shadow stretching in VR
-            // (giant thin lines/static across the ground) resisted
-            // extensive investigation this session -- matrix math, float
-            // precision, frame-interpolation timing, shader
-            // texture-coordinate generation, and texture wrap mode were all
-            // checked and ruled out as the direct cause. Hiding entirely
-            // for now rather than leaving the distracting visual in place;
-            // revisit properly in a future session.
-            //
-            // CONFIRMED still stretched even after the double-precision
-            // fixes in setShadowRealMtx() (d_drawlist.cpp) and
-            // eyePoseToViewMtx() (vr_stereo_render.hpp) -- those were not
-            // the (or not the only) root cause. Re-disabled after a
-            // mistaken re-enable; do not re-enable again without new
-            // diagnostic evidence.
-            if (!dusk::vr::isImmersiveVr()) {
+            // VR: only when the "Shadows" VR setting built this frame's
+            // shadows before the eye pass (vr_main.cpp's shadow step). The
+            // old stretching came from shadow maps that were never rendered
+            // in VR plus shadows registered several times per frame.
+            if (!dusk::vr::isImmersiveVr() || dusk::vr::areVrShadowsActive()) {
                 GX_DEBUG_GROUP(dComIfGd_drawShadow, camera_p->view.viewMtx);
             }
 

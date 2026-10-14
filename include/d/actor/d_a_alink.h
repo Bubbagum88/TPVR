@@ -3726,6 +3726,7 @@ public:
     J3DModel* getBodyModel() const { return mpLinkModel; }
     J3DModel* getSwordModel() const { return mSwordModel; }
     J3DModel* getShieldModel() const { return mShieldModel; }
+    J3DModel* getSheathModel() const { return mSheathModel; }
     // Same VR held-item tracking, extended past sword/shield to the
     // broader "currently equipped item" model and the separate lantern/
     // kantera model (see vr_link_visibility.hpp's

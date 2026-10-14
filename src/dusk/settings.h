@@ -363,6 +363,21 @@ struct UserSettings {
         // floating just above the left hand/wrist instead of a panel in
         // front of your face. Default off.
         ConfigVar<bool> vrHudOnLeftArm;
+        // Object shadows (the projected "real" shadows under Link, NPCs and
+        // props, plus the simple blob shadows) in immersive VR. Only drawn
+        // with single-pass stereo. Default off.
+        ConfigVar<bool> vrShadows;
+        // Full body: shows Link's body in first person (face/hat/ears stay
+        // hidden) and poses his arms with IK so his hands follow the tracked
+        // controllers. Default on.
+        ConfigVar<bool> vrFullBody;
+        // With Full Body on: moves/turns the whole body every frame so its
+        // head sits at the camera and its torso faces where you look.
+        // Default on.
+        ConfigVar<bool> vrFullBodyHeadAnchor;
+        // Full Body: how far Link's arms may lengthen (1.25 = 25%) when your
+        // hand reaches past his full arm length.
+        ConfigVar<float> vrArmStretchMax;
         // Forces the WHOLE game into third-person VR, the same way Wolf
         // form/cutscenes already render (camera anchored to the flatscreen
         // third-person eye instead of Link's head, headset position/

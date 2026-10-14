@@ -5633,14 +5633,23 @@ void daAlink_c::setBodyPartPos() {
         // which is real physics/collision state (read by dBomb_c's own
         // logic), not just a draw matrix -- deliberately not attempted
         // here; not yet explored.
-        if (dusk::vr::isImmersiveVr()) {
+        // First person only: in third person the hands show the normal
+        // animation, so carried objects belong in Link's animated hands.
+        bool vrHandsOverridden = false;
+        if (dusk::vr::isImmersiveVr() && dusk::vr::isVrFirstPerson(this)) {
             float lx, ly, lz, rx, ry, rz;
             if (dusk::vr::getTrackedHandWorldPos(true, lx, ly, lz) &&
                 dusk::vr::getTrackedHandWorldPos(false, rx, ry, rz)) {
                 mLeftHandPos.set(lx, ly, lz);
                 mRightHandPos.set(rx, ry, rz);
+                vrHandsOverridden = true;
             }
         }
+        // Lets the VR code move a carried object with the hands between
+        // ticks (vr_link::refreshCarriedItemLive()).
+        dusk::vr::noteTrackedHandMidpoint(vrHandsOverridden, (mLeftHandPos.x + mRightHandPos.x) * 0.5f,
+                                          (mLeftHandPos.y + mRightHandPos.y) * 0.5f,
+                                          (mLeftHandPos.z + mRightHandPos.z) * 0.5f);
 #endif
         mDoMtx_multVecZero(mpLinkModel->getAnmMtx(field_0x30bc), &mLeftFootPos);
         mDoMtx_multVecZero(mpLinkModel->getAnmMtx(field_0x30be), &mRightFootPos);
@@ -20283,11 +20292,21 @@ int daAlink_c::draw() {
         // NOTE: setting renamed/inverted from "Hide Body" (vrHideBody) to
         // "Experimental: Show Link's Body" (vrShowBody), now off by default
         // -- same underlying mechanism, just flipped sense and default.
+        // 2026-10-14: the "Experimental: Show Link's Body" menu toggle was
+        // removed (Full Body replaces it); vrShowBody is no longer read so an
+        // old saved value can't leave the body showing with no way to turn
+        // it off.
         const BOOL hideBodyForVr = dusk::vr::isImmersiveVr() &&
-                                    !dusk::getSettings().game.vrShowBody.getValue() &&
+                                    !dusk::getSettings().game.vrFullBody.getValue() &&
                                     !dusk::getSettings().game.vrThirdPerson.getValue() &&
                                     !dusk::vr::isRealCutsceneRunning();
         modelDraw(mpLinkModel, isPlayerNoDraw || hideBodyForVr);
+        // Stowed sword/shield and the sheath are hidden in VR first person
+        // too, not only with the body hidden (2026-10-14, user request: with
+        // Full Body they kept swinging around on the back during rolls). The
+        // sword/shield still show whenever they're actually in your hand.
+        const BOOL hideStowedGearForVr =
+            hideBodyForVr || (dusk::vr::isImmersiveVr() && dusk::vr::isVrFirstPerson(this));
 
         if (dComIfGp_checkCameraAttentionStatus(field_0x317c, 0x20)) {
 #if PLATFORM_SHIELD
@@ -20362,7 +20381,7 @@ int daAlink_c::draw() {
             // (vr_link_visibility.hpp) -- so the sword stays visible,
             // tracking the hand, whenever it's actually being wielded, and
             // only disappears while resting on the back.
-            const BOOL hideStowedSwordForVr = hideBodyForVr && !checkItemSwordEquip();
+            const BOOL hideStowedSwordForVr = hideStowedGearForVr && !checkItemSwordEquip();
             if (!checkNoResetFlg3(FLG3_UNK_80000000)) {
                 modelDraw(mSwordModel, var_r3 || hideStowedSwordForVr);
             }
@@ -20372,7 +20391,7 @@ int daAlink_c::draw() {
             // the body whenever hideBodyForVr is on, regardless of whether
             // the sword itself is currently drawn.
             if (!checkWoodSwordEquip()) {
-                modelDraw(mSheathModel, var_r3 || hideBodyForVr);
+                modelDraw(mSheathModel, var_r3 || hideStowedGearForVr);
             }
         }
 
@@ -20390,7 +20409,7 @@ int daAlink_c::draw() {
             // Same reasoning as the sword above -- checkShieldHandAttached()
             // is the authoritative "actively held up/guarding" flag this
             // project's own VR shield-tracking work already established.
-            const BOOL hideStowedShieldForVr = hideBodyForVr && !checkShieldHandAttached();
+            const BOOL hideStowedShieldForVr = hideStowedGearForVr && !checkShieldHandAttached();
             modelDraw(mShieldModel, var_r3 || hideStowedShieldForVr);
             if (var_r24_2) {
                 tevStr.TevColor.r = 0;

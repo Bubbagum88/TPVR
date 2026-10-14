@@ -61,6 +61,14 @@ bool isImmersiveVr();
 // yet" -- the latter is exactly the safe window captureHudBillboard() and
 // captureMapCopy2D() (m_Do_graphic.cpp) already render into.
 bool isEyePassOpen();
+// VR object shadows (game.vrShadows): true from the frame's shadow step
+// (shadow maps rendered from this frame's view) until the stereo pass ends.
+// The shadow draw code checks this instead of its old blanket VR disable.
+bool areVrShadowsActive();
+// While true, dDlst_shadowControl_c drops new shadow registrations: actor
+// draw() runs again inside the stereo pass, and the shadows were already
+// registered once by the shadow step.
+bool isVrShadowRegistrationLocked();
 // True while any protected OpenXR render pass is open, including the
 // flat-camera source pass used by screen mode. Use before opening a nested
 // GX framebuffer pass; isEyePassOpen() remains eye-specific.
@@ -188,6 +196,9 @@ void refreshTrackedHeldItemMtxLive();
 // just for this one type, same reasoning as applyTrackedItemMtx()'s plain
 // float(*)[4] parameters above.
 bool getTrackedHandWorldPos(bool isLeftHand, float& outX, float& outY, float& outZ);
+// setBodyPartPos() reports the tracked hand midpoint it placed carried
+// objects from this sim tick (valid=false when it didn't override).
+void noteTrackedHandMidpoint(bool valid, float x, float y, float z);
 
 // Extends held-item tracking to daAlink_c::getLeftItemMatrix()/
 // getRightItemMatrix() (d_a_alink_link.inc) themselves -- fixes every
