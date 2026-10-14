@@ -15241,3 +15241,70 @@ arrived in steps. Now a smoothed bearing (`s_fpFocusSmoothedBearingRad`, exponen
 `pacing.dt`-based) eases toward the raw bearing and only the smoothed step is applied. The initial lock-on
 snap is unchanged and resets the smoothed value. CONFIRMED in-headset 2026-10-06 ("much smoother"). `kFocusSmoothingTimeConstantSec`
 is the knob: raise it for smoother/laggier, lower it for snappier.
+
+### Valve Index controller bindings — built 2026-10-13, NOT yet tested in-headset
+
+`createHandActionSet()` (`vr_xr_bootstrap.hpp`) now suggests full gameplay
+bindings for `/interaction_profiles/valve/index_controller` (was pose-only).
+Same actions/paths as Touch, except Index has A/B on both hands: left A/B
+-> `primary_click`/`secondary_click` (Touch's X/Y = D-pad left/up). Index
+has no menu button (system is runtime-reserved), so pause and the Dusklight
+menu chord rely on right stick click (already bound for Touch too). Not
+done: hand-mesh rotation calibration was tuned on Touch grip poses; Index's
+grip pose may sit at a slightly different angle -- if the hands look rotated
+on Index, that needs its own static offset, not a binding change.
+
+### "HUD on Left Arm" VR setting — built 2026-10-13, NOT yet tested in-headset
+
+`game.vrHudOnLeftArm` (default off), VR tab > Appearance > "HUD on Left
+Arm". `vr_main.cpp`'s `drawHudBillboard()` forward passes the tracked left
+hand's world position (`vr_link::getTrackedHandWorldPos(true, ...)`) to
+`vr_render::drawHudBillboard(tex, &pos)`; `computeArmHudPose()`
+(`vr_stereo_render.hpp`) puts a 0.30m-wide panel 0.12m above the hand,
+transformed into the current eye via `view->viewMtx` and billboarded on
+eye-local axes (does NOT follow hand rotation -- avoids depending on the
+hand-mesh calibration). Skipped for an eye when the anchor is behind it;
+falls back to the head-locked panel if hand data isn't valid. Z-test still
+off, so it draws over the hand/world. Tunables: `kArmHudWidthMeters`,
+`kArmHudAboveHandMeters` (untested guesses).
+
+**Follow-up (same day): watch-style redesign, built, NOT yet tested.** Per
+request ("anchor it to the back of the left hand and only show it when you
+look at it"). The panel now lies flat on the back of the left hand:
+`computeTrackedHandMatrices()` caches a back-of-hand normal from the RAW left
+grip pose (`+X` rotated by the yaw-adjusted quat, per the OpenXR grip-pose
+spec: +X = palm normal pointing away from the palm on the left hand) --
+deliberately not the hand-mesh calibration axes. `detail::kLeftBackOfHandSign`
+flips it if it shows on the palm instead. `computeArmHudPose(hand, normal, c)`
+centers it 5cm out along the normal, 0.20m wide, in the plane perpendicular
+to the normal with up = eye-up projected onto that plane (stays upright as the
+wrist rolls). Visibility: back of hand within 40deg of facing the eye AND
+hand within 30deg of view centre (hide at 55/40 -- hysteresis, state
+`g_armHudLooking`, updated in the per-eye draw); `g_armHudFade` eases over
+0.15s, advanced once per frame by `updateArmHudFade(pacing.dt)` in tick()
+next to `updateHudSmoothing()`. Fade is a 4th TEV stage (alpha *= KCOLOR0.a)
+only when fade < 1. Never drawn from behind.
+
+**Follow-up 2 (same day), built, NOT yet retested.** In-headset: panel was on
+the palm -- so on this setup the OpenXR left grip +X points INTO the palm,
+contrary to the reading of the spec above; `kLeftBackOfHandSign` = -1. Also,
+per request, the wrist anchor is now gameplay-only: `vr_main.cpp`'s
+`drawHudBillboard()` forward uses the normal head-locked panel whenever
+`dComIfGp_isPauseFlag()` (set by every dMw_c menu via its capture: pause/
+collection, maps, save, etc.) or `dComIfGp_event_runCheck()` (dialogue text
+boxes, cutscenes, doors) is true. Not covered: the item wheel, if it doesn't
+set the pause flag.
+
+**Follow-up 3 (same day), built, NOT yet tested.** Item wheel and file select
+also use the head-locked panel now. Gate in `vr_main.cpp`'s
+`drawHudBillboard()` forward: `dComIfGp_getLinkPlayer() != nullptr` (no Link
+on title/file select) and `dMeter2Info_getWindowStatus() == 0` (dMw_c sets 2
+for the item ring, 3 collection, 4/5 maps, 10 other menus -- see
+d_menu_window.cpp's *_init functions), in addition to the pause flag and
+event checks.
+
+**CONFIRMED WORKING IN-HEADSET 2026-10-13** ("fixed") -- back-of-hand side
+(`kLeftBackOfHandSign = -1`), look-to-show fade, and the gameplay-only gating
+(item wheel, menus, file select, events all use the head-locked panel).
+Size/offset/angle constants left at their first-guess values; no tuning
+requested.

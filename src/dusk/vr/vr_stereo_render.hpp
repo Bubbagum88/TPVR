@@ -1055,13 +1055,124 @@ inline HudQuadCorners computeHudPose() {
     return computeBillboardPose(g_hudSmoothedWorldForward, dist, halfW, halfH);
 }
 
+// "HUD on Left Arm" (game.vrHudOnLeftArm): a watch-style panel lying flat on
+// the back of the tracked left hand, shown only while you raise the back of
+// your hand toward your eyes (the "check your watch" motion).
+//
+// Placement: centered kArmHudOffBackMeters out from the grip along the
+// back-of-hand normal, lying in the plane perpendicular to that normal.
+// Its "up" is the eye's up projected onto that plane, so the text stays
+// upright however the wrist is rolled. Untested starting values -- tune
+// in-headset.
+inline constexpr float kArmHudWidthMeters = 0.20f;
+inline constexpr float kArmHudHeightMeters = kArmHudWidthMeters * (448.0f / 608.0f);
+inline constexpr float kArmHudOffBackMeters = 0.05f;
+// Visibility: the back of the hand must face the eye (angle between the
+// normal and the hand->eye direction) AND the hand must be near the centre
+// of view. Separate show/hide angles give hysteresis so it doesn't flicker
+// at the edge.
+inline constexpr float kArmHudFacingShowDeg = 40.f, kArmHudFacingHideDeg = 55.f;
+inline constexpr float kArmHudInViewShowDeg = 30.f, kArmHudInViewHideDeg = 40.f;
+inline constexpr float kArmHudFadeSec = 0.15f;
+
+inline bool g_armHudLooking = false;  // hysteresis state, updated per eye draw
+inline float g_armHudFade = 0.f;      // 0..1, advanced once per frame
+
+// Once per frame from tick(): eases the fade toward the looking state.
+inline void updateArmHudFade(float dtSeconds) {
+    const float step = kArmHudFadeSec > 0.f ? dtSeconds / kArmHudFadeSec : 1.f;
+    if (g_armHudLooking) {
+        g_armHudFade = std::min(1.f, g_armHudFade + step);
+    } else {
+        g_armHudFade = std::max(0.f, g_armHudFade - step);
+    }
+}
+
+// Returns false if the panel shouldn't be drawn for this eye at all.
+inline bool computeArmHudPose(const cXyz& handWorldPos, const cXyz& backNormalWorld,
+                              HudQuadCorners& c) {
+    view_class* view = dComIfGd_getView();
+    assert(view != nullptr && "VR: computeArmHudPose() called outside gameplay?");
+    const Mtx& m = view->viewMtx;
+
+    // Normal into eye space (rotation only).
+    float nx = m[0][0] * backNormalWorld.x + m[0][1] * backNormalWorld.y + m[0][2] * backNormalWorld.z;
+    float ny = m[1][0] * backNormalWorld.x + m[1][1] * backNormalWorld.y + m[1][2] * backNormalWorld.z;
+    float nz = m[2][0] * backNormalWorld.x + m[2][1] * backNormalWorld.y + m[2][2] * backNormalWorld.z;
+    const float nLen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (nLen < 1e-4f) return false;
+    nx /= nLen; ny /= nLen; nz /= nLen;
+
+    const float off = kArmHudOffBackMeters * kHudUnitsPerMetre;
+    const cXyz centerWorld(handWorldPos.x + backNormalWorld.x / nLen * off,
+                           handWorldPos.y + backNormalWorld.y / nLen * off,
+                           handWorldPos.z + backNormalWorld.z / nLen * off);
+    cXyz e;
+    mDoMtx_multVec(view->viewMtx, &centerWorld, &e);
+    const float dist = std::sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
+    if (dist < 1.f || e.z >= -1.f) {
+        g_armHudLooking = false;
+        return false;
+    }
+
+    // The eye sits at the origin of eye space, looking down -Z.
+    const float facingCos = -(nx * e.x + ny * e.y + nz * e.z) / dist;  // normal vs panel->eye
+    const float inViewCos = -e.z / dist;                               // forward vs eye->panel
+    const auto cosDeg = [](float deg) { return std::cos(deg * 3.14159265f / 180.f); };
+    if (g_armHudLooking) {
+        g_armHudLooking = facingCos > cosDeg(kArmHudFacingHideDeg) &&
+                          inViewCos > cosDeg(kArmHudInViewHideDeg);
+    } else {
+        g_armHudLooking = facingCos > cosDeg(kArmHudFacingShowDeg) &&
+                          inViewCos > cosDeg(kArmHudInViewShowDeg);
+    }
+    // Never draw from behind (the texture would read mirrored).
+    if (facingCos <= 0.f) return false;
+
+    // Panel up = eye up projected onto the panel plane; right = up x normal.
+    float ux = -ny * nx, uy = 1.f - ny * ny, uz = -ny * nz;
+    float uLen = std::sqrt(ux * ux + uy * uy + uz * uz);
+    if (uLen < 1e-3f) {
+        // Normal points straight up/down in eye space: use eye forward-ish.
+        ux = 0.f; uy = 0.f; uz = -1.f; uLen = 1.f;
+    }
+    ux /= uLen; uy /= uLen; uz /= uLen;
+    const float rx = uy * nz - uz * ny;
+    const float ry = uz * nx - ux * nz;
+    const float rz = ux * ny - uy * nx;
+
+    const float hw = kArmHudWidthMeters * 0.5f * kHudUnitsPerMetre;
+    const float hh = kArmHudHeightMeters * 0.5f * kHudUnitsPerMetre;
+    const float sx[4] = {-1.f, 1.f, 1.f, -1.f};
+    const float sy[4] = {1.f, 1.f, -1.f, -1.f};  // TL, TR, BR, BL
+    for (int i = 0; i < 4; i++) {
+        c.x[i] = e.x + rx * hw * sx[i] + ux * hh * sy[i];
+        c.y[i] = e.y + ry * hw * sx[i] + uy * hh * sy[i];
+        c.z[i] = e.z + rz * hw * sx[i] + uz * hh * sy[i];
+    }
+    return true;
+}
+
 // Call once per eye, from mDoGph_Painter()'s per-eye HUD call site (replaces
 // the flat mDoGph_drawHud2D() call there while in VR). Must run after the
 // eye's real scene draw (so it draws on top) and needs `hudTex` already
 // populated for this frame by mDoGph_gInf_c::captureHudBillboard().
-inline void drawHudBillboard(TGXTexObj* hudTex) {
+// armHandPos/armBackNormal: when both non-null ("HUD on Left Arm"), the
+// panel sits on the back of the left hand and fades with g_armHudFade.
+inline void drawHudBillboard(TGXTexObj* hudTex, const cXyz* armHandPos = nullptr,
+                             const cXyz* armBackNormal = nullptr) {
     view_class* view = dComIfGd_getView();
     assert(view != nullptr && "VR: drawHudBillboard() called outside gameplay?");
+    HudQuadCorners c;
+    float alphaScale = 1.f;
+    if (armHandPos != nullptr && armBackNormal != nullptr) {
+        // Run the pose (it updates the looking state) even while faded out.
+        const bool drawable = computeArmHudPose(*armHandPos, *armBackNormal, c);
+        alphaScale = g_armHudFade;
+        if (!drawable || alphaScale <= 0.01f) return;
+    } else {
+        c = computeHudPose();
+    }
 
     // GXSetProjection is a stateful register write, not automatic -- the 3D
     // world draw and the (skipped-in-VR, but still state-touching) HUD path
@@ -1104,7 +1215,7 @@ inline void drawHudBillboard(TGXTexObj* hudTex) {
     GXSetTevSwapModeTable(GX_TEV_SWAP2, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_GREEN);
     GXSetTevSwapModeTable(GX_TEV_SWAP3, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_BLUE);
 
-    GXSetNumTevStages(3);
+    GXSetNumTevStages(alphaScale < 1.f ? 4 : 3);
 
     // Stage 0: real color; alpha = texture's red channel (via SWAP1).
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR_NULL);
@@ -1130,6 +1241,19 @@ inline void drawHudBillboard(TGXTexObj* hudTex) {
     GXSetTevAlphaIn(GX_TEVSTAGE2, GX_CA_TEXA, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
     GXSetTevAlphaOp(GX_TEVSTAGE2, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 
+    // Stage 3 (arm HUD fade only): alpha *= konst alpha.
+    if (alphaScale < 1.f) {
+        const GXColor fade = {0, 0, 0, static_cast<u8>(alphaScale * 255.f)};
+        GXSetTevKColor(GX_KCOLOR0, fade);
+        GXSetTevKAlphaSel(GX_TEVSTAGE3, GX_TEV_KASEL_K0_A);
+        GXSetTevOrder(GX_TEVSTAGE3, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR_NULL);
+        GXSetTevSwapMode(GX_TEVSTAGE3, GX_TEV_SWAP0, GX_TEV_SWAP0);
+        GXSetTevColorIn(GX_TEVSTAGE3, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+        GXSetTevColorOp(GX_TEVSTAGE3, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        GXSetTevAlphaIn(GX_TEVSTAGE3, GX_CA_ZERO, GX_CA_APREV, GX_CA_KONST, GX_CA_ZERO);
+        GXSetTevAlphaOp(GX_TEVSTAGE3, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    }
+
     GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_SET);
     // Disabled Z-test/write: the panel always draws on top of the 3D world,
     // same as the flat ortho HUD it replaces (never occluded by scene
@@ -1140,7 +1264,6 @@ inline void drawHudBillboard(TGXTexObj* hudTex) {
 
     GXLoadTexObj(hudTex, GX_TEXMAP0);
 
-    const HudQuadCorners c = computeHudPose();
     GXBegin(GX_QUADS, GX_VTXFMT0, 4);
     GXPosition3f32(c.x[0], c.y[0], c.z[0]); GXTexCoord2f32(0.0f, 0.0f);
     GXPosition3f32(c.x[1], c.y[1], c.z[1]); GXTexCoord2f32(1.0f, 0.0f);

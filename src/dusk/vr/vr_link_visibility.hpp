@@ -800,6 +800,15 @@ inline Mtx s_rightHandMtx;
 inline Mtx s_leftHandMtx;
 inline bool s_handMtxValid = false;
 
+// Game-world unit normal pointing OUT of the back of the left hand (used by
+// "HUD on Left Arm"). Taken straight from the left OpenXR grip pose, not the
+// hand-mesh calibration: per the OpenXR spec, the grip pose's +X axis is the
+// palm normal pointing AWAY from the palm on the left hand. If testing shows
+// the panel appears on the palm instead, flip kLeftBackOfHandSign.
+// Flipped to -1 on 2026-10-13: in-headset, +X put the panel on the palm.
+inline constexpr float kLeftBackOfHandSign = -1.0f;
+inline Vec3f s_leftBackOfHand{0.f, 1.f, 0.f};
+
 // Sword/shield RESTING-POSE (not-hand-attached) smoothing state: the
 // belt/back-relative pose setItemMatrix() computes is only written once per
 // SIM TICK. Marking that matrix "live" (to bypass frame_interp's stale
@@ -1482,7 +1491,20 @@ inline void computeTrackedHandMatrices(const XrVector3f& hmdPos,
                                         float yawRad) {
     buildHandMtx(detail::s_rightHandMtx, hmdPos, rightControllerPose, eyeAnchor, VR_SCALE_FACTOR, false, yawRad);
     buildHandMtx(detail::s_leftHandMtx, hmdPos, leftControllerPose, eyeAnchor, VR_SCALE_FACTOR, true, yawRad);
+    // Same yaw-adjusted orientation buildHandMtx() uses; tracking-space
+    // vectors map to game-world vectors with no axis flip (see its comment).
+    const XrQuaternionf q = dusk::vr::rotateYawQuat(leftControllerPose.orientation, yawRad);
+    detail::s_leftBackOfHand = rotateVecByQuat(q.x, q.y, q.z, q.w,
+                                               Vec3f{detail::kLeftBackOfHandSign, 0.f, 0.f});
     detail::s_handMtxValid = true;
+}
+
+inline bool getLeftBackOfHandWorldNormal(float& outX, float& outY, float& outZ) {
+    if (!detail::s_handMtxValid) return false;
+    outX = detail::s_leftBackOfHand.x;
+    outY = detail::s_leftBackOfHand.y;
+    outZ = detail::s_leftBackOfHand.z;
+    return true;
 }
 
 inline void updateFrame(const FrameInput& input) {

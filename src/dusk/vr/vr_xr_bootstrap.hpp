@@ -961,7 +961,8 @@ inline HandActions createHandActionSet(XrInstance instance) {
     // session, still needed for hand-tracking visuals on all of them.
     suggestForProfile("/interaction_profiles/khr/simple_controller", bindings, 4);
     suggestForProfile("/interaction_profiles/htc/vive_controller", bindings, 4);
-    suggestForProfile("/interaction_profiles/valve/index_controller", bindings, 4);
+    // valve/index_controller gets full gameplay bindings below, after the
+    // Touch paths are resolved.
 
     // Gameplay button/axis bindings, scoped to oculus/touch_controller only
     // (Quest 3's native profile, and what SteamVR/Virtual Desktop/Meta Link
@@ -1023,6 +1024,38 @@ inline HandActions createHandActionSet(XrInstance instance) {
     };
     suggestForProfile("/interaction_profiles/oculus/touch_controller", touchBindings,
                       static_cast<uint32_t>(std::size(touchBindings)));
+
+    // Valve Index: same layout as Touch. Index has A/B on BOTH hands, so the
+    // left A/B stand in for Touch's X/Y (D-pad left/up). Index has no menu
+    // button (system is reserved by the runtime), so pause and the
+    // Dusklight-menu chord use right stick click, which Touch already
+    // supports too. Trigger, squeeze, thumbsticks, stick clicks and haptics
+    // use the same input paths as Touch.
+    XrPath leftAClickPath = XR_NULL_PATH, leftBClickPath = XR_NULL_PATH;
+    xrStringToPath(instance, "/user/hand/left/input/a/click", &leftAClickPath);
+    xrStringToPath(instance, "/user/hand/left/input/b/click", &leftBClickPath);
+    XrActionSuggestedBinding indexBindings[] = {
+        {actions.gripPoseAction, leftBindingPath},
+        {actions.gripPoseAction, rightBindingPath},
+        {actions.aimPoseAction, leftAimBindingPath},
+        {actions.aimPoseAction, rightAimBindingPath},
+        {actions.triggerValueAction, leftTriggerPath},
+        {actions.triggerValueAction, rightTriggerPath},
+        {actions.squeezeValueAction, leftSqueezePath},
+        {actions.squeezeValueAction, rightSqueezePath},
+        {actions.thumbstickAction, leftStickPath},
+        {actions.thumbstickAction, rightStickPath},
+        {actions.primaryClickAction, leftAClickPath},
+        {actions.primaryClickAction, rightAClickPath},
+        {actions.secondaryClickAction, leftBClickPath},
+        {actions.secondaryClickAction, rightBClickPath},
+        {actions.stickClickAction, rightStickClickPath},
+        {actions.stickClickAction, leftStickClickPath},
+        {actions.hapticAction, leftHapticPath},
+        {actions.hapticAction, rightHapticPath},
+    };
+    suggestForProfile("/interaction_profiles/valve/index_controller", indexBindings,
+                      static_cast<uint32_t>(std::size(indexBindings)));
 
     return actions;
 }

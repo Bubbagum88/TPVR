@@ -28,6 +28,7 @@
 #include "SSystem/SComponent/c_math.h"          // cM_atan2s -- getHeadMoveAngleS()
 #include "m_Do/m_Do_controller_pad.h"            // mDoCPd_c::getSubStickX -- real physical gamepad C-stick
 #include "m_Do/m_Do_graphic.h"                  // mDoGph_gInf_c::captureHudBillboard
+#include "d/d_meter2_info.h"                    // dMeter2Info_getWindowStatus -- HUD on Left Arm gating
 #include "f_pc/f_pc_manager.h"                  // fpcM_DrawIterater, fpcM_Draw
 #include "dusk/game_clock.h"                    // dusk::game_clock::FrameTiming
 #include "dusk/interp/material.h" // replay_models_for_current_view()
@@ -494,6 +495,26 @@ void getEyeSymmetricFov(float* fovyDeg, float* aspect) {
 }
 
 void drawHudBillboard(TGXTexObj* hudTex) {
+    // "HUD on Left Arm": watch-style panel on the back of the tracked left
+    // hand, shown only while looked at; falls back to the normal
+    // head-locked panel if hand tracking isn't valid this frame.
+    // Ordinary gameplay only. These use the normal head-locked panel so they
+    // stay readable:
+    //  - no Link actor: title and file select screens
+    //  - menu window open (dMw_c window status != 0): item wheel (2),
+    //    collection/pause (3), maps (4/5), save, Agitha, etc.
+    //  - pause flag: set by the dMw_c menu capture, kept as a backstop
+    //  - any running event: dialogue text boxes, cutscenes, doors
+    if (dusk::getSettings().game.vrHudOnLeftArm.getValue() &&
+        dComIfGp_getLinkPlayer() != nullptr && dMeter2Info_getWindowStatus() == 0 &&
+        !dComIfGp_isPauseFlag() && !dComIfGp_event_runCheck()) {
+        cXyz hand, backNormal;
+        if (vr_link::getTrackedHandWorldPos(true, hand.x, hand.y, hand.z) &&
+            vr_link::getLeftBackOfHandWorldNormal(backNormal.x, backNormal.y, backNormal.z)) {
+            vr_render::drawHudBillboard(hudTex, &hand, &backNormal);
+            return;
+        }
+    }
     vr_render::drawHudBillboard(hudTex);
 }
 
@@ -3095,6 +3116,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // computeHudPose() comments. Added per user feedback that the
     // head-locked panel felt "really shaky" with raw per-frame tracking.
     vr_render::updateHudSmoothing(hmdPose, renderYaw);
+    vr_render::updateArmHudFade(pacing.dt);
 
     // CONFIRMED this session (first HUD-billboard in-headset test came back
     // solid black): mDoGph_drawHud2D() draws nothing until fpcM_DrawIterater()

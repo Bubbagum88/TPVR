@@ -106,6 +106,7 @@ UserSettings g_userSettings = {
         .vrSpaceWarpDebugReversedDepth {"game.vrSpaceWarpDebugReversedDepth", false},
         .vrSpaceWarpDebugRawProbe {"game.vrSpaceWarpDebugRawProbe", false},
         .vrShowBody {"game.vrShowBody", false},
+        .vrHudOnLeftArm {"game.vrHudOnLeftArm", false},
         .vrThirdPerson {"game.vrThirdPerson", false},
         .vrThirdPersonFollowCameraYaw {"game.vrThirdPersonFollowCameraYaw", true},
         .vrZTargetCameraFocus {"game.vrZTargetCameraFocus", true},
@@ -433,6 +434,7 @@ void registerSettings() {
     Register(g_userSettings.game.vrSpaceWarpDebugReversedDepth);
     Register(g_userSettings.game.vrSpaceWarpDebugRawProbe);
     Register(g_userSettings.game.vrShowBody);
+    Register(g_userSettings.game.vrHudOnLeftArm);
     Register(g_userSettings.game.vrThirdPerson);
     Register(g_userSettings.game.vrThirdPersonFollowCameraYaw);
     Register(g_userSettings.game.vrZTargetCameraFocus);

@@ -359,6 +359,10 @@ struct UserSettings {
         // a player preference for players who don't want to see their own
         // avatar body in VR, not a bug workaround).
         ConfigVar<bool> vrShowBody;
+        // Draws the HUD (hearts, rupees, minimap, buttons) as a small panel
+        // floating just above the left hand/wrist instead of a panel in
+        // front of your face. Default off.
+        ConfigVar<bool> vrHudOnLeftArm;
         // Forces the WHOLE game into third-person VR, the same way Wolf
         // form/cutscenes already render (camera anchored to the flatscreen
         // third-person eye instead of Link's head, headset position/

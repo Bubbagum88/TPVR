@@ -1094,6 +1094,14 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             [] { return !getSettings().game.vrSnapTurn.getValue(); }, {}, " deg");
 
         leftPane.add_section("Appearance");
+        config_bool_select(leftPane, rightPane, getSettings().game.vrHudOnLeftArm,
+            {
+                .key = "HUD on Left Arm",
+                .helpText = "Shows the HUD (hearts, rupees, minimap and buttons) on the back "
+                            "of your left hand, like a watch, instead of in front of your "
+                            "face. It only appears while you turn the back of your hand "
+                            "toward your eyes and look at it. Off by default."
+            });
         config_bool_select(leftPane, rightPane, getSettings().game.vrThirdPerson,
             {
                 .key = "Third Person",
