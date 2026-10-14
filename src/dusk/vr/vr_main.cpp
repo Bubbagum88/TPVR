@@ -591,6 +591,10 @@ bool isVrFirstPerson(daAlink_c* link) {
     return vr_link::isFirstPerson(link);
 }
 
+bool areVrHandsTracked(daAlink_c* link) {
+    return vr_link::isFirstPerson(link) && !vr_link::isHandTrackingSuspended(link);
+}
+
 bool isWolfFirstPersonView(daAlink_c* link) {
     return vr_link::isWolfFirstPersonView(link);
 }

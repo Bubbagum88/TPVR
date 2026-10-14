@@ -110,6 +110,7 @@ UserSettings g_userSettings = {
         .vrShadows {"game.vrShadows", false},
         .vrFullBody {"game.vrFullBody", true},
         .vrFullBodyHeadAnchor {"game.vrFullBodyHeadAnchor", true},
+        .vrFullBodyShowRolls {"game.vrFullBodyShowRolls", false},
         .vrArmStretchMax {"game.vrArmStretchMax", 1.25f},
         .vrThirdPerson {"game.vrThirdPerson", false},
         .vrThirdPersonFollowCameraYaw {"game.vrThirdPersonFollowCameraYaw", true},
@@ -442,6 +443,7 @@ void registerSettings() {
     Register(g_userSettings.game.vrShadows);
     Register(g_userSettings.game.vrFullBody);
     Register(g_userSettings.game.vrFullBodyHeadAnchor);
+    Register(g_userSettings.game.vrFullBodyShowRolls);
     Register(g_userSettings.game.vrArmStretchMax);
     Register(g_userSettings.game.vrThirdPerson);
     Register(g_userSettings.game.vrThirdPersonFollowCameraYaw);

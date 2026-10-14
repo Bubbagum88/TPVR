@@ -872,6 +872,10 @@ inline bool s_shieldRestingValid = false;
 inline Mtx s_kanteraRestingPrevMtx;
 inline Mtx s_kanteraRestingCurrMtx;
 inline uint64_t s_kanteraRestingTick = ~0ull;
+inline Mtx s_heldItemRestingPrevMtx;
+inline Mtx s_heldItemRestingCurrMtx;
+inline bool s_heldItemRestingValid = false;
+inline uint64_t s_heldItemRestingTick = ~0ull;
 inline bool s_kanteraRestingValid = false;
 }  // namespace detail
 
@@ -1766,6 +1770,33 @@ inline void applyTrackedHandMtx(J3DModel* handModel) {
 // stop overriding the hand pose the same way it already does for Wolf
 // form/cutscenes. Checked BEFORE dereferencing link for the swim/crawl
 // checks below, not after -- a null link should never reach those either.
+// Moves whose animation spins the whole body (rolls, backflip, cartwheel).
+// With the head anchored to the camera the body would orbit around you, so
+// the body holds its pose from just before the move instead.
+inline bool isFullBodyTumbleProc(daAlink_c* link) {
+    switch (link->mProcID) {
+    case daAlink_c::PROC_FRONT_ROLL:
+    case daAlink_c::PROC_FRONT_ROLL_CRASH:
+    case daAlink_c::PROC_FRONT_ROLL_SUCCESS:
+    case daAlink_c::PROC_SIDE_ROLL:
+    case daAlink_c::PROC_BACK_JUMP:
+    case daAlink_c::PROC_ROLL_JUMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// "Show Roll Animations" (game.vrFullBodyShowRolls): during a tumbling move
+// the body, hands and anything held play the game's own animation instead of
+// following the headset/controllers. Every per-frame override then feeds the
+// normal interpolated pose instead of skipping: mark_live_this_frame() lasts
+// until the next sim tick, so skipping would freeze the last tracked pose.
+inline bool isHandTrackingSuspended(daAlink_c* link) {
+    return link && dusk::getSettings().game.vrFullBody.getValue() &&
+           dusk::getSettings().game.vrFullBodyShowRolls.getValue() && isFullBodyTumbleProc(link);
+}
+
 inline void refreshTrackedHandDrawMtxLive(J3DModel* handModel) {
     if (!handModel || !detail::s_handMtxValid) return;
 
@@ -1773,7 +1804,20 @@ inline void refreshTrackedHandDrawMtxLive(J3DModel* handModel) {
     if (!link || !isFirstPerson(link)) return;
     if (link->checkModeFlg(daAlink_c::MODE_SWIMMING) || isCrawling(link)) return;
 
-    applyTrackedHandMtx(handModel);
+    if (isHandTrackingSuspended(link)) {
+        // Hands follow the body's animated hand joints (al_handsL/R mirror
+        // body joints 9/0xE, same as setDrawHand()).
+        J3DModel* body = link->mpLinkModel;
+        Mtx m;
+        if (body && dusk::interp::lookup_interpolated(body->getAnmMtx(9), m)) {
+            handModel->setAnmMtx(LEFT_HAND_JOINT, m);
+        }
+        if (body && dusk::interp::lookup_interpolated(body->getAnmMtx(0xE), m)) {
+            handModel->setAnmMtx(RIGHT_HAND_JOINT, m);
+        }
+    } else {
+        applyTrackedHandMtx(handModel);
+    }
 
     dusk::interp::mark_live_this_frame(handModel->getAnmMtx(RIGHT_HAND_JOINT));
     dusk::interp::mark_live_this_frame(handModel->getAnmMtx(LEFT_HAND_JOINT));
@@ -2488,23 +2532,6 @@ inline void applyBodyAnchorToModel(J3DModel* model) {
     model->calc();
 }
 
-// Moves whose animation spins the whole body (rolls, backflip, cartwheel).
-// With the head anchored to the camera the body would orbit around you, so
-// the body holds its pose from just before the move instead.
-inline bool isFullBodyTumbleProc(daAlink_c* link) {
-    switch (link->mProcID) {
-    case daAlink_c::PROC_FRONT_ROLL:
-    case daAlink_c::PROC_FRONT_ROLL_CRASH:
-    case daAlink_c::PROC_FRONT_ROLL_SUCCESS:
-    case daAlink_c::PROC_SIDE_ROLL:
-    case daAlink_c::PROC_BACK_JUMP:
-    case daAlink_c::PROC_ROLL_JUMP:
-        return true;
-    default:
-        return false;
-    }
-}
-
 inline bool isFullBodyIkActive(daAlink_c* link) {
     return link && dusk::getSettings().game.vrFullBody.getValue() && detail::s_handMtxValid &&
            isFirstPerson(link) && !link->checkWolf() && !link->checkModeFlg(daAlink_c::MODE_SWIMMING) &&
@@ -2526,6 +2553,20 @@ inline void refreshFullBodyIkLive(const cXyz& cameraEye, s16 headYawS) {
     constexpr int kLeftHand = 9;
     constexpr int kRightHand = 0xE;
     if (jointNum <= kRightHand || jointNum > 256) return;
+
+    if (isHandTrackingSuspended(link)) {
+        // Plain animated pose: no anchor, no IK. Still written and marked live
+        // so last frame's solved pose can't stay on screen until the next tick.
+        for (u16 j = 0; j < jointNum; ++j) {
+            if (!dusk::interp::lookup_interpolated(model->getAnmMtx(j), detail::s_ikScratch[j])) return;
+        }
+        for (u16 j = 0; j < jointNum; ++j) {
+            MTXCopy(detail::s_ikScratch[j], model->getAnmMtx(j));
+        }
+        model->calcWeightEnvelopeMtx();
+        markModelJointsLive(model);
+        return;
+    }
 
     if (detail::s_ikModelData != data) {
         for (int& p : detail::s_ikParent) p = -1;
@@ -2691,7 +2732,8 @@ inline J3DModel* getCarriedModel(fopAc_ac_c* actor) {
 
 inline void refreshCarriedItemLive() {
     auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
-    if (!link || !detail::s_handMtxValid || !detail::s_grabTickMidValid || !isFirstPerson(link)) return;
+    if (!link || !detail::s_handMtxValid || !detail::s_grabTickMidValid || !isFirstPerson(link) ||
+        isHandTrackingSuspended(link)) return;
     fopAc_ac_c* actor = link->mGrabItemAcKeep.getActor();
     J3DModel* model = getCarriedModel(actor);
     if (!model) {
@@ -2805,8 +2847,11 @@ inline void refreshTrackedItemMtxLive() {
     // setItemMatrix()'s exact conditions) instead of re-deriving "is this
     // attached" from position data that's legitimately stale by
     // construction during fast animation.
-    const bool swordAttached = link->checkItemSwordEquip();
-    const bool shieldAttached = link->checkShieldHandAttached();
+    // Show Roll Animations: in-hand sword/shield follow the animated hands
+    // (resting-pose smoothing of the game's own item-joint placement).
+    const bool tracked = !isHandTrackingSuspended(link);
+    const bool swordAttached = tracked && link->checkItemSwordEquip();
+    const bool shieldAttached = tracked && link->checkShieldHandAttached();
 
     // SWORD/SHIELD HAND SWAP -- "Swap Sword/Shield Hands" VR setting
     // (2026-08-20, explicit user request). itemJointMtx/handJointMtx are
@@ -3056,8 +3101,14 @@ inline void refreshTrackedHeldItemMtxLive() {
                                      handJointMtx, trackedHandMtx);
 
         const bool attached = (attach != HeldItemAttach::None) && detail::s_heldItemRawBasis.valid;
-        if (applyTrackedItemMtxIfAttached(heldItemModel, attached, detail::s_heldItemRawBasis.mtx,
-                                           handJointMtx, trackedHandMtx)) {
+        if (attached && isHandTrackingSuspended(link)) {
+            // Show Roll Animations: follow the animated hand instead.
+            refreshRestingPoseSmoothed(heldItemModel, detail::s_heldItemRestingTick,
+                                        detail::s_heldItemRestingValid, detail::s_heldItemRestingPrevMtx,
+                                        detail::s_heldItemRestingCurrMtx);
+            markModelJointsLive(heldItemModel);
+        } else if (applyTrackedItemMtxIfAttached(heldItemModel, attached, detail::s_heldItemRawBasis.mtx,
+                                                  handJointMtx, trackedHandMtx)) {
             markModelJointsLive(heldItemModel);
         }
         // attach == None (head-item / hookshot / iron ball): leave
@@ -3072,7 +3123,8 @@ inline void refreshTrackedHeldItemMtxLive() {
 
         const HeldItemAttach attach = computeKanteraAttach(link);
         MtxP handJointMtx = bodyModel->getAnmMtx(link->getLeftHandJntNo());
-        const bool attached = (attach == HeldItemAttach::Left) && detail::s_kanteraRawBasis.valid;
+        const bool attached = (attach == HeldItemAttach::Left) && detail::s_kanteraRawBasis.valid &&
+                              !isHandTrackingSuspended(link);
 
         const bool updated = applyTrackedItemMtxIfAttached(
             kanteraModel, attached, detail::s_kanteraRawBasis.mtx, handJointMtx, detail::s_leftHandMtx);
@@ -3263,7 +3315,7 @@ inline void refreshTrackedItemJointMtxLive() {
     detail::s_trackedItemJointMtxValid = false;
 
     auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
-    if (!link || !detail::s_handMtxValid || !isFirstPerson(link)) return;
+    if (!link || !detail::s_handMtxValid || !isFirstPerson(link) || isHandTrackingSuspended(link)) return;
 
     J3DModel* bodyModel = link->getBodyModel();
     if (!bodyModel) return;

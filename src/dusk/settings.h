@@ -375,6 +375,10 @@ struct UserSettings {
         // head sits at the camera and its torso faces where you look.
         // Default on.
         ConfigVar<bool> vrFullBodyHeadAnchor;
+        // Full Body: rolls/backflips/side rolls play the normal animation with
+        // the body, hands and held items detached from the headset and
+        // controllers for the move. Default off (body holds its pose instead).
+        ConfigVar<bool> vrFullBodyShowRolls;
         // Full Body: how far Link's arms may lengthen (1.25 = 25%) when your
         // hand reaches past his full arm length.
         ConfigVar<float> vrArmStretchMax;

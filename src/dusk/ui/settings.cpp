@@ -1114,6 +1114,14 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                 .helpText = "With Full Body on, keeps Link's neck attached to your head: his body "
                             "moves with the headset and turns to face where you look. On by default."
             });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrFullBodyShowRolls,
+            {
+                .key = "Show Roll Animations",
+                .helpText = "With Full Body on, rolls, backflips and side rolls play Link's normal "
+                            "animation: his body, hands and anything he holds let go of the headset "
+                            "and controllers until the move ends. Off by default (his body holds "
+                            "still and stays with you instead)."
+            });
         config_percent_select(leftPane, rightPane, getSettings().game.vrArmStretchMax,
             "Arm Stretch Limit",
             "With Full Body on, lets Link's arms lengthen up to this much of their normal "

@@ -15521,3 +15521,21 @@ applies to the lantern). Also removed the "Experimental: Show Link's Body"
 menu toggle; `vrShowBody` is no longer read by `hideBodyForVr` (ConfigVar
 still registered, inert), and the Third Person help text no longer refers
 to it.
+
+### "Show Roll Animations" (Full Body) — CONFIRMED WORKING IN-HEADSET 2026-10-14 (animation plays, tracking resumes cleanly after)
+
+`game.vrFullBodyShowRolls` (default off), VR tab > Appearance, under Body
+Follows Headset. `vr_link::isHandTrackingSuspended(link)` = vrFullBody &&
+setting && `isFullBodyTumbleProc()` (moved earlier in the file). While true,
+every per-frame override FEEDS the animated pose instead of skipping
+(live marks last until the next sim tick, so skipping would freeze the last
+tracked pose): body = interpolated pose copied in + envelopes + live, no
+anchor/IK; mpLinkHandModel joints = body joints 9/0xE (interpolated);
+sword/shield/kantera treated as not hand-attached (resting smoothing of the
+game's own placement, which is the animated hand); held item uses new
+`s_heldItemResting*` smoothing; `refreshTrackedItemJointMtxLive()` and
+`refreshCarriedItemLive()` skip. New `dusk::vr::areVrHandsTracked(link)`
+gates the legacy once-per-tick tracked writes in `d_a_alink.cpp`
+(`applyTrackedHandMtx`, `applyTrackedItemMtx`) and the carry hand override,
+so the interpolation snapshot isn't poisoned with tracked poses mid-roll.
+Camera unchanged (core anchor), so the body tumbles below/around the view.

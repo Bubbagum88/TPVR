@@ -5636,7 +5636,7 @@ void daAlink_c::setBodyPartPos() {
         // First person only: in third person the hands show the normal
         // animation, so carried objects belong in Link's animated hands.
         bool vrHandsOverridden = false;
-        if (dusk::vr::isImmersiveVr() && dusk::vr::isVrFirstPerson(this)) {
+        if (dusk::vr::isImmersiveVr() && dusk::vr::areVrHandsTracked(this)) {
             float lx, ly, lz, rx, ry, rz;
             if (dusk::vr::getTrackedHandWorldPos(true, lx, ly, lz) &&
                 dusk::vr::getTrackedHandWorldPos(false, rx, ry, rz)) {
@@ -19442,7 +19442,7 @@ void daAlink_c::setDrawHand() {
     // needs the same gate as the real per-eye-relevant fix
     // (refreshTrackedHandDrawMtxLive(), vr_main.cpp's tick()) even though
     // it's confirmed dead for reaching the actual render output itself.
-    if (dusk::vr::isImmersiveVr() && dusk::vr::isVrFirstPerson(this)) {
+    if (dusk::vr::isImmersiveVr() && dusk::vr::areVrHandsTracked(this)) {
         dusk::vr::applyTrackedHandMtx(mpLinkHandModel);
     }
 #endif
@@ -20155,7 +20155,7 @@ int daAlink_c::draw() {
         // "Third Person" VR setting (2026-08-19 follow-up): also gated on
         // isVrFirstPerson(this) now -- see its comment (vr_main.hpp) and
         // the matching fix on the tracked-hand call site above.
-        if (dusk::vr::isImmersiveVr() && dusk::vr::isVrFirstPerson(this)) {
+        if (dusk::vr::isImmersiveVr() && dusk::vr::areVrHandsTracked(this)) {
             dusk::vr::applyTrackedItemMtx(mSwordModel, mShieldModel,
                                            mpLinkModel->getAnmMtx(mLeftItemJntNo),
                                            mpLinkModel->getAnmMtx(mLeftHandJntNo),

@@ -450,6 +450,9 @@ bool isHeadDrivenAimActive();
 // defeating the other fix. Guard both call sites on
 // `isRenderingToHeadset() && isVrFirstPerson(this)`.
 bool isVrFirstPerson(daAlink_c* link);
+// First person AND the hands currently follow the controllers (false while
+// "Show Roll Animations" lets a roll play its own animation).
+bool areVrHandsTracked(daAlink_c* link);
 
 // Thin forward to vr_link::isWolfFirstPersonView(link) (vr_link_visibility.hpp)
 // -- 2026-09-15, wolf-mode first-person camera/hide feature. Added for
