@@ -2932,6 +2932,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // bottles, lantern, etc.). See refreshTrackedHeldItemMtxLive()'s own
     // comment (vr_link_visibility.hpp).
     dusk::vr::refreshTrackedHeldItemMtxLive();
+    // Dominion Rod orb follows the tracked rod (vr_link_visibility.hpp).
+    vr_link::refreshCopyRodBallLive();
 
     // Extends tracking to getLeftItemMatrix()/getRightItemMatrix()
     // themselves (fixes fishing rod/boomerang/nocked arrows/etc. -- see

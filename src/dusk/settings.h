@@ -371,10 +371,6 @@ struct UserSettings {
         // hidden) and poses his arms with IK so his hands follow the tracked
         // controllers. Default on.
         ConfigVar<bool> vrFullBody;
-        // With Full Body on: moves/turns the whole body every frame so its
-        // head sits at the camera and its torso faces where you look.
-        // Default on.
-        ConfigVar<bool> vrFullBodyHeadAnchor;
         // Full Body: rolls/backflips/side rolls play the normal animation with
         // the body, hands and held items detached from the headset and
         // controllers for the move. Default off (body holds its pose instead).

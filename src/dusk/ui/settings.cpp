@@ -1108,12 +1108,6 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                 .helpText = "Shows Link's whole body in first person (everything except his "
                             "head), with his arms following your hands. On by default."
             });
-        config_bool_select(leftPane, rightPane, getSettings().game.vrFullBodyHeadAnchor,
-            {
-                .key = "Body Follows Headset",
-                .helpText = "With Full Body on, keeps Link's neck attached to your head: his body "
-                            "moves with the headset and turns to face where you look. On by default."
-            });
         config_bool_select(leftPane, rightPane, getSettings().game.vrFullBodyShowRolls,
             {
                 .key = "Show Roll Animations",
