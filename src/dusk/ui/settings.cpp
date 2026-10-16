@@ -1092,6 +1092,13 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             "How many degrees each snap rotates the view. Only used while Snap Turn is on.",
             15, 90, 15,
             [] { return !getSettings().game.vrSnapTurn.getValue(); }, {}, " deg");
+        config_bool_select(leftPane, rightPane, getSettings().game.vrTurnWithEpona,
+            {
+                .key = "Turn With Epona",
+                .helpText = "While riding Epona, your view turns left and right with her as "
+                            "she turns. You can still look anywhere with the headset. On by "
+                            "default.",
+            });
 
         leftPane.add_section("Appearance");
         config_bool_select(leftPane, rightPane, getSettings().game.vrHudOnLeftArm,

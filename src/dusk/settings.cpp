@@ -176,6 +176,7 @@ UserSettings g_userSettings = {
         .vrSmoothTurnSpeed {"game.vrSmoothTurnSpeed", 135},
         .vrSnapTurn {"game.vrSnapTurn", false},
         .vrSnapTurnAngle {"game.vrSnapTurnAngle", 45},
+        .vrTurnWithEpona {"game.vrTurnWithEpona", true},
         .vrSmoothStartStop {"game.vrSmoothStartStop", true},
         .vrInstantStartFacing {"game.vrInstantStartFacing", true},
         .vrLightingMode {"game.vrLightingMode", VrLightingMode::SunMoon},
@@ -467,6 +468,7 @@ void registerSettings() {
     Register(g_userSettings.game.vrSmoothTurnSpeed);
     Register(g_userSettings.game.vrSnapTurn);
     Register(g_userSettings.game.vrSnapTurnAngle);
+    Register(g_userSettings.game.vrTurnWithEpona);
     Register(g_userSettings.game.vrSmoothStartStop);
     Register(g_userSettings.game.vrInstantStartFacing);
     Register(g_userSettings.game.vrLightingMode);

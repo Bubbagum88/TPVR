@@ -29,6 +29,7 @@
 #include "m_Do/m_Do_controller_pad.h"            // mDoCPd_c::getSubStickX -- real physical gamepad C-stick
 #include "m_Do/m_Do_graphic.h"                  // mDoGph_gInf_c::captureHudBillboard
 #include "d/d_meter2_info.h"                    // dMeter2Info_getWindowStatus -- HUD on Left Arm gating
+#include "d/actor/d_a_horse.h"                  // daHorse_c -- Turn With Epona
 #include "f_pc/f_pc_manager.h"                  // fpcM_DrawIterater, fpcM_Draw
 #include "dusk/game_clock.h"                    // dusk::game_clock::FrameTiming
 #include "dusk/interp/material.h" // replay_models_for_current_view()
@@ -2485,6 +2486,58 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
             s_followLastCamYawS = camYawS;
         }
         s_followWasActive = haveYaw;
+    }
+
+    // --- Turn with Epona ---
+    //
+    // "game.vrTurnWithEpona" (default on). While riding, Epona's yaw change
+    // is added to the smooth-turn yaw, so the view turns with her. Her
+    // shape_angle only changes once per sim tick, so a smoothed yaw eases
+    // toward it and only the smoothed step is applied (same approach as the
+    // first-person Z-target focus). A single-tick change past the jump-cut
+    // threshold (warp, reset) re-bases instead of spinning. Skipped during
+    // events and when Third Person's "Turn With Game Camera" is already
+    // turning the view (the game camera follows Epona, so both would add
+    // the same turn).
+    {
+        static bool s_eponaWasActive = false;
+        static s16 s_eponaLastYawS = 0;
+        static float s_eponaSmoothedYawRad = 0.f;
+
+        const daHorse_c* horse = nullptr;
+        if (dusk::getSettings().game.vrTurnWithEpona.getValue()) {
+            if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
+                const bool cameraFollowTurns =
+                    dusk::getSettings().game.vrThirdPersonFollowCameraYaw.getValue() &&
+                    !dusk::vr::isVrFirstPerson(link);
+                if (link->checkReinRide() && !link->checkEventRun() && !cameraFollowTurns) {
+                    horse = dComIfGp_getHorseActor();
+                }
+            }
+        }
+
+        if (horse != nullptr) {
+            constexpr float kPi = 3.14159265358979323846f;
+            const s16 yawS = horse->shape_angle.y;
+            const s16 tickDeltaS = static_cast<s16>(yawS - s_eponaLastYawS);
+            if (!s_eponaWasActive ||
+                std::abs(cM_s2rad(tickDeltaS)) >=
+                    cM_s2rad(cM_deg2s(dusk::vr::kScriptedCameraJumpCutThresholdDeg)))
+            {
+                s_eponaSmoothedYawRad = cM_s2rad(yawS);
+            } else {
+                constexpr float kEponaTurnSmoothingSec = 0.1f;
+                float gap = cM_s2rad(yawS) - s_eponaSmoothedYawRad;
+                while (gap > kPi) gap -= 2.f * kPi;
+                while (gap < -kPi) gap += 2.f * kPi;
+                const float alpha = 1.f - std::exp(-pacing.dt / kEponaTurnSmoothingSec);
+                const float step = gap * alpha;
+                s_eponaSmoothedYawRad += step;
+                dusk::vr::snapScriptedCameraYaw(step);
+            }
+            s_eponaLastYawS = yawS;
+        }
+        s_eponaWasActive = horse != nullptr;
     }
 
     // --- Cutscenes: jump-cut detection only ---

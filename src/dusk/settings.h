@@ -599,6 +599,9 @@ struct UserSettings {
         ConfigVar<int> vrSmoothTurnSpeed;
         ConfigVar<bool> vrSnapTurn;
         ConfigVar<int> vrSnapTurnAngle;
+        // Turn the VR view with Epona while riding (adds her yaw change to
+        // the smooth-turn yaw each frame). Default on.
+        ConfigVar<bool> vrTurnWithEpona;
         // First-person comfort tweaks (2026-09-28), all default ON; off
         // restores the original TPVR behaviour for comparison.
         //  vrSmoothStartStop: move at the plain speed ramp instead of the

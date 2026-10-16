@@ -15646,3 +15646,18 @@ toggle were removed; `refreshFullBodyIkLive()` uses `constexpr bool headAnchor =
 true`. The separate hidden `vrAttachBodyRotationToHead` (gameplay `shape_angle`
 forcing, default off, open "body in front of me on rotation" bug) is untouched.
 Built clean, not retested.
+
+### "Turn With Epona" (default ON) — CONFIRMED WORKING IN-HEADSET 2026-10-16 ("That works")
+
+`game.vrTurnWithEpona` (settings.h/.cpp), VR tab > Turning, after Snap Turn
+Angle. `vr_main.cpp` tick(), right after the Third Person "Turn With Game
+Camera" block: while `checkReinRide()` and no event, Epona's
+`shape_angle.y` change is added to the smooth-turn yaw via
+`snapScriptedCameraYaw()`. Her yaw only updates per sim tick, so a smoothed
+yaw (exponential, `kEponaTurnSmoothingSec` = 0.1s) eases toward it and only
+the smoothed step is applied. Re-bases (no turn) on the first riding frame
+and on a single-tick change of 25+ degrees. Skipped in Third Person when
+"Turn With Game Camera" is on (that already follows the camera, which
+follows Epona). Risk to watch: if horse steering is relative to the view,
+holding the stick sideways may keep turning; and whether the follow feels
+too strong on tight turns.
