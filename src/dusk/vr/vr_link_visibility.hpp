@@ -1552,6 +1552,77 @@ inline bool getLeftBackOfHandWorldNormal(float& outX, float& outY, float& outZ) 
     return true;
 }
 
+// Applies VR's per-frame model hiding (face/hat/arms/ears in first person,
+// Midna in wolf first person). Called every frame from updateFrame(), and
+// again by withVrShadowCasterModelsShown() after the shadow-map render.
+// See updateFrame()'s comment block above the call for the clothes-change
+// guard and why this runs every frame.
+inline void applyVrModelVisibility(daAlink_c* link) {
+    if (link->getClothesChangeWaitTimer() == 0) {
+        const bool firstPerson = isFirstPerson(link) && !dComIfGp_isPauseFlag();
+        if (firstPerson) {
+            // Hide face and hat — these are separate J3DModel objects so
+            // hiding their shape tables has no effect on the body or hand
+            // models.
+            hideModel(link->mpLinkFaceModel);
+            hideModel(link->mpLinkHatModel);
+            if (dusk::getSettings().game.vrFullBody.getValue()) {
+                hideEarsShowArms(link);
+            } else {
+                hideArmsAndEars(link);
+            }
+        } else {
+            showModel(link->mpLinkFaceModel);
+            showModel(link->mpLinkHatModel);
+            showArmsAndEars(link);
+        }
+    }
+
+    // Wolf-mode first-person: hide Midna entirely while riding and not
+    // currently off his back -- see hideMidnaEntirely()'s own comment above
+    // for the round-by-round history and why this is a persistent
+    // whole-model toggle (run every real frame, same "outfit-branch logic
+    // can silently reverse a one-shot toggle" reasoning as the face/hat/
+    // arm block above) rather than a per-shape hide or the earlier,
+    // reverted whole-draw()-skip approach. Runs even if her own daMidna_c*
+    // actor doesn't exist yet/at all -- hideMidnaEntirely()/
+    // showMidnaEntirely() also toggle link's OWN mpWlMidna* models
+    // directly (round 7), independent of her actor.
+    // "off his back" = isMidnaOffWolfBack() (see its own comment) --
+    // broadened from just checkCalledUp() to also cover FLG0_WOLF_NO_POS,
+    // per user report of still seeing her invisible outside the intro
+    // jail cell and during the wolf-tag jump-point mechanic.
+    {
+        daMidna_c* midna = daPy_py_c::getMidnaActor();
+        if (isWolfFirstPersonView(link) && !isMidnaOffWolfBack(midna)) {
+            hideMidnaEntirely(link, midna);
+        } else {
+            showMidnaEntirely(link, midna);
+        }
+    }
+}
+
+// Runs fn (the VR shadow-map render) with VR's own model hiding undone, so
+// Link's shadow is his whole normal body (head, hat, ears, Midna) rather
+// than what the first-person view shows. The shadow-map render checks each
+// shape's hidden flag when it records the draw, so showing the shapes for
+// its duration and re-hiding right after is enough; the eye pass that
+// follows sees the normal VR hiding again.
+template <typename Fn>
+inline void withVrShadowCasterModelsShown(Fn&& fn) {
+    auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (link == nullptr || link->getClothesChangeWaitTimer() != 0) {
+        fn();
+        return;
+    }
+    showModel(link->mpLinkFaceModel);
+    showModel(link->mpLinkHatModel);
+    showArmsAndEars(link);
+    showMidnaEntirely(link, daPy_py_c::getMidnaActor());
+    fn();
+    applyVrModelVisibility(link);
+}
+
 inline void updateFrame(const FrameInput& input) {
     auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
     if (!link) return;
@@ -1619,48 +1690,7 @@ inline void updateFrame(const FrameInput& input) {
     // unrelated to the clothes-change hazard and shouldn't stall too, even
     // though in practice the player is looking at a menu during this brief
     // window either way.
-    if (link->getClothesChangeWaitTimer() == 0) {
-        const bool firstPerson = isFirstPerson(link) && !dComIfGp_isPauseFlag();
-        if (firstPerson) {
-            // Hide face and hat — these are separate J3DModel objects so
-            // hiding their shape tables has no effect on the body or hand
-            // models.
-            hideModel(link->mpLinkFaceModel);
-            hideModel(link->mpLinkHatModel);
-            if (dusk::getSettings().game.vrFullBody.getValue()) {
-                hideEarsShowArms(link);
-            } else {
-                hideArmsAndEars(link);
-            }
-        } else {
-            showModel(link->mpLinkFaceModel);
-            showModel(link->mpLinkHatModel);
-            showArmsAndEars(link);
-        }
-    }
-
-    // Wolf-mode first-person: hide Midna entirely while riding and not
-    // currently off his back -- see hideMidnaEntirely()'s own comment above
-    // for the round-by-round history and why this is a persistent
-    // whole-model toggle (run every real frame, same "outfit-branch logic
-    // can silently reverse a one-shot toggle" reasoning as the face/hat/
-    // arm block above) rather than a per-shape hide or the earlier,
-    // reverted whole-draw()-skip approach. Runs even if her own daMidna_c*
-    // actor doesn't exist yet/at all -- hideMidnaEntirely()/
-    // showMidnaEntirely() also toggle link's OWN mpWlMidna* models
-    // directly (round 7), independent of her actor.
-    // "off his back" = isMidnaOffWolfBack() (see its own comment) --
-    // broadened from just checkCalledUp() to also cover FLG0_WOLF_NO_POS,
-    // per user report of still seeing her invisible outside the intro
-    // jail cell and during the wolf-tag jump-point mechanic.
-    {
-        daMidna_c* midna = daPy_py_c::getMidnaActor();
-        if (isWolfFirstPersonView(link) && !isMidnaOffWolfBack(midna)) {
-            hideMidnaEntirely(link, midna);
-        } else {
-            showMidnaEntirely(link, midna);
-        }
-    }
+    applyVrModelVisibility(link);
 
     // Compute (but do not yet apply -- see applyTrackedHandMtx() below)
     // both hands' tracked matrices.
@@ -2622,10 +2652,91 @@ inline bool isFullBodyIkActive(daAlink_c* link) {
            !link->checkSpinnerRide() && !link->checkSpinnerReady();
 }
 
+// ---------------------------------------------------------------------------
+// Head attached to the headset (Full Body, 2026-10-16)
+//
+// The head (face/hat models and the body's head joint subtree, which holds
+// the ears) is hidden in the first-person view, but it casts Link's shadow.
+// The face/hat models were still placed by the game from the un-anchored,
+// animated head joint, so in the shadow the head floated off the anchored
+// body and bobbed with the game's animation. This turns the head to the
+// headset's rotation (applied to the head's rest pose, so the game's own head
+// animation is dropped), pivoting on the head joint so it stays on the neck,
+// and carries the face/hat models along.
+// ---------------------------------------------------------------------------
+namespace detail {
+inline J3DModelData* s_headRestData = nullptr;
+inline int s_headRestJoint = -1;
+inline Mtx s_headRestRot;  // head's rest rotation relative to the model root
+
+// Rest-pose rotation of `joint` relative to the model root: the product of
+// the rest local transforms along the chain, translation dropped.
+inline void ikRestRotationToRoot(J3DModelData* data, int joint, Mtx out) {
+    MTXIdentity(out);
+    for (int j = joint; j >= 0; j = s_ikParent[j]) {
+        Mtx local, tmp;
+        J3DGetTranslateRotateMtx(data->getJointNodePointer(static_cast<u16>(j))->getTransformInfo(), local);
+        MTXConcat(local, out, tmp);
+        MTXCopy(tmp, out);
+    }
+    out[0][3] = out[1][3] = out[2][3] = 0.f;
+}
+
+// Moves a separately drawn model that sits on the game's head joint onto the
+// new head: every joint = headDelta * (its interpolated matrix).
+inline void ikMoveModelWithHead(J3DModel* m, const Mtx headDelta) {
+    if (!m) return;
+    const u16 n = m->getModelData()->getJointNum();
+    if (n == 0 || n > 256) return;
+    for (u16 j = 0; j < n; ++j) {
+        if (!dusk::interp::lookup_interpolated(m->getAnmMtx(j), s_ikScratch[j])) return;
+    }
+    for (u16 j = 0; j < n; ++j) {
+        MTXConcat(headDelta, s_ikScratch[j], m->getAnmMtx(j));
+    }
+    if (m->getModelData()->getWEvlpMtxNum() > 0) m->calcWeightEnvelopeMtx();
+    markModelJointsLive(m);
+}
+
+// headWorldRot: vr_render::computeHeadWorldRotation(). gameHead: the game's
+// own (interpolated, un-anchored) head joint, which the face/hat were placed
+// from.
+inline void ikAttachHeadToHeadset(daAlink_c* link, J3DModel* model, int headJ, const Mtx headWorldRot,
+                                  const Mtx gameHead) {
+    J3DModelData* data = model->getModelData();
+    if (s_headRestData != data || s_headRestJoint != headJ) {
+        ikRestRotationToRoot(data, headJ, s_headRestRot);
+        s_headRestData = data;
+        s_headRestJoint = headJ;
+    }
+    // Pivot on the head joint itself (the neck end), so the head turns on the
+    // neck and stays attached. Pivoting on the eye point (first version) kept
+    // the eyes on the camera but swung the neck end off the body.
+    MtxP cur = model->getAnmMtx(headJ);
+    Mtx head;
+    MTXConcat(headWorldRot, s_headRestRot, head);
+    head[0][3] = cur[0][3];
+    head[1][3] = cur[1][3];
+    head[2][3] = cur[2][3];
+
+    Mtx inv, delta;
+    if (!MTXInverse(cur, inv)) return;
+    MTXConcat(head, inv, delta);
+    ikApplyToSubtree(model, headJ, delta);
+
+    if (!MTXInverse(gameHead, inv)) return;
+    MTXConcat(head, inv, delta);
+    ikMoveModelWithHead(link->mpLinkFaceModel, delta);
+    ikMoveModelWithHead(link->mpLinkHatModel, delta);
+}
+}  // namespace detail
+
 // cameraEye: the head-center camera position this frame
 // (getVrCameraEyeAnchor()); headYawS: where the head faces
-// (dusk::vr::getHeadMoveAngleS()).
-inline void refreshFullBodyIkLive(const cXyz& cameraEye, s16 headYawS) {
+// (dusk::vr::getHeadMoveAngleS()); headWorldRot: the headset's rotation
+// (vr_render::computeHeadWorldRotation()), or null to leave the head as
+// animated.
+inline void refreshFullBodyIkLive(const cXyz& cameraEye, s16 headYawS, const Mtx* headWorldRot = nullptr) {
     detail::s_bodyAnchorValid = false;
     detail::s_ikFreezeActive = false;
     auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
@@ -2767,6 +2878,13 @@ inline void refreshFullBodyIkLive(const cXyz& cameraEye, s16 headYawS) {
         }
         detail::s_bodyAnchorValid = true;
         bodyYaw = headYawS;
+
+        if (headWorldRot != nullptr) {
+            const int headJ = link->field_0x30b4;
+            detail::ikAttachHeadToHeadset(
+                link, model, headJ, *headWorldRot,
+                detail::s_ikFreezeActive ? detail::s_ikActual[headJ] : detail::s_ikInterp[headJ]);
+        }
     }
 
     // Pole: elbows point down, outward (away from the other shoulder) and a

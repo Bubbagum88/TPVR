@@ -990,6 +990,24 @@ inline cXyz computeHeadWorldForward(const XrPosef& headPose, float yawRad) {
     return forward;
 }
 
+// The head's world rotation in a character's local convention (+X = the
+// character's left, +Y = up, +Z = forward -- a model facing +Z), i.e. the
+// rotation that turns Link's rest-pose head to match the headset. Same
+// rotation source as computeHeadWorldForward(): the view matrix's rows are
+// the head's right/up/back in world space; character left = -right,
+// forward = -back. Translation is zero.
+inline void computeHeadWorldRotation(const XrPosef& headPose, float yawRad, Mtx out) {
+    Mtx headViewMtx;
+    eyePoseToViewMtx(headViewMtx, headPose, headPose.position, cXyz(0.f, 0.f, 0.f),
+                      kEyePosScale, yawRad);
+    for (int i = 0; i < 3; ++i) {
+        out[i][0] = -headViewMtx[0][i];
+        out[i][1] = headViewMtx[1][i];
+        out[i][2] = -headViewMtx[2][i];
+        out[i][3] = 0.f;
+    }
+}
+
 // Called once per frame (not per eye) to advance the damped reference
 // direction toward the current real head pose. `yawRad` is the VR
 // smooth-turn offset (vr_smooth_turn.hpp) -- passed through so the HUD's

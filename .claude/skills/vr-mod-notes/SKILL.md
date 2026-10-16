@@ -15661,3 +15661,55 @@ and on a single-tick change of 25+ degrees. Skipped in Third Person when
 follows Epona). Risk to watch: if horse steering is relative to the view,
 holding the stick sideways may keep turning; and whether the follow feels
 too strong on tight turns.
+
+### VR shadows "no shadows at all" — ROOT CAUSE confirmed by code reading, fix built 2026-10-16, NOT yet tested in-headset
+
+The 2026-10-14 theory was right. `fpcLf_Draw()`/`fpcNd_Draw()` (f_pc_leaf.cpp
+/ f_pc_node.cpp) skip an actor's draw method unless `is_sim_frame()` or the
+process sets `draw_interp_frame` (only bg, kankyo, meter2, menu window,
+gameover, title, name do). So actor draw() -- which registers shadows --
+runs only in the per-sim-tick `fpcDw_Handler` pass, whose
+`cAPIGph_BeforeOfDraw` -> `mDoGph_BeforeOfDraw` -> `dComIfGd_reset()` also
+resets the shadow list; the draw lists are then replayed every frame. The
+VR shadow step's `resetShadow()` + `fpcM_DrawIterater()` wiped that list and
+re-registered nothing. Fix (`vr_main.cpp` single-pass block): no reset, no
+extra iterate -- just `prepareStereoView`, `dComIfGd_imageDrawShadow`,
+re-set the projection, lock registration, open the pass. This also means
+the "registered several times per frame" half of the 2026-10-14 diagnosis
+was wrong for the same reason (tick()'s iterates never run actor draw).
+Screen mode already used this shape. If shadows now appear but stretch or
+lag, next suspects: `shadowControl::draw()`/`imageDraw()` skip interp
+replacements in VR (so shadows use sim-tick matrices while models draw
+interpolated), and the stencil simple-shadow path under stereo replay.
+**Same day: shadows CONFIRMED visible in-headset.** Follow-up: Link's shadow
+was missing his head/hat/ears (VR's first-person shape hides; the shadow-map
+render `dDlst_shadowReal_c::imageDraw()` skips shapes with the hidden flag).
+User chose "full normal Link" for the shadow (stowed sword/shield on his back
+still cast shadows, which they already did -- those are draw skips, not shape
+hides). Fix: `updateFrame()`'s hide block factored into
+`vr_link::applyVrModelVisibility()`; new `withVrShadowCasterModelsShown(fn)`
+shows face/hat/arms/ears/Midna, runs the shadow-map render, then reapplies
+the hiding. Built, NOT yet retested.
+**Follow-up (same day):** shadow now had Midna/ears, but the head was
+detached and bobbed with the game's animation (face/hat models still placed
+from the un-anchored tick-time head joint 4, while Full Body anchors the
+body). New `detail::ikAttachHeadToHeadset()` (vr_link_visibility.hpp, called
+from `refreshFullBodyIkLive()` right after the head anchor, given
+`vr_render::computeHeadWorldRotation()` from tick()): head joint subtree of
+the body = headset rotation * the head's REST rotation (game head animation
+dropped), eye point kept on the camera; face/hat joints = (new head *
+inv(game interpolated head)) * their interpolated matrices, marked live.
+Full Body only. Built, NOT yet tested. Assumes Link's rest pose has the head
+upright facing +Z -- if the shadow's head is tilted/turned by a constant
+amount, that assumption is wrong (fix with a constant correction on
+`s_headRestRot`). Also watch for neck/collar skin stretching in view when
+looking down/around (head subtree now rotates with the headset).
+**Follow-up:** head tracking CONFIRMED accurate, but the head sat detached
+from the body -- it was rotated around the eye point (kept on the camera),
+which swung the head joint's neck end off the body. Now pivots on the head
+joint's own position (translation kept). Built, NOT yet retested. If the
+shadow's head still looks off at the neck, the next lever is splitting the
+rotation between the neck joint and the head joint.
+**CONFIRMED FIXED IN-HEADSET 2026-10-16** ("That fixed it") -- shadows render
+in VR, Link's shadow is his full body with the head attached and following
+the headset (Full Body). `game.vrShadows` still defaults OFF.

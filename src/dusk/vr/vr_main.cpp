@@ -2968,10 +2968,13 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // Full body IK: poses the body's arms onto the tracked hands. Before
     // the item refreshes, which read the body's item joints.
     if (view_class* ikView = dComIfGd_getView()) {
+        const float ikYaw = screenMode ? 0.0f : dusk::vr::getSmoothTurnYawRad();
+        // The (hidden) head follows the headset so Link's shadow matches.
+        Mtx headWorldRot;
+        vr_render::computeHeadWorldRotation(hmdPose, ikYaw, headWorldRot);
         vr_link::refreshFullBodyIkLive(
-            vr_link::getVrCameraEyeAnchor(ikView->lookat.eye, &hmdPose.position,
-                                          screenMode ? 0.0f : dusk::vr::getSmoothTurnYawRad()),
-            dusk::vr::getHeadMoveAngleS());
+            vr_link::getVrCameraEyeAnchor(ikView->lookat.eye, &hmdPose.position, ikYaw),
+            dusk::vr::getHeadMoveAngleS(), &headWorldRot);
     }
 
     // Same fix, same reason, extended to sword/shield (2026-08-09 follow-up
@@ -3355,22 +3358,25 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         g_duskVRCurrentEyeIndex = 0;
         g_perfPreLoopMs = perfMs(g_perfMark, PerfClock::now());
         PerfClock::time_point perfT0 = PerfClock::now();
-        // VR object shadows. The game registers shadows from actor draw(),
-        // which VR runs several times a frame with nothing clearing the list
-        // in between (only the legacy per-sim-tick pass resets it), and it
-        // renders the shadow maps in mDoGph_Painter(), inside the eye pass,
-        // where a nested framebuffer isn't allowed -- so in VR the maps were
-        // never written and shadows stacked up. Instead: set up this frame's
-        // view, rebuild the shadow list from one draw traversal, render the
-        // maps before the pass opens, then lock registration so the
-        // traversal inside the pass doesn't add them again.
+        // VR object shadows. mDoGph_Painter() renders the shadow maps inside
+        // the eye pass, where a nested framebuffer isn't allowed, so in VR
+        // they're rendered here, before the pass opens. The shadow list
+        // itself is built by the per-sim-tick draw pass (fpcDw_Handler ->
+        // mDoGph_BeforeOfDraw resets it, actor draw() refills it) and
+        // replayed every frame, like the rest of the draw lists. It must NOT
+        // be reset here: actor draw() only runs on sim frames
+        // (fpcLf_Draw's draw_interp_frame gate), so a traversal from tick()
+        // re-registers nothing and the list stays empty -- the 2026-10-14
+        // "no shadows at all" result. Registration stays locked during the
+        // pass as a guard against duplicates.
         const bool vrShadows = dusk::getSettings().game.vrShadows.getValue();
         if (vrShadows) {
             const vr_render::StereoViewSetup viewSetup = vr_render::prepareStereoView(stereoParams);
             view_class* view = dComIfGd_getView();
-            g_dComIfG_gameInfo.drawlist.resetShadow();
-            fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
-            dComIfGd_imageDrawShadow(view->viewMtx);
+            // Link's shadow is his whole normal body (user choice
+            // 2026-10-16), not the first-person hidden version.
+            vr_link::withVrShadowCasterModelsShown(
+                [view] { dComIfGd_imageDrawShadow(view->viewMtx); });
             GXSetProjection(view->projMtx, GX_PERSPECTIVE);
             g_vrShadowRegistrationLocked = true;
             g_vrShadowsActive = true;

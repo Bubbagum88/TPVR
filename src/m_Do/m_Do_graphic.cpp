@@ -2573,10 +2573,10 @@ int mDoGph_Painter() {
             fapGm_HIO_c::startCpuTimer();
             #endif
 
-            // VR: only when the "Shadows" VR setting built this frame's
-            // shadows before the eye pass (vr_main.cpp's shadow step). The
-            // old stretching came from shadow maps that were never rendered
-            // in VR plus shadows registered several times per frame.
+            // VR: only when the "Shadows" VR setting rendered this frame's
+            // shadow maps before the eye pass (vr_main.cpp's shadow step).
+            // The old stretching came from shadow maps that were never
+            // rendered in VR.
             if (!dusk::vr::isImmersiveVr() || dusk::vr::areVrShadowsActive()) {
                 GX_DEBUG_GROUP(dComIfGd_drawShadow, camera_p->view.viewMtx);
             }

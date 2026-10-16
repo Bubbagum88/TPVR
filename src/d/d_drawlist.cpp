@@ -1132,9 +1132,9 @@ void dDlst_shadowReal_c::imageDraw(Mtx param_0) {
 
 void dDlst_shadowReal_c::draw() {
 #if TARGET_PC
-    // VR: drawn only when the "Shadows" VR setting built this frame's
-    // shadows (dusk::vr::areVrShadowsActive()). Without that step the shadow
-    // maps are never rendered in VR and the list holds duplicates.
+    // VR: drawn only when the "Shadows" VR setting rendered this frame's
+    // shadow maps before the eye pass (dusk::vr::areVrShadowsActive()).
+    // Without that step the maps are never rendered in VR.
     if (dusk::vr::isImmersiveVr() && !dusk::vr::areVrShadowsActive()) {
         return;
     }
