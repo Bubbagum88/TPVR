@@ -26,8 +26,6 @@ More on why it uses AI generated code below.
   
 </div>
 
-> [!IMPORTANT]
-> Dusklight's official website is https://twilitrealm.dev/, any other website is not affiliated and may be promoting AI-generated misinformation.
 
 # Setup
 
