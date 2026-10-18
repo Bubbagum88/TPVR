@@ -1273,14 +1273,6 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         };
 
         leftPane.add_section("Inputs");
-        leftPane.register_control(
-            leftPane.add_group_button({.text = "Configure Inputs"}).on_pressed([this] {
-                push(std::make_unique<ControllerConfigWindow>());
-            }),
-            rightPane, [](Pane& pane) {
-                pane.clear();
-                pane.add_text("Open input binding configuration.");
-            });
         config_bool_select(leftPane, rightPane, getSettings().game.allowBackgroundInput,
             {
                 .key = "Allow Background Inputs",
