@@ -39,12 +39,13 @@ Distilled from the full history in `vr-mod-notes`; read that skill for the
 reasoning before touching any of this again.
 
 - **UPDATE 2026-10-14**: object shadows are back in VR behind the
-  `game.vrShadows` setting (VR tab > Appearance > "Shadows", default OFF,
+  `game.vrShadows` setting (VR tab > Appearance > "Shadows", default ON
+  as of 2026-10-18 at user request,
   single-pass stereo only). CONFIRMED WORKING in-headset 2026-10-16 (empty shadow list was the last bug). New evidence for the old stretching: in VR the
   shadow maps were never rendered (`imageDrawShadow` skipped) and shadows
   were registered several times per frame. Fix and details: `vr-mod-notes`,
   "Object shadows re-enabled". The rule below still applies with the
-  setting off; keep it off by default until confirmed in-headset.
+  setting off.
 - **Shadows are intentionally DISABLED in VR** (`m_Do_graphic.cpp`,
   `d_drawlist.cpp`) — tested precision fixes did NOT resolve the underlying
   stretching. Do not re-enable without new diagnostic evidence.

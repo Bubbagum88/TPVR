@@ -726,6 +726,13 @@ struct StereoViewSetup {
     Mtx   eyeT[2];
 };
 
+// This frame's setup while a single-pass stereo pass is being recorded
+// (prepareStereoView() -> endStereoPass()). Read by CPU-side code that has to
+// know where something lands in each eye (the ice mirror's scissor rect,
+// dusk::vr::getMirrorStereoProjection()).
+inline StereoViewSetup g_activeStereoSetup;
+inline bool g_activeStereoSetupValid = false;
+
 inline StereoViewSetup prepareStereoView(const StereoParams& sp) {
     view_class* view = dComIfGd_getView();
     assert(view != nullptr && "VR: no active view_class -- called outside gameplay?");
@@ -806,6 +813,8 @@ inline StereoViewSetup prepareStereoView(const StereoParams& sp) {
         g_eyeSymmetricFovyDeg = clipperFovyDeg;
         g_eyeSymmetricAspect = clipperAspect;
     }
+    g_activeStereoSetup = setup;
+    g_activeStereoSetupValid = true;
     return setup;
 }
 
@@ -853,6 +862,7 @@ inline aurora::gfx::ResolvedTargets endStereoPass(const aurora::gfx::ExternalPas
     // call" note); here the stream order guarantees it.
     GXSetStereo(GX_FALSE, nullptr, nullptr, nullptr, nullptr);
     GXSetOffscreenNativeLogicalSize(GX_FALSE);
+    g_activeStereoSetupValid = false;
 
     aurora::gfx::ResolvedTargets targets;
     // External target: no snapshot (color = false) -- the result is the

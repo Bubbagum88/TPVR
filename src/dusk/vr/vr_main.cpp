@@ -255,6 +255,9 @@ s16 g_headMoveAngleS = 0;
 // same pattern/reasoning as g_headMoveAngleS above.
 s16 g_controllerAimYawS = 0;
 s16 g_controllerAimPitchS = 0;
+// Same from the left controller's aim pose.
+s16 g_controllerAimLeftYawS = 0;
+s16 g_controllerAimLeftPitchS = 0;
 
 // HMD-based aim pitch -- see getHeadAimAngles()'s own declaration comment
 // (vr_main.hpp). Yaw reuses g_headMoveAngleS directly (identical formula,
@@ -592,6 +595,10 @@ bool isVrFirstPerson(daAlink_c* link) {
     return vr_link::isFirstPerson(link);
 }
 
+void restoreGameBodyPose(daAlink_c* link) {
+    vr_link::restoreGameBodyPose(link);
+}
+
 bool areVrHandsTracked(daAlink_c* link) {
     return vr_link::isFirstPerson(link) && !vr_link::isHandTrackingSuspended(link);
 }
@@ -752,6 +759,50 @@ bool getTrackedSwordMtx(float (*outMtx)[4]) {
 void getControllerAimAngles(s16* outYawS, s16* outPitchS) {
     *outYawS = g_controllerAimYawS;
     *outPitchS = g_controllerAimPitchS;
+}
+
+void getControllerAimAnglesForHand(bool leftHand, s16* outYawS, s16* outPitchS) {
+    *outYawS = leftHand ? g_controllerAimLeftYawS : g_controllerAimYawS;
+    *outPitchS = leftHand ? g_controllerAimLeftPitchS : g_controllerAimPitchS;
+}
+
+bool beginMirrorShowsHiddenModels() {
+    if (!isImmersiveVr()) {
+        return false;
+    }
+    return vr_link::beginVrHiddenModelsShown();
+}
+
+void endMirrorShowsHiddenModels() {
+    vr_link::endVrHiddenModelsShown();
+}
+
+int getMirrorStereoProjection(float outProj[2][6], float outEyeT[2][3][4]) {
+    if (!isImmersiveVr()) {
+        return 0;
+    }
+    if (vr_render::g_activeStereoSetupValid) {
+        for (int eye = 0; eye < 2; ++eye) {
+            for (int i = 0; i < 6; ++i) {
+                outProj[eye][i] = vr_render::g_activeStereoSetup.projVec[eye][i];
+            }
+            MTXCopy(vr_render::g_activeStereoSetup.eyeT[eye], outEyeT[eye]);
+        }
+        return 2;
+    }
+    // Two-pass: view->projMtx is this eye's own projection.
+    view_class* view = dComIfGd_getView();
+    if (view == nullptr) {
+        return 0;
+    }
+    outProj[0][0] = view->projMtx[0][0];
+    outProj[0][1] = view->projMtx[0][2];
+    outProj[0][2] = view->projMtx[1][1];
+    outProj[0][3] = view->projMtx[1][2];
+    outProj[0][4] = view->projMtx[2][2];
+    outProj[0][5] = view->projMtx[2][3];
+    MTXIdentity(outEyeT[0]);
+    return 1;
 }
 
 // Seconds left in the "head-driven aim is active" window; set by
@@ -2886,6 +2937,13 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         const float horiz = std::sqrt(aimForward.x * aimForward.x + aimForward.z * aimForward.z);
         g_controllerAimYawS = cM_atan2s(aimForward.x, aimForward.z);
         g_controllerAimPitchS = static_cast<s16>(-cM_atan2s(aimForward.y, horiz));
+
+        const vr_link::Vec3f leftAimForward =
+            vr_link::computeControllerAimForward(leftAimPose, dusk::vr::getSmoothTurnYawRad());
+        const float leftHoriz =
+            std::sqrt(leftAimForward.x * leftAimForward.x + leftAimForward.z * leftAimForward.z);
+        g_controllerAimLeftYawS = cM_atan2s(leftAimForward.x, leftAimForward.z);
+        g_controllerAimLeftPitchS = static_cast<s16>(-cM_atan2s(leftAimForward.y, leftHoriz));
     }
 
     constexpr u32 kVrPadPort = PAD_CHAN0;
@@ -2946,7 +3004,18 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // per-eye call site (d_a_alink.cpp, inside daAlink_c::draw()) was
     // proven, via a full-session [dusk::vr::eyepasscheck] log capture, to
     // never actually run during a real VR eye pass -- this call site does.
-    if (!screenMode) {
+    // Not while Link's models are being swapped (2026-10-18 crash: J3DModel::
+    // calc() on the wooden sword from refreshTrackedItemMtxLive(), while
+    // transforming to Wolf Link in rando). A transform or clothes change frees
+    // the current form's archive (mpArcHeap->freeAll(), loadModelDVD()) and
+    // loads the new one over several frames while mClothesChangeWaitTimer
+    // counts; models built from that archive (wooden sword, lantern, boots,
+    // body) point at freed data until changeWolf()/changeLink() rebuilds them,
+    // and Link is still flagged human, so isFirstPerson() doesn't exclude it.
+    // The game itself leaves those models alone while the timer runs.
+    const auto* refreshLink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    const bool linkModelsSwapping = refreshLink != nullptr && refreshLink->getClothesChangeWaitTimer() != 0;
+    if (!screenMode && !linkModelsSwapping) {
     if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
         dusk::vr::refreshTrackedHandDrawMtxLive(link->getHandModel());
     }

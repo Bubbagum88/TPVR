@@ -15713,3 +15713,133 @@ rotation between the neck joint and the head joint.
 **CONFIRMED FIXED IN-HEADSET 2026-10-16** ("That fixed it") -- shadows render
 in VR, Link's shadow is his full body with the head attached and following
 the headset (Full Body). `game.vrShadows` still defaults OFF.
+
+### Ledge climb cancelled with Full Body IK on — CONFIRMED FIXED IN-HEADSET 2026-10-18
+
+Symptom: walking up to a ledge, the camera rose briefly, then dropped back and
+Link didn't climb (Full Body on). Cause, found by reading the code:
+`daAlink_c::execute()` runs the procs BEFORE `setMatrix()`/`calc()`, and
+some procs read body joints as game state. `setHangGroundY()`
+(`d_a_alink_hang.inc`, used by every hang/climb proc) reads joint 0 to find
+the ground under the ledge -- but the buffer still held last frame's Full
+Body pose (root moved by the head anchor), so the ground check hit the wrong
+floor and `changeHangEndProc()` landed Link. Fix: `captureRawBodyJointsOnce()`
+now also snapshots the whole body buffer (anm + weight envelope) as the game
+computed it; `refreshFullBodyIkLive()` marks it dirty once it's about to
+write; new `vr_link::restoreGameBodyPose()` (forward `dusk::vr::`) at the
+top of `execute()` puts the game's pose back. Likely also fixes other proc
+reads of body joints under Full Body (unknown which were affected).
+
+### "Still Arms" (Full Body) — tried and REVERTED 2026-10-18
+
+Tried resetting each arm chain (collarbone down to the hand's parent) to the
+rest pose before the IK solve, to stop the arms wiggling with the walk
+animation. User: "nothing changed" -- fully removed. So the visible wiggle is
+NOT the collarbone/bone twist the IK keeps from the animation; look elsewhere
+(e.g. chest/spine motion moving the shoulders, the hand model, or the tracked
+hands themselves) before trying again.
+
+### Per-item aiming hand — CONFIRMED WORKING IN-HEADSET 2026-10-18
+
+User choice: bow/slingshot/boomerang aim with the RIGHT controller, single
+clawshot and Dominion Rod with the LEFT, double clawshots alternate (first
+shot left, then right, ...). "Swap Sword/Shield Hands" doesn't affect it.
+`vr_main.cpp` now also computes left-controller aim angles (same
+`computeControllerAimForward()` on `leftAimPose`), exposed via
+`getControllerAimAnglesForHand(leftHand, ...)`. `setBodyAngleToCamera()`
+(`d_a_alink_link.inc`) picks by `mEquipItem`; double clawshot uses
+`getHookshotLeft()` (`field_0x3020 == 0` = firing clawshot on Link's left
+hand per `applyTrackedHookshotGripTransforms()`; flips in the hang-end code
+each time Link latches on). Unverified: whether the left aim pose needs its
+own sign fixes (right needed a pitch negation; assumed identical); whether
+the clawshot's grip/tip model visually sits in the aiming hand. Third Person
+still aims with the headset.
+
+### Camera clipping into Epona's neck while sprinting — CONFIRMED FIXED IN-HEADSET 2026-10-18
+
+Cause (reasoned, not measured): `getVrCameraEyeAnchor()` extrapolates the
+anchor one sim tick ahead (`kEyeAnchorExtrapolationGain` = 1), but Epona is
+drawn interpolated, about a tick behind. The camera led her by one tick of
+travel, which at gallop/dash speed reaches her neck. Fix: gain 0 (plain
+interpolation) while `checkReinRide()`. If it still clips at a dash, next
+lever is a speed-dependent extra backward pull in computeRawEyeAnchor()'s
+horse branch (the lash/gallop animation may also lean Link's head joint
+forward).
+
+### "Reflections (Experimental)" (screen-copy) toggle — REVERTED 2026-10-18
+
+Built a toggle re-enabling the screen-copy water reflections; not what the
+user meant (they meant the 3D planar ice reflections, daMirror_c). Fully
+removed.
+
+### 3D ice/floor mirror reflections locked to the headset (Snowpeak Ruins, Zora's Domain) — CONFIRMED FIXED IN-HEADSET 2026-10-18
+
+The planar reflections come from `daMirror_c` / `dMirror_packet_c`
+(`d_a_mirror.cpp`), which redraws registered models (Link etc.) through a
+reflected view matrix. Two VR bugs, found by reading the code:
+1. The reflected camera was `mDoMtx_lookAt()` of the FLATSCREEN camera's
+   `view->lookat.eye/center` mirrored through the plane (then `mViewScale`
+   flip). In VR that camera doesn't follow the head, so the reflected scene
+   sat fixed in view space -> "locked to the headset".
+2. The scissor rect limiting the reflection to the mirror's on-screen area
+   was projected with `view->fovy/aspect` (stale flatscreen values in VR).
+Fix (`#if TARGET_PC`, only when `dusk::vr::getMirrorStereoProjection()`
+returns > 0, i.e. immersive VR): reflected view = `j3dSys.getViewMtx() * R`,
+R = Householder reflection through `n.x = d` (n = spF8, d = temp_f7); det -1
+like the original, so modelDraw()'s GX_CULL_FRONT still holds; single-pass
+stereo applies T_eye on top in the shader. Scissor rect = bounding rect of
+the near-clipped corners projected with each eye's real projection
+(`vr_render::g_activeStereoSetup`, set in prepareStereoView(), cleared in
+endStereoPass(); two-pass uses view->projMtx). Flatscreen path unchanged.
+Things to check: reflection lines up with the real objects in both eyes;
+it isn't clipped at the mirror's edges or leaking past them (the ortho
+depth reset in mirrorZdraw() uses the same rect); no inside-out models.
+
+**Follow-up (same day): Link's head/hat/ears in the mirror reflection —
+built, NOT yet tested.** The mirror's modelDraw() skips hidden shapes, so the
+first-person hiding removed his head from the reflection. Factored the
+shadow's show/re-hide into `vr_link::beginVrHiddenModelsShown()` /
+`endVrHiddenModelsShown()` (withVrShadowCasterModelsShown() now uses them);
+`dMirror_packet_c::mainDraw()` brackets its model loop with
+`dusk::vr::beginMirrorShowsHiddenModels()`/`endMirrorShowsHiddenModels()`
+(immersive VR only). Head stays attached because Full Body's
+`ikAttachHeadToHeadset()` already moved the face/hat/head joints the mirror
+draws. Midna is shown in the reflection too (same set as the shadow).
+
+### Quest keyboard for menu text fields (standalone) — CONFIRMED WORKING IN-HEADSET 2026-10-18
+
+An immersive OpenXR app can't show the Android soft keyboard, so editing a
+Dusklight-menu text field did nothing on Quest. New 2D activity
+`platforms/android/.../TextInputActivity.java` (Dialog theme, EditText +
+OK/Cancel, keyboard forced visible, own taskAffinity, no VR category -> shows
+as a Horizon OS panel, same reason the SAF disc picker works).
+`DuskActivity.requestTextInput(text, number, maxLength)` launches it;
+`pollTextInput()` returns "1"+text / "0" (cancel) / null (waiting).
+`BaseStringButton` (`src/dusk/ui/string_button.cpp`, `__ANDROID__` only):
+when `dusk::vr::isActive()`, `focus_input()` opens the panel instead of
+focusing the RmlUi input; `update()` polls and commits/cancels via
+`request_stop_editing()`. Falls back to the normal path if the JNI call
+fails. Unknown until tested: whether Horizon OS shows our own app's 2D
+activity over the live immersive session, or pauses/ends the session
+(focus-aware is on; STOPPING->READY is resumable in tick()). The command
+console's raw <input> isn't covered (not a BaseStringButton).
+Debug builds install as com.joeyaw.tpvr.dev.
+
+### Crash transforming to Wolf Link (rando) — CONFIRMED FIXED 2026-10-18
+
+Access violation executing garbage inside `J3DModel::calc()` <-
+`refreshRestingPoseSmoothed()` <- `refreshTrackedItemMtxLive()` <- tick().
+Cause (code reading): PROC_METAMORPHOSE's `loadModelDVD()`
+(`d_a_alink_swindow.inc`) frees the current form's archive
+(`mpArcHeap->freeAll()`) and loads the other one over several frames while
+`mClothesChangeWaitTimer` counts; models built from that archive (wooden
+sword `al_SWB.bmd`, lantern, boots, body) point at freed data until
+`changeWolf()`/`changeLink()` rebuilds them, and Link is still flagged human
+during that window, so `isFirstPerson()` passed and VR calc()'d the stowed
+(wooden) sword. Rando likely hits it more because the wooden sword is often
+equipped. Fix: tick()'s whole live-refresh block (hands, Full Body IK,
+sword/shield, held items, carried items, rod, boomerang, clawshot) is
+skipped while `getClothesChangeWaitTimer() != 0`. Also hardened the ledge
+fix: `restoreGameBodyPose()` now runs before `loadModelDVD()` in execute()
+and skips while the timer runs. Rule for new per-frame VR code touching
+Link's models: check the clothes-change timer first.

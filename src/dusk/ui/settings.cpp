@@ -1133,9 +1133,8 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             {
                 .key = "Shadows",
                 .helpText = "Draws the shadows under Link, characters and objects. "
-                            "Needs Single-Pass Stereo. Off by default."
-            });
-        config_bool_select(leftPane, rightPane, getSettings().game.vrThirdPerson,
+                            "Needs Single-Pass Stereo."
+            });        config_bool_select(leftPane, rightPane, getSettings().game.vrThirdPerson,
             {
                 .key = "Third Person",
                 .helpText = "Plays the entire game in third person while in VR, the same "

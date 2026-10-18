@@ -39,6 +39,8 @@ private:
     bool mPendingCommit = true;
     bool mPendingRefocusRoot = false;
     bool mSetOnChange = false;
+    // Android VR: waiting for the text entry panel (TextInputActivity).
+    bool mWaitingForPanelInput = false;
     Rml::String mOriginalValue;
 };
 

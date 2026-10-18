@@ -18111,6 +18111,14 @@ int daAlink_c::procGoronRideWait() {
 }
 
 int daAlink_c::execute() {
+#if TARGET_PC
+    // Full Body IK leaves its pose in mpLinkModel's joint buffer; the procs
+    // below read body joints before setMatrix()/calc() (e.g. ledge climbing's
+    // setHangGroundY()), so give them the game's own pose back. Before
+    // loadModelDVD(), which can free the body model mid transform.
+    dusk::vr::restoreGameBodyPose(this);
+#endif
+
     loadModelDVD();
 
     if (checkEndResetFlg0(ERFLG0_BOSS_ROOM_WAIT) && getMidnaActor() != NULL) {

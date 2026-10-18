@@ -1608,19 +1608,36 @@ inline void applyVrModelVisibility(daAlink_c* link) {
 // shape's hidden flag when it records the draw, so showing the shapes for
 // its duration and re-hiding right after is enough; the eye pass that
 // follows sees the normal VR hiding again.
-template <typename Fn>
-inline void withVrShadowCasterModelsShown(Fn&& fn) {
+// Shows everything VR hides on Link (head, hat, ears, Midna) until
+// endVrHiddenModelsShown(). Used around the shadow-map render and the ice
+// mirror's reflection draw (d_a_mirror.cpp), which both check each shape's
+// hidden flag when they record the draw. Returns false (and does nothing)
+// mid clothes change.
+inline bool beginVrHiddenModelsShown() {
     auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
     if (link == nullptr || link->getClothesChangeWaitTimer() != 0) {
-        fn();
-        return;
+        return false;
     }
     showModel(link->mpLinkFaceModel);
     showModel(link->mpLinkHatModel);
     showArmsAndEars(link);
     showMidnaEntirely(link, daPy_py_c::getMidnaActor());
+    return true;
+}
+
+inline void endVrHiddenModelsShown() {
+    if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
+        applyVrModelVisibility(link);
+    }
+}
+
+template <typename Fn>
+inline void withVrShadowCasterModelsShown(Fn&& fn) {
+    const bool shown = beginVrHiddenModelsShown();
     fn();
-    applyVrModelVisibility(link);
+    if (shown) {
+        endVrHiddenModelsShown();
+    }
 }
 
 inline void updateFrame(const FrameInput& input) {
@@ -2296,6 +2313,15 @@ inline Mtx s_rawRightHandJointMtx;
 inline Mtx s_rawBodyRootMtx;
 inline uint64_t s_rawBodyJointTick = ~0ull;
 inline bool s_rawBodyJointValid = false;
+
+// Whole body buffer as the game computed it this tick, so it can be put back
+// before the next execute() (restoreGameBodyPose()).
+inline Mtx s_rawBodyAnm[256];
+inline Mtx s_rawBodyWeight[256];
+inline u16 s_rawBodyAnmNum = 0;
+inline u16 s_rawBodyWeightNum = 0;
+inline J3DModelData* s_rawBodyModelData = nullptr;
+inline bool s_rawBodyBufferDirty = false;
 }  // namespace detail
 
 inline void captureRawBodyJointsOnce(daAlink_c* link) {
@@ -2308,6 +2334,43 @@ inline void captureRawBodyJointsOnce(daAlink_c* link) {
     MTXCopy(body->getAnmMtx(link->getRightHandJntNo()), detail::s_rawRightHandJointMtx);
     MTXCopy(body->getAnmMtx(0), detail::s_rawBodyRootMtx);
     detail::s_rawBodyJointValid = true;
+
+    J3DModelData* data = body->getModelData();
+    const u16 anmNum = data->getJointNum();
+    const u16 weightNum = data->getWEvlpMtxNum();
+    if (anmNum > 256 || weightNum > 256) {
+        detail::s_rawBodyModelData = nullptr;
+        return;
+    }
+    for (u16 j = 0; j < anmNum; ++j) {
+        MTXCopy(body->getAnmMtx(j), detail::s_rawBodyAnm[j]);
+    }
+    for (u16 j = 0; j < weightNum; ++j) {
+        MTXCopy(body->getWeightAnmMtx(j), detail::s_rawBodyWeight[j]);
+    }
+    detail::s_rawBodyAnmNum = anmNum;
+    detail::s_rawBodyWeightNum = weightNum;
+    detail::s_rawBodyModelData = data;
+}
+
+// Full Body IK leaves its anchored/IK'd pose in mpLinkModel's joint buffer.
+// daAlink_c::execute() runs the procs BEFORE it recalculates the model, and
+// some procs read body joints as game state -- e.g. setHangGroundY() reads
+// joint 0 to find the ground under a ledge, so with the head-anchored root it
+// hit the wrong ground and the ledge climb cancelled into a landing. Called at
+// the top of execute(): puts the game's own pose from the last tick back.
+inline void restoreGameBodyPose(daAlink_c* link) {
+    if (!detail::s_rawBodyBufferDirty) return;
+    detail::s_rawBodyBufferDirty = false;
+    if (!link || !link->mpLinkModel || link->getClothesChangeWaitTimer() != 0) return;
+    J3DModel* body = link->mpLinkModel;
+    if (body->getModelData() != detail::s_rawBodyModelData) return;
+    for (u16 j = 0; j < detail::s_rawBodyAnmNum; ++j) {
+        MTXCopy(detail::s_rawBodyAnm[j], body->getAnmMtx(j));
+    }
+    for (u16 j = 0; j < detail::s_rawBodyWeightNum; ++j) {
+        MTXCopy(detail::s_rawBodyWeight[j], body->getWeightAnmMtx(j));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2744,6 +2807,7 @@ inline void refreshFullBodyIkLive(const cXyz& cameraEye, s16 headYawS, const Mtx
     if (!isFullBodyIkActive(link)) return;
     J3DModel* model = link->mpLinkModel;
     if (!model) return;
+    detail::s_rawBodyBufferDirty = true;
     J3DModelData* data = model->getModelData();
     const u16 jointNum = data->getJointNum();
     constexpr int kLeftHand = 9;
@@ -4846,8 +4910,13 @@ inline cXyz getVrCameraEyeAnchor(const cXyz& fallbackEye,
     // passing `step` straight through -- extrapolates ahead to roughly
     // cancel this engine's usual constant ~1-sim-tick render lag, instead
     // of just smoothing between two already-stale samples.
+    // Not on Epona (2026-10-18): she's drawn interpolated (about a tick
+    // behind), so a camera extrapolated a tick ahead led her by one tick of
+    // travel -- at sprint speed enough to put the camera inside her neck.
+    // Riding, the anchor interpolates and stays in step with her.
+    const float extrapolationGain = link->checkReinRide() ? 0.0f : detail::kEyeAnchorExtrapolationGain;
     const cXyz extrapolated = detail::lerpXyz(detail::s_eyeAnchorPrev, detail::s_eyeAnchorCurr,
-                                               step + detail::kEyeAnchorExtrapolationGain);
+                                               step + extrapolationGain);
 
     // Camera-only 6DOF positional tracking (2026-09-11, explicit user
     // request: "the headset can move horizontally and vertically from its

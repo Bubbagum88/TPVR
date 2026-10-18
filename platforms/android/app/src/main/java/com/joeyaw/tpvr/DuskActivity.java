@@ -162,6 +162,46 @@ public class DuskActivity extends BorealisActivity {
         file.delete();
     }
 
+    // Text entry for menu text fields while in VR (see TextInputActivity). The result is
+    // "1" + text when accepted, "0" when cancelled; null while nothing is waiting.
+    private static final Object textInputLock = new Object();
+    private static String textInputResult = null;
+
+    /** Called from native code (BaseStringButton) to open the text entry window. */
+    public void requestTextInput(String text, boolean number, int maxLength) {
+        synchronized (textInputLock) {
+            textInputResult = null;
+        }
+        Intent intent = new Intent(this, TextInputActivity.class)
+            .putExtra(TextInputActivity.EXTRA_TEXT, text)
+            .putExtra(TextInputActivity.EXTRA_NUMBER, number)
+            .putExtra(TextInputActivity.EXTRA_MAX_LENGTH, maxLength)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        runOnUiThread(() -> {
+            try {
+                startActivity(intent);
+            } catch (Exception e) {
+                Log.w(TAG, "Unable to open text input", e);
+                deliverTextInput(null);
+            }
+        });
+    }
+
+    /** Called from native code every frame while waiting; returns and clears the result. */
+    public String pollTextInput() {
+        synchronized (textInputLock) {
+            String result = textInputResult;
+            textInputResult = null;
+            return result;
+        }
+    }
+
+    static void deliverTextInput(String text) {
+        synchronized (textInputLock) {
+            textInputResult = text != null ? "1" + text : "0";
+        }
+    }
+
     @Override
     protected String[] getArguments() {
         String[] arguments = super.getArguments();

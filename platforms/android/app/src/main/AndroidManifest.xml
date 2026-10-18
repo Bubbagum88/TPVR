@@ -84,6 +84,17 @@
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>
         </activity>
+
+        <!-- Text entry for menu text fields in VR: a plain 2D activity (no VR category), so
+             Horizon OS shows it as a panel with the system keyboard. Own task so it doesn't
+             replace the game's activity. -->
+        <activity
+            android:name="com.joeyaw.tpvr.TextInputActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="${applicationId}.textinput"
+            android:theme="@android:style/Theme.DeviceDefault.Dialog"
+            android:windowSoftInputMode="stateAlwaysVisible|adjustResize" />
     </application>
 
 </manifest>

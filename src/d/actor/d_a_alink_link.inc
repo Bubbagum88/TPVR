@@ -146,7 +146,20 @@ BOOL daAlink_c::setBodyAngleToCamera() {
                 dusk::vr::getHeadAimAngles(&aimYawS, &aimPitchS);
                 dusk::vr::noteHeadDrivenAim();
             } else {
-                dusk::vr::getControllerAimAngles(&aimYawS, &aimPitchS);
+                // Aiming hand per item (user choice, 2026-10-18): clawshot and
+                // Dominion Rod aim with the left controller; the double
+                // clawshots aim with whichever hand fires next (field_0x3020
+                // == 0 is the left one, and it flips each time Link latches
+                // on, so the first shot is left, the second right, ...);
+                // everything else (bow, slingshot, boomerang) with the right.
+                // "Swap Sword/Shield Hands" doesn't affect this.
+                bool leftHand = false;
+                if (mEquipItem == dItemNo_HOOKSHOT_e || mEquipItem == dItemNo_COPY_ROD_e) {
+                    leftHand = true;
+                } else if (mEquipItem == dItemNo_W_HOOKSHOT_e) {
+                    leftHand = getHookshotLeft();
+                }
+                dusk::vr::getControllerAimAnglesForHand(leftHand, &aimYawS, &aimPitchS);
             }
             shape_angle.y = aimYawS;
             sp8 = aimPitchS;

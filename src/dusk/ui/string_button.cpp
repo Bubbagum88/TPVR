@@ -2,7 +2,99 @@
 
 #include <aurora/rmlui.hpp>
 
+#if defined(__ANDROID__)
+#include "dusk/vr/vr_main.hpp"
+
+#include <SDL3/SDL_system.h>
+#include <jni.h>
+
+#include <optional>
+#include <string>
+#endif
+
 namespace dusk::ui {
+
+#if defined(__ANDROID__)
+namespace {
+
+// While the game is an immersive VR app the Android keyboard can't show over
+// it, so text fields open DuskActivity's 2D text entry panel instead
+// (TextInputActivity) and poll for its result.
+bool use_text_input_panel() {
+    return dusk::vr::isActive();
+}
+
+bool request_text_input_panel(const Rml::String& text, bool number, int maxLength) {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    jclass activityClass = env->GetObjectClass(activity);
+    jmethodID method =
+        env->GetMethodID(activityClass, "requestTextInput", "(Ljava/lang/String;ZI)V");
+    if (method == nullptr) {
+        env->ExceptionClear();
+    } else {
+        jstring jtext = env->NewStringUTF(text.c_str());
+        env->CallVoidMethod(activity, method, jtext, static_cast<jboolean>(number),
+                            static_cast<jint>(maxLength));
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        } else {
+            ok = true;
+        }
+        if (jtext != nullptr) {
+            env->DeleteLocalRef(jtext);
+        }
+    }
+    env->DeleteLocalRef(activityClass);
+    env->DeleteLocalRef(activity);
+    return ok;
+}
+
+using PanelResult = std::optional<std::optional<Rml::String>>;
+
+PanelResult panel_cancelled() {
+    return PanelResult{std::in_place, std::nullopt};
+}
+
+// Empty while still waiting; otherwise the text (accepted) or nullopt (cancelled).
+PanelResult poll_text_input_panel() {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity == nullptr) {
+        return panel_cancelled();  // can't poll: treat as cancelled
+    }
+    PanelResult result;
+    jclass activityClass = env->GetObjectClass(activity);
+    jmethodID method = env->GetMethodID(activityClass, "pollTextInput", "()Ljava/lang/String;");
+    if (method == nullptr) {
+        env->ExceptionClear();
+        result = panel_cancelled();
+    } else if (auto str = static_cast<jstring>(env->CallObjectMethod(activity, method))) {
+        if (const char* chars = env->GetStringUTFChars(str, nullptr)) {
+            const std::string value(chars);
+            env->ReleaseStringUTFChars(str, chars);
+            if (!value.empty() && value[0] == '1') {
+                result = PanelResult{std::in_place, value.substr(1)};
+            } else {
+                result = panel_cancelled();
+            }
+        }
+        env->DeleteLocalRef(str);
+    } else if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        result = panel_cancelled();
+    }
+    env->DeleteLocalRef(activityClass);
+    env->DeleteLocalRef(activity);
+    return result;
+}
+
+}  // namespace
+#endif
 
 BaseStringButton::BaseStringButton(Rml::Element* parent, Props props)
     : BaseControlledSelectButton(parent, {std::move(props.key)}), mType(std::move(props.type)),
@@ -11,6 +103,17 @@ BaseStringButton::BaseStringButton(Rml::Element* parent, Props props)
 }
 
 void BaseStringButton::update() {
+#if defined(__ANDROID__)
+    if (mWaitingForPanelInput && is_editing()) {
+        if (auto result = poll_text_input_panel()) {
+            mWaitingForPanelInput = false;
+            if (*result) {
+                mInputElem->SetValue(**result);
+            }
+            request_stop_editing(result->has_value(), true);
+        }
+    }
+#endif
     if (mPendingStopEditing) {
         stop_editing(mPendingCommit, mPendingRefocusRoot);
     }
@@ -120,6 +223,15 @@ void BaseStringButton::focus_input() {
         return;
     }
 
+#if defined(__ANDROID__)
+    if (use_text_input_panel() &&
+        request_text_input_panel(mInputElem->GetValue(), mType == "number", mMaxLength))
+    {
+        mWaitingForPanelInput = true;
+        return;
+    }
+#endif
+
     aurora::rmlui::set_input_type(
         mType == "number" ? aurora::rmlui::InputType::Number : aurora::rmlui::InputType::Text);
 
@@ -132,6 +244,7 @@ void BaseStringButton::focus_input() {
 void BaseStringButton::stop_editing(bool commit, bool refocusRoot) {
     mPendingStopEditing = false;
     mPendingInputFocusFrames = 0;
+    mWaitingForPanelInput = false;
     if (!is_editing()) {
         return;
     }
