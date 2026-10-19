@@ -40,6 +40,14 @@ bool isActive();
 // skipping that fallback whenever this is false blanks menus/video, not
 // just 3D gameplay.
 bool isRenderingToHeadset();
+// True while this headset frame is rendering the flat-camera giant-screen
+// presentation rather than the game directly in immersive VR.
+bool isVrScreenMode();
+
+// True only when a frame has a headset target and the game should use
+// immersive-VR gameplay/rendering behavior. Use this for game semantics;
+// isRenderingToHeadset() remains the physical output-target predicate.
+bool isImmersiveVr();
 
 // True ONLY while a VR eye's own protected offscreen pass is actually open
 // (between a given beginEye() and its matching endEye() inside tick()'s
@@ -53,6 +61,18 @@ bool isRenderingToHeadset();
 // yet" -- the latter is exactly the safe window captureHudBillboard() and
 // captureMapCopy2D() (m_Do_graphic.cpp) already render into.
 bool isEyePassOpen();
+// VR object shadows (game.vrShadows): true from the frame's shadow step
+// (shadow maps rendered from this frame's view) until the stereo pass ends.
+// The shadow draw code checks this instead of its old blanket VR disable.
+bool areVrShadowsActive();
+// While true, dDlst_shadowControl_c drops new shadow registrations: actor
+// draw() runs again inside the stereo pass, and the shadows were already
+// registered once by the shadow step.
+bool isVrShadowRegistrationLocked();
+// True while any protected OpenXR render pass is open, including the
+// flat-camera source pass used by screen mode. Use before opening a nested
+// GX framebuffer pass; isEyePassOpen() remains eye-specific.
+bool isProtectedVrPassOpen();
 
 // Only meaningful while isRenderingToHeadset() is true (returns the last
 // computed values otherwise, harmlessly stale). The smallest symmetric
@@ -176,6 +196,9 @@ void refreshTrackedHeldItemMtxLive();
 // just for this one type, same reasoning as applyTrackedItemMtx()'s plain
 // float(*)[4] parameters above.
 bool getTrackedHandWorldPos(bool isLeftHand, float& outX, float& outY, float& outZ);
+// setBodyPartPos() reports the tracked hand midpoint it placed carried
+// objects from this sim tick (valid=false when it didn't override).
+void noteTrackedHandMidpoint(bool valid, float x, float y, float z);
 
 // Extends held-item tracking to daAlink_c::getLeftItemMatrix()/
 // getRightItemMatrix() (d_a_alink_link.inc) themselves -- fixes every
@@ -385,6 +408,21 @@ bool getTrackedSwordMtx(float (*outMtx)[4]);
 // and why this sources from OpenXR's own aim pose rather than the tracked
 // hand mesh's grip-based calibration.
 void getControllerAimAngles(s16* outYawS, s16* outPitchS);
+// Same, for either controller (leftHand = the left controller's aim pose).
+// setBodyAngleToCamera() picks the hand per item.
+void getControllerAimAnglesForHand(bool leftHand, s16* outYawS, s16* outPitchS);
+
+// For the ice/floor mirror (d_a_mirror.cpp): the perspective projection of
+// each eye being rendered right now (GXSetProjection's 6 cells) and the
+// view-space correction from the current view (j3dSys view) to that eye.
+// Returns the number of eyes (2 single-pass, 1 two-pass), or 0 when not in
+// immersive VR.
+int getMirrorStereoProjection(float outProj[2][6], float outEyeT[2][3][4]);
+// Around the mirror's reflection draw: shows Link's head/hat/ears (and Midna)
+// that first person hides, so the reflection shows his whole body like the
+// shadow does. begin returns false (nothing to undo) outside immersive VR.
+bool beginMirrorShowsHiddenModels();
+void endMirrorShowsHiddenModels();
 
 // HMD-based aim yaw/pitch, same s16 BAMS unit and computed-once-per-frame
 // pattern as getControllerAimAngles() above. Added 2026-08-19 (explicit
@@ -427,6 +465,13 @@ bool isHeadDrivenAimActive();
 // defeating the other fix. Guard both call sites on
 // `isRenderingToHeadset() && isVrFirstPerson(this)`.
 bool isVrFirstPerson(daAlink_c* link);
+// Puts back the body joint buffer the game computed last tick if Full Body
+// IK has since overwritten it. Called at the top of daAlink_c::execute(),
+// because the procs read body joints before the model is recalculated.
+void restoreGameBodyPose(daAlink_c* link);
+// First person AND the hands currently follow the controllers (false while
+// "Show Roll Animations" lets a roll play its own animation).
+bool areVrHandsTracked(daAlink_c* link);
 
 // Thin forward to vr_link::isWolfFirstPersonView(link) (vr_link_visibility.hpp)
 // -- 2026-09-15, wolf-mode first-person camera/hide feature. Added for

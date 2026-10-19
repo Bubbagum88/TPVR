@@ -22,13 +22,10 @@ More on why it uses AI generated code below.
 - The ability to play the game in flatscreen for parts you want to skip in VR
 # Quest 2/3 Controller binds
 <div align="center">
-<img src="Controller binding.png" alt="Logo" width="400">
+<img src="Graphic design/TPVR controls.png" alt="Logo" width="1920">
   
-(I'm going to replace this with a graphic soon)
 </div>
 
-> [!IMPORTANT]
-> Dusklight's official website is https://twilitrealm.dev/, any other website is not affiliated and may be promoting AI-generated misinformation.
 
 # Setup
 
@@ -71,7 +68,24 @@ And yes—I used an em-dash there. You can type it with on your keyboard with Al
 
 # Credits
 
-Special thanks to the [Dusklight](https://twilitrealm.dev/) team, [TP decompilation](https://github.com/zeldaret/tp) team, the GC/Wii decompilation community, the [Aurora](https://github.com/encounter/aurora) developers, [Automata](https://github.com/automata-rtx/dusklight-mods), the [TP speedrunning community](https://zsrtp.link), and all [contributors](https://github.com/TwilitRealm/dusklight/graphs/contributors).
+Special thanks to the [Dusklight](https://twilitrealm.dev/) team, [TP decompilation](https://github.com/zeldaret/tp) team, the GC/Wii decompilation community, the [Aurora](https://github.com/encounter/aurora) developers, [Automata](https://github.com/automata-rtx/dusklight-mods), the [TP speedrunning community](https://zsrtp.link), [danieltobey](https://github.com/danieltobey), [999sian](https://github.com/999sian), and all [Dusklight contributors](https://github.com/TwilitRealm/dusklight/graphs/contributors).
+
+# **Also a huge thanks to my Patrons:**
+
+AaronCLS
+
+Joe Gill
+
+Collin Drennen
+
+Ryan Faaborg
+
+Mitch Mordy
+
+MarioBruthaGangsta
+
+Nard Marley
+
 
 
 

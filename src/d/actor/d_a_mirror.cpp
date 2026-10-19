@@ -13,6 +13,10 @@
 #include <gf/GFGeometry.h>
 #include <gf/GFLight.h>
 #include "m_Do/m_Do_lib.h"
+#if TARGET_PC
+#include "dusk/vr/vr_main.hpp"
+#include <algorithm>
+#endif
 
 static BOOL daMirror_c_createHeap(fopAc_ac_c* i_this) {
     return ((daMirror_c*)i_this)->createHeap();
@@ -369,6 +373,42 @@ void dMirror_packet_c::mainDraw() {
             var_f6 = view_port->height;
         }
 
+#if TARGET_PC
+        // VR (2026-10-18): view->fovy/aspect are the flatscreen camera's, not
+        // the headset's, so the screen rect the reflection is limited to was
+        // wrong. Project the near-clipped corners with each eye's real
+        // projection instead and take the bounding rect over both eyes (the
+        // same logical rect is mapped into both halves).
+        float vrProj[2][6];
+        Mtx vrEyeT[2];
+        const int vrEyes = dusk::vr::getMirrorStereoProjection(vrProj, vrEyeT);
+        if (vrEyes > 0) {
+            for (int i = 0; i < prjPosNum; i++) {
+                if (sp19C[i].z > var_f27) {
+                    var_f27 = sp19C[i].z;
+                }
+                for (int eye = 0; eye < vrEyes; eye++) {
+                    cXyz p;
+                    cMtx_multVec(vrEyeT[eye], &sp19C[i], &p);
+                    const f32 w = -p.z;
+                    if (w < 1e-3f) {
+                        continue;
+                    }
+                    const f32 ndcX = (vrProj[eye][0] * p.x + vrProj[eye][1] * p.z) / w;
+                    const f32 ndcY = (vrProj[eye][2] * p.y + vrProj[eye][3] * p.z) / w;
+                    f32 sx = var_f3 + (1.0f + ndcX) * (var_f5 * 0.5f);
+                    f32 sy = var_f4 + (1.0f - ndcY) * (var_f6 * 0.5f);
+                    sx = cLib_minMaxLimit<f32>(sx, temp_f26, temp_f25);
+                    sy = cLib_minMaxLimit<f32>(sy, temp_f24, temp_f23);
+                    var_f31 = std::min(var_f31, sx);
+                    var_f29 = std::max(var_f29, sx);
+                    var_f30 = std::min(var_f30, sy);
+                    var_f28 = std::max(var_f28, sy);
+                }
+            }
+        } else
+#endif
+        {
         Vec* var_r3 = sp19C;
         for (int i = 0; i < prjPosNum; i++) {
             var_r3->y = (var_r3->y / (var_r3->z * temp_f0_2));
@@ -400,6 +440,7 @@ void dMirror_packet_c::mainDraw() {
             }
 
             var_r3++;
+        }
         }
 
         if (fabsf(var_f29 - var_f31) < 8.0f || fabsf(var_f28 - var_f30) < 8.0f) {
@@ -436,14 +477,48 @@ void dMirror_packet_c::mainDraw() {
             spD4 *= cXyz(-1.0f, -1.0f, -1.0f);
         }
 
-        mDoMtx_lookAt(sp16C, &spEC, &spE0, &spD4, view->bank);
-        mDoMtx_stack_c::scaleS(mViewScale);
-        mDoMtx_stack_c::concat(sp16C);
+#if TARGET_PC
+        if (vrEyes > 0) {
+            // VR: the reflected camera above is built from the flatscreen
+            // camera (view->lookat), which doesn't follow the headset, so the
+            // reflection stayed fixed relative to the head. Reflect the
+            // actual view through the mirror plane instead: view * R, with
+            // R = reflection through n.x = d (n = spF8, d = temp_f7). Mirror
+            // handedness is the same as the original (det -1), so the
+            // GX_CULL_FRONT in modelDraw() still applies, and the stereo
+            // per-eye correction is applied on top in the shader.
+            Mtx refl;
+            const f32 n[3] = {spF8.x, spF8.y, spF8.z};
+            for (int r = 0; r < 3; r++) {
+                for (int c = 0; c < 3; c++) {
+                    refl[r][c] = (r == c ? 1.0f : 0.0f) - 2.0f * n[r] * n[c];
+                }
+                refl[r][3] = 2.0f * temp_f7 * n[r];
+            }
+            MTXConcat(j3dSys.getViewMtx(), refl, sp16C);
+            mDoMtx_stack_c::copy(sp16C);
+        } else
+#endif
+        {
+            mDoMtx_lookAt(sp16C, &spEC, &spE0, &spD4, view->bank);
+            mDoMtx_stack_c::scaleS(mViewScale);
+            mDoMtx_stack_c::concat(sp16C);
+        }
         J3DShape::resetVcdVatCache();
 
+#if TARGET_PC
+        // VR: the reflection shows Link's whole body (head, hat, ears), like
+        // his shadow, not the first-person hidden version.
+        const bool vrShownHidden = dusk::vr::beginMirrorShowsHiddenModels();
+#endif
         for (int i = 0; i < mModelCount; i++) {
             modelDraw(mModels[i], mDoMtx_stack_c::get());
         }
+#if TARGET_PC
+        if (vrShownHidden) {
+            dusk::vr::endMirrorShowsHiddenModels();
+        }
+#endif
 
         j3dSys.reinitGX();
         GXSetScissor(scissor[0], scissor[1], scissor[2], scissor[3]);

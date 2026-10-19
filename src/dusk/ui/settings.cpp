@@ -938,11 +938,30 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         auto& leftPane = add_child<Pane>(content, Pane::Type::Controlled);
         auto& rightPane = add_child<Pane>(content, Pane::Type::Uncontrolled);
 
+        leftPane.add_section("Display");
+        config_bool_select(leftPane, rightPane, getSettings().game.vrScreenMode,
+            {
+                .key = "Giant Screen Mode",
+                .helpText = "Shows flat-camera gameplay on a large 16:9 screen about 5.3 m wide and 4.5 m away. "
+                            "The screen follows your head; the room stays black. Switches live."
+            });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrScreenModeStereo,
+            {
+                .key = "Stereoscopic 3D Screen",
+                .helpText = "When Giant Screen Mode is active, renders stereoscopic 3D onto the virtual display "
+                            "with depth converging on Link (like GalaxyQuest / 3D cinema). Turn off for 2D flat display.",
+                .isDisabled = [] { return !dusk::getSettings().game.vrScreenMode.getValue(); }
+            });
+        config_percent_select(leftPane, rightPane, getSettings().game.vrScreenModeDepth,
+            "3D Screen Depth",
+            "Amount of 3D depth on the virtual screen (50% .. 200%). Higher values make background scenery "
+            "recede farther into the screen and Link pop out toward you.",
+            20, 200, 10,
+            [] { return !dusk::getSettings().game.vrScreenMode.getValue() || !dusk::getSettings().game.vrScreenModeStereo.getValue(); });
 #if !VR_SETTINGS_STANDALONE
         // Standalone (Quest) has no desktop window to mirror to. The setting itself stays
         // registered and defaults ON there -- the mirror path also drives the Dusklight overlay's
         // scaling -- it's just not user-facing.
-        leftPane.add_section("Display");
         config_bool_select(leftPane, rightPane, getSettings().game.vrDesktopMirror,
             {
                 .key = "VR Desktop Mirror",
@@ -1073,17 +1092,55 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             "How many degrees each snap rotates the view. Only used while Snap Turn is on.",
             15, 90, 15,
             [] { return !getSettings().game.vrSnapTurn.getValue(); }, {}, " deg");
+        config_bool_select(leftPane, rightPane, getSettings().game.vrTurnWithEpona,
+            {
+                .key = "Turn With Epona",
+                .helpText = "While riding Epona, your view turns left and right with her as "
+                            "she turns. You can still look anywhere with the headset. On by "
+                            "default.",
+            });
 
         leftPane.add_section("Appearance");
-        config_bool_select(leftPane, rightPane, getSettings().game.vrThirdPerson,
+        config_bool_select(leftPane, rightPane, getSettings().game.vrHudOnLeftArm,
+            {
+                .key = "HUD on Left Arm",
+                .helpText = "Shows the HUD (hearts, rupees, minimap and buttons) on the back "
+                            "of your left hand, like a watch, instead of in front of your "
+                            "face. It only appears while you turn the back of your hand "
+                            "toward your eyes and look at it. Off by default."
+            });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrFullBody,
+            {
+                .key = "Full Body",
+                .helpText = "Shows Link's whole body in first person (everything except his "
+                            "head), with his arms following your hands. On by default."
+            });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrFullBodyShowRolls,
+            {
+                .key = "Show Roll Animations",
+                .helpText = "With Full Body on, rolls, backflips and side rolls play Link's normal "
+                            "animation: his body, hands and anything he holds let go of the headset "
+                            "and controllers until the move ends. Off by default (his body holds "
+                            "still and stays with you instead)."
+            });
+        config_percent_select(leftPane, rightPane, getSettings().game.vrArmStretchMax,
+            "Arm Stretch Limit",
+            "With Full Body on, lets Link's arms lengthen up to this much of their normal "
+            "length when you reach further than he can, so his hands stay attached. "
+            "100% turns stretching off.",
+            100, 150, 5);
+        config_bool_select(leftPane, rightPane, getSettings().game.vrShadows,
+            {
+                .key = "Shadows",
+                .helpText = "Draws the shadows under Link, characters and objects. "
+                            "Needs Single-Pass Stereo."
+            });        config_bool_select(leftPane, rightPane, getSettings().game.vrThirdPerson,
             {
                 .key = "Third Person",
                 .helpText = "Plays the entire game in third person while in VR, the same "
                             "camera Wolf Link and cutscenes already use -- your headset "
                             "still looks around freely, just from behind Link instead of "
-                            "through his eyes. Also shows his body (overriding \"Experimental: "
-                            "Show Link's Body\" below if it's off), since there's no point "
-                            "being in third person with an invisible avatar. Off by default."
+                            "through his eyes. Also shows his body. Off by default."
             });
         config_bool_select(leftPane, rightPane, getSettings().game.vrThirdPersonFollowCameraYaw,
             {
@@ -1093,6 +1150,14 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                             "with it. You can still look anywhere with the headset. On by "
                             "default.",
                 .isDisabled = [] { return !getSettings().game.vrThirdPerson.getValue(); },
+            });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrZTargetCameraFocus,
+            {
+                .key = "Z-Target Camera Focus",
+                .helpText = "Z-targeting turns your view to face the target, like the "
+                            "normal game camera does, and keeps turning with it as the "
+                            "target or Link moves. You can still look around freely with "
+                            "the headset. On by default.",
             });
         // "Attach Body Rotation to Headset" (game.vrAttachBodyRotationToHead) is
         // intentionally not exposed here -- still a real ConfigVar, editable
@@ -1105,17 +1170,6 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         // shape_angle.y to the headset's yaw regardless. Disabled at the
         // ConfigVar default 2026-09-19 rather than left silently on. Do not
         // re-enable without new evidence the underlying bug is actually fixed.
-        config_bool_select(leftPane, rightPane, getSettings().game.vrShowBody,
-            {
-                .key = "Experimental: Show Link's Body",
-                .helpText = "Shows Link's whole body in VR, in any outfit or armor, along "
-                            "with the sword and shield while they're stowed on his back. "
-                            "Your tracked hands and anything actively held (sword drawn, "
-                            "shield raised, other items) show normally either way. Off by "
-                            "default (body hidden) since this is experimental; turn this on "
-                            "if you'd like to see your own body. Has no effect while \"Third "
-                            "Person\" above is on, which always shows the body."
-            });
         config_bool_select(leftPane, rightPane, getSettings().game.vrExperimentalCutsceneFirstPerson,
             {
                 .key = "EXPERIMENTAL: Cutscenes First-Person",
@@ -1164,6 +1218,22 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             "more GPU headroom on the standalone headset -- 90% cuts the pixel count "
             "by a fifth. Takes effect the next time the game starts.",
             50, 100, 5);
+#if VR_SETTINGS_STANDALONE
+        config_bool_select(leftPane, rightPane, getSettings().game.vrHighClocks,
+            {
+                .key = "High Clocks",
+                .helpText = "Asks the headset to run its CPU and GPU at a higher sustained speed, "
+                            "at the cost of more heat and battery. Off lets the headset choose. "
+                            "Takes effect the next time the game starts. On by default."
+            });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrSuperResolution,
+            {
+                .key = "Super Resolution (Sharpening)",
+                .helpText = "Asks the headset to apply its own edge-aware sharpening to the picture, "
+                            "making distant scenery and textures look crisper. Applies immediately. "
+                            "On by default."
+            });
+#endif
 
 #if !VR_SETTINGS_STANDALONE
         // Standalone renders through the native Quest runtime -- no SteamVR / Virtual Desktop /
@@ -1202,14 +1272,6 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         };
 
         leftPane.add_section("Inputs");
-        leftPane.register_control(
-            leftPane.add_group_button({.text = "Configure Inputs"}).on_pressed([this] {
-                push(std::make_unique<ControllerConfigWindow>());
-            }),
-            rightPane, [](Pane& pane) {
-                pane.clear();
-                pane.add_text("Open input binding configuration.");
-            });
         config_bool_select(leftPane, rightPane, getSettings().game.allowBackgroundInput,
             {
                 .key = "Allow Background Inputs",

@@ -88,8 +88,14 @@ UserSettings g_userSettings = {
         .disableLetterboxing {"game.disableLetterboxing", LetterboxMode::Off},
         .enableHighQualityMinimapTextures {"game.enableHighQualityMinimapTextures", true},
         .vrDesktopMirror {"game.vrDesktopMirror", true},
+        .vrScreenMode {"game.vrScreenMode", false},
+        .vrScreenModeStereo {"game.vrScreenModeStereo", false},
+        .vrScreenModeDepth {"game.vrScreenModeDepth", 1.0f},
         .vrSinglePassStereo {"game.vrSinglePassStereo", true},
         .vrRenderScale {"game.vrRenderScale", 1.0f},
+        .vrHighClocks {"game.vrHighClocks", true},
+        .vrDisplayRefreshRate {"game.vrDisplayRefreshRate", 72},
+        .vrSuperResolution {"game.vrSuperResolution", true},
         .vrSpaceWarp {"game.vrSpaceWarp", false},
         .vrSpaceWarpDebugNegateMv {"game.vrSpaceWarpDebugNegateMv", false},
         .vrSpaceWarpDebugFlipMvY {"game.vrSpaceWarpDebugFlipMvY", false},
@@ -100,8 +106,12 @@ UserSettings g_userSettings = {
         .vrSpaceWarpDebugReversedDepth {"game.vrSpaceWarpDebugReversedDepth", false},
         .vrSpaceWarpDebugRawProbe {"game.vrSpaceWarpDebugRawProbe", false},
         .vrShowBody {"game.vrShowBody", false},
-        .vrThirdPerson {"game.vrThirdPerson", false},
+        .vrHudOnLeftArm {"game.vrHudOnLeftArm", false},
+        .vrShadows {"game.vrShadows", true},        .vrFullBody {"game.vrFullBody", true},
+        .vrFullBodyShowRolls {"game.vrFullBodyShowRolls", false},
+        .vrArmStretchMax {"game.vrArmStretchMax", 1.25f},        .vrThirdPerson {"game.vrThirdPerson", false},
         .vrThirdPersonFollowCameraYaw {"game.vrThirdPersonFollowCameraYaw", true},
+        .vrZTargetCameraFocus {"game.vrZTargetCameraFocus", true},
         .vrAttachBodyRotationToHead {"game.vrAttachBodyRotationToHead", false},
         .vrExperimentalCutsceneFirstPerson {"game.vrExperimentalCutsceneFirstPerson", false},
         .vrSwapSwordShieldHands {"game.vrSwapSwordShieldHands", false},
@@ -164,6 +174,7 @@ UserSettings g_userSettings = {
         .vrSmoothTurnSpeed {"game.vrSmoothTurnSpeed", 135},
         .vrSnapTurn {"game.vrSnapTurn", false},
         .vrSnapTurnAngle {"game.vrSnapTurnAngle", 45},
+        .vrTurnWithEpona {"game.vrTurnWithEpona", true},
         .vrSmoothStartStop {"game.vrSmoothStartStop", true},
         .vrInstantStartFacing {"game.vrInstantStartFacing", true},
         .vrLightingMode {"game.vrLightingMode", VrLightingMode::SunMoon},
@@ -408,8 +419,14 @@ void registerSettings() {
     Register(g_userSettings.game.disableLetterboxing);
     Register(g_userSettings.game.enableHighQualityMinimapTextures);
     Register(g_userSettings.game.vrDesktopMirror);
+    Register(g_userSettings.game.vrScreenMode);
+    Register(g_userSettings.game.vrScreenModeStereo);
+    Register(g_userSettings.game.vrScreenModeDepth);
     Register(g_userSettings.game.vrSinglePassStereo);
     Register(g_userSettings.game.vrRenderScale);
+    Register(g_userSettings.game.vrHighClocks);
+    Register(g_userSettings.game.vrDisplayRefreshRate);
+    Register(g_userSettings.game.vrSuperResolution);
     Register(g_userSettings.game.vrSpaceWarp);
     Register(g_userSettings.game.vrSpaceWarpDebugNegateMv);
     Register(g_userSettings.game.vrSpaceWarpDebugFlipMvY);
@@ -420,8 +437,12 @@ void registerSettings() {
     Register(g_userSettings.game.vrSpaceWarpDebugReversedDepth);
     Register(g_userSettings.game.vrSpaceWarpDebugRawProbe);
     Register(g_userSettings.game.vrShowBody);
-    Register(g_userSettings.game.vrThirdPerson);
+    Register(g_userSettings.game.vrHudOnLeftArm);
+    Register(g_userSettings.game.vrShadows);    Register(g_userSettings.game.vrFullBody);
+    Register(g_userSettings.game.vrFullBodyShowRolls);
+    Register(g_userSettings.game.vrArmStretchMax);    Register(g_userSettings.game.vrThirdPerson);
     Register(g_userSettings.game.vrThirdPersonFollowCameraYaw);
+    Register(g_userSettings.game.vrZTargetCameraFocus);
     Register(g_userSettings.game.vrAttachBodyRotationToHead);
     Register(g_userSettings.game.vrExperimentalCutsceneFirstPerson);
     Register(g_userSettings.game.vrSwapSwordShieldHands);
@@ -443,6 +464,7 @@ void registerSettings() {
     Register(g_userSettings.game.vrSmoothTurnSpeed);
     Register(g_userSettings.game.vrSnapTurn);
     Register(g_userSettings.game.vrSnapTurnAngle);
+    Register(g_userSettings.game.vrTurnWithEpona);
     Register(g_userSettings.game.vrSmoothStartStop);
     Register(g_userSettings.game.vrInstantStartFacing);
     Register(g_userSettings.game.vrLightingMode);
