@@ -1,26 +1,41 @@
 #!/bin/bash
-# Portable x86_64 Linux AppImage for the VR build.
+# Portable Linux AppImage for the VR build (x86_64, or arm64 for SteamOS on
+# the Steam Frame -- built natively inside an emulated arm64 container).
 #
 # Builds inside an Ubuntu 24.04 container (same baseline as upstream CI) so the
 # result needs only glibc 2.39 / GLIBCXX_3.4.32: runs on SteamOS 3.x, Ubuntu
 # 24.04+, Mint 22+, Fedora 40+, Arch/CachyOS. A build made directly on a
 # rolling distro links that distro's newer glibc and won't run elsewhere.
 #
-# Usage (host): ci/build-linux-portable.sh
-# Requires podman (or docker). Output: build/portable/Dusklight_VR*.AppImage
+# Usage (host): ci/build-linux-portable.sh [x86_64|aarch64]   (default x86_64)
+# Requires podman (or docker). aarch64 also needs qemu-user binfmt on the host
+# (Arch: sudo pacman -S qemu-user-static qemu-user-static-binfmt).
+# Output: build/portable[-aarch64]/Dusklight_VR*.AppImage
+# Build dirs are separate per arch, so the two never mix.
 set -euo pipefail
 
 src_dir="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ "${1:-}" != "--inside" ]]; then
+  arch="${1:-x86_64}"
+  case "$arch" in
+    x86_64) platform=linux/amd64 ;;
+    aarch64|arm64) arch=aarch64; platform=linux/arm64 ;;
+    *) echo "error: unknown arch '$arch' (x86_64 or aarch64)" >&2; exit 1 ;;
+  esac
+  if [[ "$arch" != "$(uname -m)" && ! -e /proc/sys/fs/binfmt_misc/qemu-$arch ]]; then
+    echo "error: no qemu binfmt handler for $arch" >&2
+    echo "  Arch: sudo pacman -S qemu-user-static qemu-user-static-binfmt" >&2
+    exit 1
+  fi
   engine="$(command -v podman || command -v docker || true)"
   if [[ -z "$engine" ]]; then
     echo "error: podman or docker is required (sudo pacman -S podman)" >&2
     exit 1
   fi
-  exec "$engine" run --rm --network=host \
+  exec "$engine" run --rm --network=host --platform "$platform" \
     -v "$src_dir:/src:z" -w /src \
-    -e APP_VERSION="${APP_VERSION:-}" \
+    -e APP_VERSION="${APP_VERSION:-}" -e TPVR_ARCH="$arch" \
     docker.io/library/ubuntu:24.04 \
     /src/ci/build-linux-portable.sh --inside
 fi
@@ -39,15 +54,26 @@ apt-get -y install --no-install-recommends \
 
 git config --global --add safe.directory '*'
 
-build_dir=/src/build/portable-x86_64
-install_dir=/src/build/portable-install
-out_dir=/src/build/portable
+arch="${TPVR_ARCH:-x86_64}"
+[[ "$(uname -m)" == "$arch" ]] || { echo "error: container is $(uname -m), expected $arch" >&2; exit 1; }
+if [[ "$arch" == x86_64 ]]; then
+  # Keep the original x86_64 paths so existing builds stay incremental.
+  build_dir=/src/build/portable-x86_64
+  install_dir=/src/build/portable-install
+  out_dir=/src/build/portable
+else
+  build_dir=/src/build/portable-$arch
+  install_dir=/src/build/portable-install-$arch
+  out_dir=/src/build/portable-$arch
+fi
+mkdir -p "$out_dir"
 version="${APP_VERSION:-linux-vr-$(git -C /src rev-parse --short HEAD)}"
 
 cmake -S /src -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_SHARED_LIBS=OFF \
   -DAURORA_SDL3_PROVIDER=vendor \
+  -DAURORA_NOD_PROVIDER=package \
   -DCMAKE_INSTALL_PREFIX="$install_dir"
 cmake --build "$build_dir"
 rm -rf "$install_dir"
@@ -58,10 +84,14 @@ max_glibc=$(objdump -T "$install_dir/dusklight" | grep -oE 'GLIBC_[0-9.]+' | sor
 echo "dusklight requires $max_glibc"
 
 # ---- AppImage ----
-linuxdeploy=/src/build/linuxdeploy-x86_64.AppImage
+linuxdeploy=/src/build/linuxdeploy-$arch.AppImage
 [[ -x "$linuxdeploy" ]] || {
-  curl -fL https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -o "$linuxdeploy"
+  curl -fL https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage -o "$linuxdeploy"
   chmod +x "$linuxdeploy"
+  # Clear the AppImage magic ("AI\x02" in the ELF padding): qemu's binfmt
+  # mask requires those bytes be zero, else an emulated run fails with
+  # "Exec format error". Harmless on native runs.
+  printf '\0\0\0' | dd of="$linuxdeploy" bs=1 seek=8 conv=notrunc status=none
 }
 export APPIMAGE_EXTRACT_AND_RUN=1  # no FUSE in the container
 
@@ -81,7 +111,7 @@ cd "$out_dir"
 # libvulkan is excluded by linuxdeploy's excludelist on purpose: the host's
 # loader/ICDs must be used. The OpenXR loader is linked statically.
 VERSION="$version" NO_STRIP=1 "$linuxdeploy" \
-  -l "/usr/lib/x86_64-linux-gnu/libusb-1.0.so" \
+  -l "/usr/lib/$arch-linux-gnu/libusb-1.0.so" \
   --appdir "$appdir" --output appimage
 chown -R "$(stat -c %u:%g /src)" "$out_dir" "$build_dir" "$install_dir" 2>/dev/null || true
 ls -la "$out_dir"/*.AppImage

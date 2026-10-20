@@ -20,7 +20,12 @@ Twilight Princess PC port ("dusklight") with an in-progress VR mod.
   built from source and linked statically (no system `openxr` needed).
   Distributable x86_64 AppImage: `ci/build-linux-portable.sh` (Ubuntu 24.04
   container via podman; a host build on CachyOS needs glibc 2.44 and won't
-  run elsewhere). arm64/Steam Frame native build dropped by user choice. Linux uses the same Vulkan XR path as Quest
+  run elsewhere). arm64/Steam Frame AppImage (added 2026-10-19, built but
+  NOT yet tested on hardware): `ci/build-linux-portable.sh aarch64` — an
+  emulated arm64 container via qemu-user binfmt, about 30–60 min, output in
+  `build/portable-aarch64/`. It forces `AURORA_NOD_PROVIDER=package`
+  (on aarch64 "auto" would build nod from source, and Ubuntu's rustc is
+  too old). Linux uses the same Vulkan XR path as Quest
   (`DUSK_VR_XR_GRAPHICS_VULKAN`); Android-only pieces are gated by
   `DUSK_VR_PLATFORM_ANDROID`. VR logs (`duskVrLog`) go to stderr on Linux.
   `.gitmodules` points `extern/aurora` at encounter/aurora, but the pinned
