@@ -19,6 +19,9 @@
 #include "d/actor/d_a_hozelda.h"
 #if TARGET_PC
 #include "dusk/achievements.h"
+#if TARGET_PC
+#include "dusk/vr/vr_main.hpp"
+#endif
 #endif
 
 int daArrow_c::createHeap() {
@@ -413,6 +416,14 @@ void daArrow_c::setKeepMatrix() {
     } else {
         mDoMtx_stack_c::YrotS(-0x8000);
         mDoMtx_stack_c::revConcat(daAlink_getAlinkActorClass()->getLeftItemMatrix());
+#if TARGET_PC
+        // VR physical bow: a nocked arrow sits on the bow's aim line, so the
+        // shot flies along it (arrowShooting() uses this orientation).
+        Mtx nockedMtx;
+        if (dusk::vr::getPhysicalBowArrowMtx(fopAcM_GetID(this), nockedMtx)) {
+            mDoMtx_stack_c::copy(nockedMtx);
+        }
+#endif
     }
     mpModel->setBaseTRMtx(mDoMtx_stack_c::get());
     mDoMtx_multVecZero(mpModel->getBaseTRMtx(), &current.pos);

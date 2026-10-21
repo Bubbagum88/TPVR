@@ -394,6 +394,29 @@ bool isPhysicalSwordSwingActive();
 // as last drawn. False if the sword isn't following the tracked hand.
 bool getTrackedSwordMtx(float (*outMtx)[4]);
 
+// Physical bow (game.vrPhysicalBow, vr_link_visibility.hpp): whether the bow
+// is in physical-draw mode for Link right now, whether the nocked arrow is
+// pulled back far enough to fire (latched briefly so the 30Hz release check
+// sees it), and the nocked arrow's base transform (false if not nocked).
+bool isPhysicalBowMode(daAlink_c* link);
+bool isPhysicalBowDrawn();
+// arrowId = the asking arrow's process id (the shot is placed from the last
+// nocked position on the tick after release).
+bool getPhysicalBowArrowMtx(unsigned int arrowId, float (*outMtx)[4]);
+// Physical bow: an arrow is nocked on the bow right now.
+bool isPhysicalBowNocked();
+// "Left-Handed Bow" (game.vrLeftHandedBow): bow in the left hand, arrow in
+// the right, aiming with the left controller.
+bool isLeftHandedBow(daAlink_c* link);
+// Physical bow: aim yaw/pitch along the tracked bow's arrow line (same units
+// as getControllerAimAngles()). False -> aim with the controller instead.
+bool getPhysicalBowAimAngles(s16* outYawS, s16* outPitchS);
+// Diagnostic: logs every material name of `model` once per tag, as
+// "[dusk::vr::<tag>] <index> <name>".
+void logModelMaterialNamesOnce(J3DModel* model, const char* tag);
+// Frame of the bow's draw animation (BARELORD) matching the current pull.
+float getPhysicalBowStringFrame(float frameMax);
+
 // Real right-controller-pointing aim yaw/pitch (same s16 BAMS unit as
 // daAlink_c::shape_angle.y / mBodyAngle.x), for first-person item aiming
 // (bow/slingshot/hookshot/boomerang, all funneling through

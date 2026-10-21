@@ -458,6 +458,17 @@ struct UserSettings {
         // tracked sword's own attack hitbox is live while the hand moves
         // faster than the swing-gesture threshold (no attack animation).
         ConfigVar<bool> vrPhysicalSword;
+        // Physical bow: nock the arrow by bringing the draw hand to the bow,
+        // pull it back along the bow's aim, release the item button to fire.
+        ConfigVar<bool> vrPhysicalBow;
+        // Bow in the left tracked hand and the arrow in the right (the base
+        // game has it the other way round). The bow's grip is mirrored from
+        // the right-hand rig data through vrBowSwapMirrorAxis (+ optional
+        // vrBowSwapExtraFlipAxis), same technique as the sword/shield swap;
+        // both are debug-only calibration knobs.
+        ConfigVar<bool> vrLeftHandedBow;
+        ConfigVar<int> vrBowSwapMirrorAxis;
+        ConfigVar<int> vrBowSwapExtraFlipAxis;
         // Which local axis (0=X, 1=Y, 2=Z) mirrorLocalMtxAxis()
         // (vr_link_visibility.hpp) reflects the sword's grip data through
         // when vrSwapSwordShieldHands is on -- see that function's own

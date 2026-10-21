@@ -1202,6 +1202,20 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                             "the swing slows down. Link doesn't play an attack animation. "
                             "The real attack button still works normally. Off by default."
             });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrPhysicalBow,
+            {
+                .key = "Physical Bow",
+                .helpText = "Hold the bow button, bring your other hand to the bow to nock "
+                            "the arrow, pull it back, then release the button to fire. "
+                            "Releasing without pulling back puts the arrow away."
+            });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrLeftHandedBow,
+            {
+                .key = "Left-Handed Bow",
+                .helpText = "Holds the bow in your left hand and the arrow in your right, and "
+                            "aims with the left controller. Off puts them the way the game "
+                            "does: bow in the right hand, arrow in the left."
+            });
 
         leftPane.add_section("Performance");
         config_bool_select(leftPane, rightPane, getSettings().game.vrSinglePassStereo,

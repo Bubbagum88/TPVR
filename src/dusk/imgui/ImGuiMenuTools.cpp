@@ -130,6 +130,11 @@ namespace dusk {
                     getSettings().game.vrSwapSwordExtraFlipAxis, -1, 2);
                 dusk::config::ImGuiSliderInt("VR Swap Shield Extra Flip Axis (-1=off 0=X 1=Y 2=Z)",
                     getSettings().game.vrSwapShieldExtraFlipAxis, -1, 2);
+                // Left-Handed Bow grip calibration (settings.h vrLeftHandedBow).
+                dusk::config::ImGuiSliderInt("VR Left-Handed Bow Mirror Axis (0=X 1=Y 2=Z)",
+                    getSettings().game.vrBowSwapMirrorAxis, 0, 2);
+                dusk::config::ImGuiSliderInt("VR Left-Handed Bow Extra Flip Axis (-1=off 0=X 1=Y 2=Z)",
+                    getSettings().game.vrBowSwapExtraFlipAxis, -1, 2);
                 // Debug-only, live-adjustable (2026-08-20 same-day
                 // follow-up) -- see settings.h's vrSwapSwordGripOffsetX/Y/Z
                 // comment. Fixed positional nudge applied to the item's

@@ -261,8 +261,17 @@ BOOL daAlink_c::checkUpperItemActionBow() {
 
     if (checkBowChargeWaitAnime()) {
         daArrow_c* arrow_p = (daArrow_c*)mItemAcKeep.getActor();
+#if TARGET_PC
+        // VR physical bow: fire only on release while the nocked arrow is
+        // pulled back, and only charge while it's held drawn.
+        const bool vrPhysicalBow = dusk::vr::isPhysicalBowMode(this);
+        const bool vrBowDrawn = vrPhysicalBow && dusk::vr::isPhysicalBowDrawn();
+#else
+        const bool vrPhysicalBow = false;
+        const bool vrBowDrawn = false;
+#endif
 
-        if (mEquipItem != dItemNo_PACHINKO_e) {
+        if (mEquipItem != dItemNo_PACHINKO_e && (!vrPhysicalBow || vrBowDrawn)) {
             if (field_0x301c > 0) {
                 field_0x301c--;
 
@@ -299,6 +308,12 @@ BOOL daAlink_c::checkUpperItemActionBow() {
 
                 changeItemBck(bck_res_id, mpHIO->mItem.mBow.m.mShootAnm.mStartFrame);
                 mItemVar0.field_0x3018 = 0;
+            } else if (vrPhysicalBow && !vrBowDrawn && !itemButton()) {
+                // Released without drawing: put the arrow away. Pressing
+                // the button again loads a new one.
+                deleteArrow();
+                resetFacePriAnime();
+                setBowReadyAnime();
             } else if (mEquipItem == dItemNo_PACHINKO_e) {
                 if (!itemButton()) {
                     dComIfGp_getVibration().StartShock(VIBMODE_S_POWER1, 1, cXyz(0.0f, 1.0f, 0.0f));
@@ -364,6 +379,10 @@ BOOL daAlink_c::checkUpperItemActionBow() {
             setFacePriBck(dRes_ID_ALANM_BCK_FARELORDTAME_e);
 
             if (mEquipItem != dItemNo_PACHINKO_e) {
+#if TARGET_PC
+                // VR physical bow keeps the draw animation; its frame follows the pull.
+                if (!dusk::vr::isPhysicalBowMode(this))
+#endif
                 changeItemBck(dRes_ID_ALANM_BCK_BARELORDTAME_e, 0.0f);
                 dComIfGp_getVibration().StartQuake(VIBMODE_Q_POWER1, 1, cXyz(0.0f, 1.0f, 0.0f));
                 onNoResetFlg3(FLG3_UNK_4);
@@ -426,6 +445,21 @@ BOOL daAlink_c::checkUpperItemActionBow() {
     } else {
         field_0x33dc = mUpperFrameCtrl[2].getFrame();
     }
+#if TARGET_PC
+    // VR physical bow: the string is drawn by the arrow, not the timed
+    // animation. At rest (BASHOOT's last frame -- BARELORD's first frame has
+    // the string pulled aside) until nocked, then BARELORD at the pull.
+    if (dusk::vr::isPhysicalBowMode(this) && (checkBowReloadAnime() || checkBowChargeWaitAnime())) {
+        if (dusk::vr::isPhysicalBowNocked()) {
+            changeItemBck(dRes_ID_ALANM_BCK_BARELORD_e, 0.0f);
+            if (mItemBck.getBckAnm() != NULL) {
+                field_0x33dc = dusk::vr::getPhysicalBowStringFrame(mItemBck.getBckAnm()->getFrameMax());
+            }
+        } else {
+            changeItemBck(dRes_ID_ALANM_BCK_BASHOOT_e, -1.0f);
+        }
+    }
+#endif
 
     return cancelUpperItemReadyAnime(0);
 }

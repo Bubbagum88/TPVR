@@ -19420,6 +19420,23 @@ void daAlink_c::setDrawHand() {
         }
     }
 
+#if TARGET_PC
+    // VR "Left-Handed Bow": the bow is in the left hand and the arrow in the
+    // right, so each hand shows the other hand's pose. Left poses are
+    // materials 0-4, right 5-10; mapped by matching pairs the game itself uses
+    // together (0/5 grip, 1/6 open, 3/9 grab, 4/10 ledge grip). Check with the
+    // one-shot [dusk::vr::handmats] name dump if a pose looks wrong.
+    if (dusk::vr::isLeftHandedBow(this) && var_r30 != 0xFB && var_r29 != 0xFB) {
+        dusk::vr::logModelMaterialNamesOnce(mpLinkHandModel, "handmats");
+        static const u8 kRightToLeft[] = {0, 1, 2, 2, 3, 4};      // right 5..10 -> left
+        static const u8 kLeftToRight[] = {5, 6, 7, 9, 10};        // left 0..4 -> right
+        const u8 left = var_r30;
+        const u8 right = var_r29;
+        var_r30 = (right >= 5 && right <= 10) ? kRightToLeft[right - 5] : right;
+        var_r29 = (left <= 4) ? kLeftToRight[left] : left;
+    }
+#endif
+
     mpLinkHandModel->setBaseTRMtx(mpLinkModel->getBaseTRMtx());
     mpLinkHandModel->calc();
 

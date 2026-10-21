@@ -158,8 +158,16 @@ BOOL daAlink_c::setBodyAngleToCamera() {
                     leftHand = true;
                 } else if (mEquipItem == dItemNo_W_HOOKSHOT_e) {
                     leftHand = getHookshotLeft();
+                } else if (dusk::vr::isLeftHandedBow(this)) {
+                    leftHand = true;  // "Left-Handed Bow": the bow is in the left hand
                 }
-                dusk::vr::getControllerAimAnglesForHand(leftHand, &aimYawS, &aimPitchS);
+                // Physical Bow: aim along the bow's own arrow line, so the
+                // aim dot matches where the nocked arrow points.
+                if (!checkBowItem(mEquipItem) || !dusk::vr::isPhysicalBowMode(this) ||
+                    !dusk::vr::getPhysicalBowAimAngles(&aimYawS, &aimPitchS))
+                {
+                    dusk::vr::getControllerAimAnglesForHand(leftHand, &aimYawS, &aimPitchS);
+                }
             }
             shape_angle.y = aimYawS;
             sp8 = aimPitchS;

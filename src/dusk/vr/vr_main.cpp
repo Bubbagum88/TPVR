@@ -258,6 +258,9 @@ s16 g_controllerAimPitchS = 0;
 // Same from the left controller's aim pose.
 s16 g_controllerAimLeftYawS = 0;
 s16 g_controllerAimLeftPitchS = 0;
+// Right controller aim direction (game world), for the physical bow's arrow line.
+vr_link::Vec3f g_rightAimForward{0.f, 0.f, 1.f};
+vr_link::Vec3f g_leftAimForward{0.f, 0.f, 1.f};
 
 // HMD-based aim pitch -- see getHeadAimAngles()'s own declaration comment
 // (vr_main.hpp). Yaw reuses g_headMoveAngleS directly (identical formula,
@@ -753,6 +756,47 @@ bool isPhysicalSwordSwingActive() {
 
 bool getTrackedSwordMtx(float (*outMtx)[4]) {
     return vr_link::getTrackedSwordMtx(outMtx);
+}
+
+bool isPhysicalBowMode(daAlink_c* link) {
+    return isImmersiveVr() && vr_link::isPhysicalBowMode(link);
+}
+
+bool isPhysicalBowDrawn() {
+    return vr_link::isPhysicalBowDrawn();
+}
+
+bool getPhysicalBowArrowMtx(unsigned int arrowId, float (*outMtx)[4]) {
+    return isImmersiveVr() && vr_link::getPhysicalBowArrowMtx(arrowId, outMtx);
+}
+
+bool isPhysicalBowNocked() {
+    return isImmersiveVr() && vr_link::isPhysicalBowNocked();
+}
+
+bool isLeftHandedBow(daAlink_c* link) {
+    return isImmersiveVr() && vr_link::isLeftHandedBow(link);
+}
+
+bool getPhysicalBowAimAngles(s16* outYawS, s16* outPitchS) {
+    return isImmersiveVr() && vr_link::getPhysicalBowAimAngles(outYawS, outPitchS);
+}
+
+void logModelMaterialNamesOnce(J3DModel* model, const char* tag) {
+    static bool s_logged = false;  // only one caller so far
+    if (s_logged || !model) return;
+    s_logged = true;
+    J3DModelData* data = model->getModelData();
+    JUTNameTab* names = data->getMaterialName();
+    for (u16 i = 0; i < data->getMaterialNum(); ++i) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "[dusk::vr::%s] %u %s\n", tag, i, names ? names->getName(i) : "?");
+        duskVrLog(buf);
+    }
+}
+
+float getPhysicalBowStringFrame(float frameMax) {
+    return vr_link::getPhysicalBowStringFrame(frameMax);
 }
 
 
@@ -2935,6 +2979,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         const vr_link::Vec3f aimForward =
             vr_link::computeControllerAimForward(rightAimPose, dusk::vr::getSmoothTurnYawRad());
         const float horiz = std::sqrt(aimForward.x * aimForward.x + aimForward.z * aimForward.z);
+        g_rightAimForward = aimForward;
         g_controllerAimYawS = cM_atan2s(aimForward.x, aimForward.z);
         g_controllerAimPitchS = static_cast<s16>(-cM_atan2s(aimForward.y, horiz));
 
@@ -2942,6 +2987,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
             vr_link::computeControllerAimForward(leftAimPose, dusk::vr::getSmoothTurnYawRad());
         const float leftHoriz =
             std::sqrt(leftAimForward.x * leftAimForward.x + leftAimForward.z * leftAimForward.z);
+        g_leftAimForward = leftAimForward;
         g_controllerAimLeftYawS = cM_atan2s(leftAimForward.x, leftAimForward.z);
         g_controllerAimLeftPitchS = static_cast<s16>(-cM_atan2s(leftAimForward.y, leftHoriz));
     }
@@ -3016,6 +3062,10 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     const auto* refreshLink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
     const bool linkModelsSwapping = refreshLink != nullptr && refreshLink->getClothesChangeWaitTimer() != 0;
     if (!screenMode && !linkModelsSwapping) {
+    // Physical bow: nock/pull from the real controllers, then lock the draw
+    // hand to the arrow and pose the bow string -- before anything below
+    // poses the hands/arms or calcs the bow.
+    vr_link::updatePhysicalBowState(g_rightAimForward, g_leftAimForward, pacing.dt);
     if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
         dusk::vr::refreshTrackedHandDrawMtxLive(link->getHandModel());
     }
@@ -3064,6 +3114,23 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // themselves (fixes fishing rod/boomerang/nocked arrows/etc. -- see
     // refreshTrackedItemJointMtxLive()'s own comment, vr_link_visibility.hpp).
     dusk::vr::refreshTrackedItemJointMtxLive();
+
+    // Physical bow arrow model (after the item joints above, the un-nocked
+    // arrow reads getLeftItemMatrix()).
+    vr_link::refreshPhysicalBowArrowLive();
+    if (vr_link::consumeBowNockEvent()) {
+        XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
+        info.action = g_hapticAction;
+        XrHapticVibration vib{XR_TYPE_HAPTIC_VIBRATION};
+        vib.duration = 30'000'000;  // ns
+        vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+        vib.amplitude = 0.5f;
+        for (const XrPath hand : {g_leftHandPath, g_rightHandPath}) {
+            info.subactionPath = hand;
+            xrApplyHapticFeedback(g_session->session(), &info,
+                                  reinterpret_cast<const XrHapticBaseHeader*>(&vib));
+        }
+    }
 
     // The held (not-yet-thrown) boomerang's OWN base-transform setter only
     // samples getLeftItemMatrix() once per sim tick (see

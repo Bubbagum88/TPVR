@@ -15,6 +15,7 @@
 #include "dusk/vr/vr_smooth_turn.hpp"  // dusk::vr::rotateYawXr/rotateYawQuat
 #include "dusk/settings.h"  // dusk::getSettings().game.vrThirdPerson
 #include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_arrow.h"
 #include "d/actor/d_a_boomerang.h"
 #include "d/actor/d_a_mg_rod.h"
 #include "d/actor/d_a_midna.h"  // Wolf-mode Midna head/mask hiding
@@ -31,6 +32,7 @@
 #include "JSystem/J3DGraphAnimator/J3DModelData.h"
 #include "JSystem/J3DGraphAnimator/J3DJoint.h"
 #include "JSystem/J3DGraphAnimator/J3DShapeTable.h"
+#include "JSystem/JUtility/JUTNameTab.h"
 
 #include <cmath>
 #include <cstdio>
@@ -3383,6 +3385,14 @@ namespace detail {
 inline bool s_heldItemTrackedThisFrame = false;
 }  // namespace detail
 
+// "Left-Handed Bow" (game.vrLeftHandedBow): bow in the left tracked hand,
+// arrow in the right. Only when the game itself has the bow in Link's right
+// hand (checkBowGrabLeftHand() already puts it in the left on horseback).
+inline bool isLeftHandedBow(daAlink_c* link) {
+    return link && dusk::getSettings().game.vrLeftHandedBow.getValue() && isFirstPerson(link) &&
+           daPy_py_c::checkBowItem(link->getEquipItem()) && !link->checkBowGrabLeftHand();
+}
+
 inline void refreshTrackedHeldItemMtxLive() {
     detail::s_heldItemTrackedThisFrame = false;
     dusk::interp::particle::clear_live_positions();  // re-marked below while the lantern is held
@@ -3404,6 +3414,15 @@ inline void refreshTrackedHeldItemMtxLive() {
                                      handJointMtx, trackedHandMtx);
 
         const bool attached = (attach != HeldItemAttach::None) && detail::s_heldItemRawBasis.valid;
+        // Left-Handed Bow: the right-hand grip data, mirrored onto the left
+        // tracked hand (same technique as the sword/shield swap).
+        int mirrorAxis = -1;
+        int extraFlipAxis = -1;
+        if (attach == HeldItemAttach::Right && isLeftHandedBow(link)) {
+            trackedHandMtx = detail::s_leftHandMtx;
+            mirrorAxis = dusk::getSettings().game.vrBowSwapMirrorAxis.getValue();
+            extraFlipAxis = dusk::getSettings().game.vrBowSwapExtraFlipAxis.getValue();
+        }
         if (attached && isHandTrackingSuspended(link)) {
             // Show Roll Animations: follow the animated hand instead.
             refreshRestingPoseSmoothed(heldItemModel, detail::s_heldItemRestingTick,
@@ -3411,7 +3430,7 @@ inline void refreshTrackedHeldItemMtxLive() {
                                         detail::s_heldItemRestingCurrMtx);
             markModelJointsLive(heldItemModel);
         } else if (applyTrackedItemMtxIfAttached(heldItemModel, attached, detail::s_heldItemRawBasis.mtx,
-                                                  handJointMtx, trackedHandMtx)) {
+                                                  handJointMtx, trackedHandMtx, mirrorAxis, extraFlipAxis)) {
             markModelJointsLive(heldItemModel);
             detail::s_heldItemTrackedThisFrame = true;
         }
@@ -3569,6 +3588,508 @@ inline void refreshCopyRodBallLive() {
     if (!rod->mpBallModel || !rod->applyRodAttachedTransform()) return;
     rod->mpBallModel->calc();
     markModelJointsLive(rod->mpBallModel);
+}
+
+// ---------------------------------------------------------------------------
+// Physical bow drawing (game.vrPhysicalBow)
+// ---------------------------------------------------------------------------
+//
+// The bow sits in the right tracked hand (computeHeldItemAttach()) and aims
+// with the right controller (setBodyAngleToCamera()); the arrow follows the
+// left hand via getLeftItemMatrix() (daArrow_c::setKeepMatrix()). While the
+// game is in its charge-wait pose (button held, arrow loaded), bringing the
+// left hand to the bow nocks the arrow; from then on the arrow sits on the
+// bow's aim line with its tail pulled back by how far the left hand is behind
+// the grip. checkUpperItemActionBow() only fires on release while drawn
+// (isPhysicalBowDrawn()), and puts the arrow away otherwise.
+namespace detail {
+inline bool s_bowNocked = false;
+inline bool s_bowNockEvent = false;
+inline bool s_bowArrowMtxValid = false;
+inline Mtx s_bowArrowMtx;
+inline float s_bowDrawnLatchSec = 0.0f;
+inline float s_bowPullUnits = 0.0f;
+}  // namespace detail
+
+constexpr float kBowNockRadiusUnits = 20.0f;   // draw hand this close to the grip nocks
+constexpr float kBowMaxPullUnits = 70.0f;      // arrow is 95 units long
+constexpr float kBowMinDrawPullUnits = 25.0f;  // pulled at least this far counts as drawn
+constexpr float kBowDrawnLatchSec = 0.15f;     // covers the 30Hz release check
+
+// Same conditions the game side uses (d_a_alink_bow.inc), minus the
+// per-frame charge-wait/arrow checks.
+inline bool isPhysicalBowMode(daAlink_c* link) {
+    return link && dusk::getSettings().game.vrPhysicalBow.getValue() && isFirstPerson(link) &&
+           daPy_py_c::checkBowItem(link->getEquipItem()) && !dComIfGp_checkPlayerStatus0(0, 0x200000);
+}
+
+inline daArrow_c* getNockableArrow(daAlink_c* link) {
+    fopAc_ac_c* actor = link->mItemAcKeep.getActor();
+    if (!actor || !fopAc_IsActor(actor) || fopAcM_GetName(actor) != fpcNm_ARROW_e) return nullptr;
+    return static_cast<daArrow_c*>(actor);
+}
+
+inline bool isPhysicalBowDrawn() {
+    return detail::s_bowDrawnLatchSec > 0.0f;
+}
+
+namespace detail {
+// Left-Handed Bow: the not-yet-nocked arrow in the right hand.
+inline bool s_bowHeldArrowMtxValid = false;
+inline Mtx s_bowHeldArrowMtx;
+// The last arrow that was nocked, and where it was on the bow. The shot is
+// launched from setKeepMatrix() on the tick AFTER the release, when the bow
+// has already left its draw pose and nothing is nocked any more -- without
+// this the arrow fell back to the game's own hand joint (Link's hip).
+inline fpc_ProcID s_lastNockedArrowId = fpcM_ERROR_PROCESS_ID_e;
+inline Mtx s_lastNockedArrowMtx;
+}  // namespace detail
+
+// The arrow's base transform when VR places it: nocked on the bow, just shot
+// from it, or (with Left-Handed Bow) held in the right hand. Read by
+// daArrow_c::setKeepMatrix() for `arrowId`.
+inline bool getPhysicalBowArrowMtx(fpc_ProcID arrowId, Mtx outMtx) {
+    if (detail::s_bowArrowMtxValid) {
+        MTXCopy(detail::s_bowArrowMtx, outMtx);
+        return true;
+    }
+    if (arrowId != fpcM_ERROR_PROCESS_ID_e && arrowId == detail::s_lastNockedArrowId) {
+        MTXCopy(detail::s_lastNockedArrowMtx, outMtx);
+        return true;
+    }
+    if (detail::s_bowHeldArrowMtxValid) {
+        MTXCopy(detail::s_bowHeldArrowMtx, outMtx);
+        return true;
+    }
+    return false;
+}
+
+// True once, on the frame the arrow gets nocked (for a haptic pulse).
+inline bool consumeBowNockEvent() {
+    const bool e = detail::s_bowNockEvent;
+    detail::s_bowNockEvent = false;
+    return e;
+}
+
+// The bow's own draw animation (BARELORD, mItemBck) is posed from the pull
+// instead of the game's timed reload: frame 0 = string at rest, last frame =
+// fully drawn. Used by the game side (checkUpperItemActionBow()) per tick and
+// re-applied every frame below.
+namespace detail {
+// The bow model's string joint (the one BARELORD moves furthest), found once
+// per bow model, and its rest/full-draw positions in the bow's local space.
+inline J3DModelData* s_bowStringData = nullptr;
+inline int s_bowStringJoint = -1;
+inline cXyz s_bowStringRestLocal;
+inline cXyz s_bowStringDrawnLocal;
+inline f32 s_bowStringFrac = 0.0f;  // 0 = rest, 1 = BARELORD's last frame
+}  // namespace detail
+
+inline f32 getPhysicalBowStringFrame(f32 frameMax) {
+    return (frameMax - 0.001f) * detail::s_bowStringFrac;
+}
+
+inline cXyz detail_jointLocal(J3DModel* model, int joint) {
+    Mtx inv;
+    MTXInverse(model->getBaseTRMtx(), inv);
+    MtxP m = model->getAnmMtx(joint);
+    const cXyz world(m[0][3], m[1][3], m[2][3]);
+    cXyz local;
+    mDoMtx_multVec(inv, &world, &local);
+    return local;
+}
+
+inline void detail_findBowStringJoint(daAlink_c* link, J3DModel* bow, J3DAnmTransform* bck) {
+    J3DModelData* data = bow->getModelData();
+    if (detail::s_bowStringData == data) return;
+    detail::s_bowStringData = data;
+    detail::s_bowStringJoint = -1;
+    const u16 num = data->getJointNum();
+    if (num == 0 || num > 64) return;
+
+    cXyz rest[64];
+    link->mItemBck.entry(data, 0.0f);
+    bow->calc();
+    for (u16 j = 0; j < num; ++j) rest[j] = detail_jointLocal(bow, j);
+    link->mItemBck.entry(data, bck->getFrameMax() - 0.001f);
+    bow->calc();
+
+    f32 best = 0.0f;
+    for (u16 j = 0; j < num; ++j) {
+        const cXyz drawn = detail_jointLocal(bow, j);
+        const f32 d = (drawn - rest[j]).abs();
+        if (d > best) {
+            best = d;
+            detail::s_bowStringJoint = j;
+            detail::s_bowStringRestLocal = rest[j];
+            detail::s_bowStringDrawnLocal = drawn;
+        }
+    }
+    if (detail::s_bowStringJoint >= 0) {
+        char buf[160];
+        JUTNameTab* names = data->getJointName();
+        std::snprintf(buf, sizeof(buf), "[dusk::vr::bowstring] joint %d (%s) travels %.1f units over BARELORD",
+                      detail::s_bowStringJoint,
+                      names ? names->getName(static_cast<u16>(detail::s_bowStringJoint)) : "?", best);
+        dusk::vr::duskVrLog(buf);
+    }
+}
+
+// Where the arrow's tail sits in the draw hand: the left item joint, in the
+// left hand joint's frame, from the game's own pose this tick.
+inline cXyz detail_leftItemPointInHand(daAlink_c* link) {
+    captureRawBodyJointsOnce(link);
+    const u16 itemJnt = link->getLeftItemJntNo();
+    if (!detail::s_rawBodyModelData || itemJnt >= detail::s_rawBodyAnmNum) return cXyz(0.0f, 0.0f, 0.0f);
+    Mtx inv;
+    MTXInverse(detail::s_rawLeftHandJointMtx, inv);
+    const cXyz itemPos(detail::s_rawBodyAnm[itemJnt][0][3], detail::s_rawBodyAnm[itemJnt][1][3],
+                       detail::s_rawBodyAnm[itemJnt][2][3]);
+    cXyz local;
+    mDoMtx_multVec(inv, &itemPos, &local);
+    return local;
+}
+
+// Same point for the hand that holds the arrow: with Left-Handed Bow that's
+// the right hand, so the left-hand point is mirrored (vrBowSwapMirrorAxis).
+inline cXyz detail_arrowPointInDrawHand(daAlink_c* link, bool leftHandedBow) {
+    cXyz p = detail_leftItemPointInHand(link);
+    if (leftHandedBow) {
+        switch (dusk::getSettings().game.vrBowSwapMirrorAxis.getValue()) {
+        case 0: p.x = -p.x; break;
+        case 1: p.y = -p.y; break;
+        case 2: p.z = -p.z; break;
+        default: break;
+        }
+    }
+    return p;
+}
+
+// Left-Handed Bow: the arrow held in the right hand -- the left hand's arrow
+// grip from this tick's pose, mirrored onto the right tracked hand.
+// daArrow_c::setKeepMatrix() turns the left-hand item joint 180 degrees for
+// the arrow; the mirror already reverses the shaft axis, so no turn here
+// (with it the arrow pointed backwards in the hand, in-headset 2026-10-20).
+inline bool detail_computeRightHandArrowMtx(daAlink_c* link, Mtx out) {
+    captureRawBodyJointsOnce(link);
+    const u16 itemJnt = link->getLeftItemJntNo();
+    if (!detail::s_rawBodyModelData || itemJnt >= detail::s_rawBodyAnmNum) return false;
+    return computeTrackedItemMtx(out, detail::s_rawBodyAnm[itemJnt], detail::s_rawLeftHandJointMtx,
+                                 detail::s_rightHandMtx,
+                                 dusk::getSettings().game.vrBowSwapMirrorAxis.getValue());
+}
+
+namespace detail {
+// The arrow's direction in the bow model's own frame, taken from the game's
+// draw pose (charge wait), so the VR arrow lies along the bow the way the
+// game authored it rather than along the controller's aim pose (the two are
+// pitched apart -- the arrow looked tilted against the bow, 2026-10-20).
+inline cXyz s_bowLocalArrowDir;
+inline bool s_bowLocalArrowDirValid = false;
+// That direction in the world for the tracked bow this frame; bows aim along
+// it (getPhysicalBowAimAngles()) so the aim dot matches the arrow.
+inline cXyz s_bowArrowDirWorld;
+inline bool s_bowArrowDirWorldValid = false;
+}  // namespace detail
+
+inline void detail_negateAxis(cXyz& v, int axis) {
+    if (axis == 0) v.x = -v.x;
+    else if (axis == 1) v.y = -v.y;
+    else if (axis == 2) v.z = -v.z;
+}
+
+// Bow's arrow direction in the world for the bow as it's tracked this frame.
+// Mirrors refreshTrackedHeldItemMtxLive()'s bow placement so it can run
+// before it (the hand lock needs it first).
+inline bool detail_computeBowArrowDirWorld(daAlink_c* link, bool leftHandedBow, cXyz& out) {
+    J3DModel* bow = link->getHeldItemModel();
+    if (!bow) return false;
+    captureRawBasisOnce(bow, detail::s_heldItemRawBasis);
+    captureRawBodyJointsOnce(link);
+    if (!detail::s_heldItemRawBasis.valid || !detail::s_rawBodyModelData) return false;
+
+    MtxP rawBow = detail::s_heldItemRawBasis.mtx;
+    if (link->checkBowChargeWaitAnime()) {
+        // Game's nocked arrow = left item joint * Ry(180) (setKeepMatrix()):
+        // its +Z is the item joint's -Z.
+        const u16 itemJnt = link->getLeftItemJntNo();
+        if (itemJnt < detail::s_rawBodyAnmNum) {
+            MtxP item = detail::s_rawBodyAnm[itemJnt];
+            const cXyz fwd(-item[0][2], -item[1][2], -item[2][2]);
+            // Into the bow's frame: transpose of its rotation.
+            cXyz local(rawBow[0][0] * fwd.x + rawBow[1][0] * fwd.y + rawBow[2][0] * fwd.z,
+                       rawBow[0][1] * fwd.x + rawBow[1][1] * fwd.y + rawBow[2][1] * fwd.z,
+                       rawBow[0][2] * fwd.x + rawBow[1][2] * fwd.y + rawBow[2][2] * fwd.z);
+            if (local.abs() > 0.001f) {
+                local.normalize();
+                detail::s_bowLocalArrowDir = local;
+                detail::s_bowLocalArrowDirValid = true;
+            }
+        }
+    }
+    if (!detail::s_bowLocalArrowDirValid) return false;
+
+    int mirrorAxis = -1;
+    int flipAxis = -1;
+    MtxP bowHand = detail::s_rightHandMtx;
+    if (leftHandedBow) {
+        bowHand = detail::s_leftHandMtx;
+        mirrorAxis = dusk::getSettings().game.vrBowSwapMirrorAxis.getValue();
+        flipAxis = dusk::getSettings().game.vrBowSwapExtraFlipAxis.getValue();
+    }
+    Mtx trackedBow;
+    if (!computeTrackedItemMtx(trackedBow, rawBow, detail::s_rawRightHandJointMtx, bowHand, mirrorAxis, flipAxis)) {
+        return false;
+    }
+    // Mirrored bow = H' (M O M) D, so a bow-local direction d becomes D M d.
+    cXyz d = detail::s_bowLocalArrowDir;
+    detail_negateAxis(d, mirrorAxis);
+    if (flipAxis >= 0) {
+        for (int a = 0; a < 3; ++a) {
+            if (a != flipAxis) detail_negateAxis(d, a);
+        }
+    }
+    out.set(trackedBow[0][0] * d.x + trackedBow[0][1] * d.y + trackedBow[0][2] * d.z,
+            trackedBow[1][0] * d.x + trackedBow[1][1] * d.y + trackedBow[1][2] * d.z,
+            trackedBow[2][0] * d.x + trackedBow[2][1] * d.y + trackedBow[2][2] * d.z);
+    if (out.abs() < 0.001f) return false;
+    out.normalize();
+    return true;
+}
+
+// Physical bow aim along the bow's arrow line (yaw/pitch in the same units as
+// getControllerAimAngles()). False -> use the controller aim.
+inline bool getPhysicalBowAimAngles(s16* outYaw, s16* outPitch) {
+    if (!detail::s_bowArrowDirWorldValid) return false;
+    const cXyz& d = detail::s_bowArrowDirWorld;
+    *outYaw = cM_atan2s(d.x, d.z);
+    *outPitch = static_cast<s16>(-cM_atan2s(d.y, std::sqrt(d.x * d.x + d.z * d.z)));
+    return true;
+}
+
+// Called once per real frame from tick(), right after updateFrame() and
+// before anything poses the hands/arms or calcs the bow: decides nocking and
+// pull from the real controllers, then (while nocked) moves the tracked draw
+// hand so the arrow's tail sits in its fingers. The bow hand is the right
+// controller, or the left with Left-Handed Bow; the arrow line follows the
+// bow model (controller aim pose only until the game's draw pose is known).
+namespace detail {
+inline Mtx s_bowHandSmoothMtx;
+inline bool s_bowHandSmoothValid = false;
+inline bool s_bowHandSmoothLeft = false;
+}  // namespace detail
+
+// Time constant of the bow hand's smoothing (seconds): steadies aiming
+// without noticeable lag.
+constexpr float kBowHandSmoothingSec = 0.05f;
+
+// Eases the hand holding the bow toward its tracked pose instead of following
+// it exactly, while a bow is held in first person. Writes the smoothed pose
+// back into that hand's tracked matrix, so everything after (hand model, bow,
+// arrow line, bow aim, Full Body arm) uses it.
+inline void detail_smoothBowHand(daAlink_c* link, float dt) {
+    const bool active = link && detail::s_handMtxValid && isFirstPerson(link) &&
+                        !isHandTrackingSuspended(link) && daPy_py_c::checkBowItem(link->getEquipItem());
+    if (!active) {
+        detail::s_bowHandSmoothValid = false;
+        return;
+    }
+    const bool left = isLeftHandedBow(link) || link->checkBowGrabLeftHand();
+    MtxP hand = left ? detail::s_leftHandMtx : detail::s_rightHandMtx;
+    if (!detail::s_bowHandSmoothValid || detail::s_bowHandSmoothLeft != left) {
+        MTXCopy(hand, detail::s_bowHandSmoothMtx);
+        detail::s_bowHandSmoothValid = true;
+        detail::s_bowHandSmoothLeft = left;
+        return;
+    }
+    const f32 t = 1.0f - std::exp(-dt / kBowHandSmoothingSec);
+
+    Quaternion qPrev, qCur, qOut;
+    QUATMtx(&qPrev, detail::s_bowHandSmoothMtx);
+    QUATMtx(&qCur, hand);
+    if (qPrev.x * qCur.x + qPrev.y * qCur.y + qPrev.z * qCur.z + qPrev.w * qCur.w < 0.0f) {
+        qCur.x = -qCur.x;
+        qCur.y = -qCur.y;
+        qCur.z = -qCur.z;
+        qCur.w = -qCur.w;
+    }
+    QUATSlerp(&qPrev, &qCur, &qOut, t);
+    Mtx out;
+    MTXQuat(out, &qOut);
+    for (int r = 0; r < 3; ++r) {
+        out[r][3] = detail::s_bowHandSmoothMtx[r][3] + (hand[r][3] - detail::s_bowHandSmoothMtx[r][3]) * t;
+    }
+    MTXCopy(out, detail::s_bowHandSmoothMtx);
+    MTXCopy(out, hand);
+}
+
+inline void updatePhysicalBowState(const Vec3f& rightAimForward, const Vec3f& leftAimForward, float dt) {
+    if (detail::s_bowDrawnLatchSec > 0.0f) detail::s_bowDrawnLatchSec -= dt;
+
+    auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    detail_smoothBowHand(link, dt);
+    const bool active = isPhysicalBowMode(link) && detail::s_handMtxValid &&
+                        !isHandTrackingSuspended(link) && link->checkBowChargeWaitAnime() &&
+                        getNockableArrow(link) != nullptr;
+    const bool leftHandedBow = isLeftHandedBow(link);
+    MtxP bowHandMtx = leftHandedBow ? detail::s_leftHandMtx : detail::s_rightHandMtx;
+    MtxP drawHandMtx = leftHandedBow ? detail::s_rightHandMtx : detail::s_leftHandMtx;
+    const Vec3f& aimForward = leftHandedBow ? leftAimForward : rightAimForward;
+    cXyz dir(aimForward.x, aimForward.y, aimForward.z);
+
+    detail::s_bowArrowDirWorldValid = false;
+    if (isPhysicalBowMode(link) && detail::s_handMtxValid && !isHandTrackingSuspended(link)) {
+        cXyz bowDir;
+        if (detail_computeBowArrowDirWorld(link, leftHandedBow, bowDir)) {
+            detail::s_bowArrowDirWorld = bowDir;
+            detail::s_bowArrowDirWorldValid = true;
+            dir = bowDir;
+        }
+    }
+    if (!active || dir.abs() < 0.001f) {
+        detail::s_bowNocked = false;
+        detail::s_bowArrowMtxValid = false;
+        detail::s_bowPullUnits = 0.0f;
+    } else {
+        dir.normalize();
+        const cXyz grip(bowHandMtx[0][3], bowHandMtx[1][3], bowHandMtx[2][3]);
+        const cXyz hand(drawHandMtx[0][3], drawHandMtx[1][3], drawHandMtx[2][3]);
+
+        if (!detail::s_bowNocked && (hand - grip).abs() <= kBowNockRadiusUnits) {
+            detail::s_bowNocked = true;
+            detail::s_bowNockEvent = true;
+        }
+
+        if (detail::s_bowNocked) {
+            // How far the draw hand is behind the grip, measured along the aim.
+            f32 pull = (grip - hand).inprod(dir);
+            if (pull < 0.0f) pull = 0.0f;
+            if (pull > kBowMaxPullUnits) pull = kBowMaxPullUnits;
+            detail::s_bowPullUnits = pull;
+            if (pull >= kBowMinDrawPullUnits) detail::s_bowDrawnLatchSec = kBowDrawnLatchSec;
+
+            // Arrow origin is its tail; local +Z points along the shaft
+            // (daArrow_c::setNormalMatrix()).
+            const cXyz tail = grip - dir * pull;
+            const f32 horiz = std::sqrt(dir.x * dir.x + dir.z * dir.z);
+            mDoMtx_stack_c::transS(tail.x, tail.y, tail.z);
+            mDoMtx_stack_c::ZXYrotM(static_cast<s16>(-cM_atan2s(dir.y, horiz)), cM_atan2s(dir.x, dir.z), 0);
+            MTXCopy(mDoMtx_stack_c::get(), detail::s_bowArrowMtx);
+            detail::s_bowArrowMtxValid = true;
+            // Kept for the shot itself (getPhysicalBowArrowMtx()).
+            detail::s_lastNockedArrowId = fopAcM_GetID(getNockableArrow(link));
+            MTXCopy(detail::s_bowArrowMtx, detail::s_lastNockedArrowMtx);
+
+            // Lock the hand to the arrow: keep the controller's rotation, move
+            // it so its item point (where the arrow is held) lands on the tail.
+            // Everything after this (hand model, Full Body arm IK,
+            // getLeft/RightItemMatrix()) reads the moved hand.
+            const cXyz itemLocal = detail_arrowPointInDrawHand(link, leftHandedBow);
+            cXyz itemWorld;
+            mDoMtx_multVec(drawHandMtx, &itemLocal, &itemWorld);
+            const cXyz delta = tail - itemWorld;
+            drawHandMtx[0][3] += delta.x;
+            drawHandMtx[1][3] += delta.y;
+            drawHandMtx[2][3] += delta.z;
+        } else {
+            detail::s_bowArrowMtxValid = false;
+        }
+    }
+}
+
+inline bool isPhysicalBowNocked() {
+    return detail::s_bowNocked;
+}
+
+// Bow string follows the arrow once nocked: BARELORD's frame is picked so its string position matches
+// the arrow tail's (bends the limbs), then the string joint itself is pinned
+// to the tail. Run after refreshTrackedHeldItemMtxLive() placed the bow.
+inline void detail_poseBowString(daAlink_c* link) {
+    // Until nocked the game keeps the bow at rest (BASHOOT's last frame --
+    // BARELORD's frame 0 has the string pulled aside); once nocked it loads
+    // BARELORD (checkUpperItemActionBow()), possibly a tick later.
+    J3DModel* bow = link->getHeldItemModel();
+    J3DAnmTransform* bck = link->mItemBck.getBckAnm();
+    if (!bow || !bck || !detail::s_bowNocked ||
+        link->mAnmHeap9.getIdx() != dRes_ID_ALANM_BCK_BARELORD_e) {
+        detail::s_bowStringFrac = 0.0f;
+        return;
+    }
+    detail_findBowStringJoint(link, bow, bck);
+
+    f32 frac = 0.0f;
+    bool pinToTail = false;
+    cXyz tail;
+    const int joint = detail::s_bowStringJoint;
+    if (detail::s_bowArrowMtxValid && joint >= 0) {
+        tail.set(detail::s_bowArrowMtx[0][3], detail::s_bowArrowMtx[1][3], detail::s_bowArrowMtx[2][3]);
+        Mtx inv;
+        MTXInverse(bow->getBaseTRMtx(), inv);
+        cXyz tailLocal;
+        mDoMtx_multVec(inv, &tail, &tailLocal);
+        const cXyz seg = detail::s_bowStringDrawnLocal - detail::s_bowStringRestLocal;
+        const f32 len2 = seg.inprod(seg);
+        const f32 along = (tailLocal - detail::s_bowStringRestLocal).inprod(seg);
+        if (len2 > 0.0001f && along > 0.0f) {
+            frac = along / len2;
+            if (frac > 1.0f) frac = 1.0f;
+            pinToTail = true;  // tail is behind the resting string
+        }
+    }
+    detail::s_bowStringFrac = frac;
+
+    link->mItemBck.entry(bow->getModelData(), getPhysicalBowStringFrame(bck->getFrameMax()));
+    bow->calc();
+    if (pinToTail) {
+        MtxP m = bow->getAnmMtx(joint);
+        m[0][3] = tail.x;
+        m[1][3] = tail.y;
+        m[2][3] = tail.z;
+    }
+    if (bow->getModelData()->getWEvlpMtxNum() > 0) bow->calcWeightEnvelopeMtx();
+    markModelJointsLive(bow);
+}
+
+// Called once per real frame from tick(), after the item-joint refresh (the
+// un-nocked arrow reads getLeftItemMatrix()).
+inline void refreshPhysicalBowArrowLive() {
+    detail::s_bowHeldArrowMtxValid = false;
+    auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    const bool tracking = link && detail::s_handMtxValid && !isHandTrackingSuspended(link);
+    const bool physical = tracking && isPhysicalBowMode(link);
+    const bool leftHandedBow = tracking && isLeftHandedBow(link);
+    const bool charging = physical && link->checkBowChargeWaitAnime();
+    if (physical && (charging || link->checkBowReloadAnime())) {
+        detail_poseBowString(link);
+    } else {
+        detail::s_bowStringFrac = 0.0f;
+    }
+    // Without Left-Handed Bow the game already keeps the arrow in the left
+    // hand; only the charge wait needs frame-rate placement for nocking.
+    // Still held but no longer nocked (not shot): forget it.
+    if (daArrow_c* held = link ? getNockableArrow(link) : nullptr) {
+        if (!detail::s_bowArrowMtxValid && fopAcM_GetID(held) == detail::s_lastNockedArrowId) {
+            detail::s_lastNockedArrowId = fpcM_ERROR_PROCESS_ID_e;
+        }
+    }
+    if (!charging && !leftHandedBow) return;
+    daArrow_c* arrow = getNockableArrow(link);
+    if (!arrow || !arrow->mpModel) return;
+    if (detail::s_bowArrowMtxValid) {
+        arrow->mpModel->setBaseTRMtx(detail::s_bowArrowMtx);
+    } else if (leftHandedBow) {
+        if (!detail_computeRightHandArrowMtx(link, detail::s_bowHeldArrowMtx)) return;
+        detail::s_bowHeldArrowMtxValid = true;
+        arrow->mpModel->setBaseTRMtx(detail::s_bowHeldArrowMtx);
+    } else {
+        // Not nocked yet: arrow in the draw hand, at frame rate (setKeepMatrix()'s
+        // own placement, which otherwise only updates per sim tick).
+        mDoMtx_stack_c::YrotS(-0x8000);
+        mDoMtx_stack_c::revConcat(link->getLeftItemMatrix());
+        arrow->mpModel->setBaseTRMtx(mDoMtx_stack_c::get());
+    }
+    arrow->mpModel->calc();
+    markModelJointsLive(arrow->mpModel);
 }
 
 // See dusk::vr::getTrackedHandWorldPos() (vr_main.hpp) for the
