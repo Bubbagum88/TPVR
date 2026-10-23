@@ -1531,11 +1531,24 @@ inline cXyz getVrCameraEyeAnchor(const cXyz& fallbackEye,
 // updateFrame() took near the top of the frame. One implementation, two
 // call sites, same "don't let a duplicated formula silently drift out of
 // sync" reasoning as vr_smooth_turn.hpp's own header comment.
+namespace detail {
+// Play space (the tracking space) in the game world, as the hand matrices
+// were last built with: hand = origin + Ry(yaw) * controller * scale.
+// Moves with Link and turns with smooth/snap turn.
+inline cXyz s_playSpaceOrigin;
+inline float s_playSpaceYawRad = 0.f;
+}  // namespace detail
+
 inline void computeTrackedHandMatrices(const XrVector3f& hmdPos,
                                         const XrPosef& rightControllerPose,
                                         const XrPosef& leftControllerPose,
                                         const cXyz& eyeAnchor,
                                         float yawRad) {
+    const XrVector3f hmdTurned = dusk::vr::rotateYawXr(hmdPos, yawRad);
+    detail::s_playSpaceOrigin.set(eyeAnchor.x - hmdTurned.x * VR_SCALE_FACTOR,
+                                  eyeAnchor.y - hmdTurned.y * VR_SCALE_FACTOR,
+                                  eyeAnchor.z - hmdTurned.z * VR_SCALE_FACTOR);
+    detail::s_playSpaceYawRad = yawRad;
     buildHandMtx(detail::s_rightHandMtx, hmdPos, rightControllerPose, eyeAnchor, VR_SCALE_FACTOR, false, yawRad);
     buildHandMtx(detail::s_leftHandMtx, hmdPos, leftControllerPose, eyeAnchor, VR_SCALE_FACTOR, true, yawRad);
     // Same yaw-adjusted orientation buildHandMtx() uses; tracking-space
@@ -3385,10 +3398,19 @@ namespace detail {
 inline bool s_heldItemTrackedThisFrame = false;
 }  // namespace detail
 
+// "Physical Slingshot" (game.vrPhysicalSlingshot): slingshot in the left
+// tracked hand, loaded and pulled with the right (see updatePhysicalSlingshotState()).
+inline bool isPhysicalSlingshotMode(daAlink_c* link) {
+    return link && dusk::getSettings().game.vrPhysicalSlingshot.getValue() && isFirstPerson(link) &&
+           link->getEquipItem() == dItemNo_PACHINKO_e && !link->checkBowGrabLeftHand();
+}
+
 // "Left-Handed Bow" (game.vrLeftHandedBow): bow in the left tracked hand,
 // arrow in the right. Only when the game itself has the bow in Link's right
 // hand (checkBowGrabLeftHand() already puts it in the left on horseback).
+// Also true for the Physical Slingshot, which is always held left-handed.
 inline bool isLeftHandedBow(daAlink_c* link) {
+    if (isPhysicalSlingshotMode(link)) return true;
     return link && dusk::getSettings().game.vrLeftHandedBow.getValue() && isFirstPerson(link) &&
            daPy_py_c::checkBowItem(link->getEquipItem()) && !link->checkBowGrabLeftHand();
 }
@@ -3680,12 +3702,16 @@ inline bool consumeBowNockEvent() {
 // fully drawn. Used by the game side (checkUpperItemActionBow()) per tick and
 // re-applied every frame below.
 namespace detail {
-// The bow model's string joint (the one BARELORD moves furthest), found once
-// per bow model, and its rest/full-draw positions in the bow's local space.
-inline J3DModelData* s_bowStringData = nullptr;
-inline int s_bowStringJoint = -1;
-inline cXyz s_bowStringRestLocal;
-inline cXyz s_bowStringDrawnLocal;
+// The joint a draw animation moves furthest (the bow's string, the
+// slingshot's pouch), found once per item model, and its first/last-frame
+// positions in the item's local space.
+struct DrawAnimJoint {
+    J3DModelData* data = nullptr;
+    int joint = -1;
+    cXyz restLocal;
+    cXyz drawnLocal;
+};
+inline DrawAnimJoint s_bowString;   // BARELORD
 inline f32 s_bowStringFrac = 0.0f;  // 0 = rest, 1 = BARELORD's last frame
 }  // namespace detail
 
@@ -3703,38 +3729,39 @@ inline cXyz detail_jointLocal(J3DModel* model, int joint) {
     return local;
 }
 
-inline void detail_findBowStringJoint(daAlink_c* link, J3DModel* bow, J3DAnmTransform* bck) {
-    J3DModelData* data = bow->getModelData();
-    if (detail::s_bowStringData == data) return;
-    detail::s_bowStringData = data;
-    detail::s_bowStringJoint = -1;
+// Finds `out` for `model` with draw animation `bck` (already in mItemBck).
+inline void detail_findDrawAnimJoint(daAlink_c* link, J3DModel* model, J3DAnmTransform* bck,
+                                     detail::DrawAnimJoint& out, const char* tag) {
+    J3DModelData* data = model->getModelData();
+    if (out.data == data) return;
+    out.data = data;
+    out.joint = -1;
     const u16 num = data->getJointNum();
     if (num == 0 || num > 64) return;
 
     cXyz rest[64];
     link->mItemBck.entry(data, 0.0f);
-    bow->calc();
-    for (u16 j = 0; j < num; ++j) rest[j] = detail_jointLocal(bow, j);
+    model->calc();
+    for (u16 j = 0; j < num; ++j) rest[j] = detail_jointLocal(model, j);
     link->mItemBck.entry(data, bck->getFrameMax() - 0.001f);
-    bow->calc();
+    model->calc();
 
     f32 best = 0.0f;
     for (u16 j = 0; j < num; ++j) {
-        const cXyz drawn = detail_jointLocal(bow, j);
+        const cXyz drawn = detail_jointLocal(model, j);
         const f32 d = (drawn - rest[j]).abs();
         if (d > best) {
             best = d;
-            detail::s_bowStringJoint = j;
-            detail::s_bowStringRestLocal = rest[j];
-            detail::s_bowStringDrawnLocal = drawn;
+            out.joint = j;
+            out.restLocal = rest[j];
+            out.drawnLocal = drawn;
         }
     }
-    if (detail::s_bowStringJoint >= 0) {
+    if (out.joint >= 0) {
         char buf[160];
         JUTNameTab* names = data->getJointName();
-        std::snprintf(buf, sizeof(buf), "[dusk::vr::bowstring] joint %d (%s) travels %.1f units over BARELORD",
-                      detail::s_bowStringJoint,
-                      names ? names->getName(static_cast<u16>(detail::s_bowStringJoint)) : "?", best);
+        std::snprintf(buf, sizeof(buf), "[dusk::vr::%s] joint %d (%s) travels %.1f units", tag, out.joint,
+                      names ? names->getName(static_cast<u16>(out.joint)) : "?", best);
         dusk::vr::duskVrLog(buf);
     }
 }
@@ -3888,20 +3915,38 @@ inline bool s_bowHandSmoothLeft = false;
 constexpr float kBowHandSmoothingSec = 0.05f;
 
 // Eases the hand holding the bow toward its tracked pose instead of following
-// it exactly, while a bow is held in first person. Writes the smoothed pose
-// back into that hand's tracked matrix, so everything after (hand model, bow,
-// arrow line, bow aim, Full Body arm) uses it.
+// it exactly, while a bow (or the Physical Slingshot) is held in first person.
+// Writes the smoothed pose back into that hand's tracked matrix, so everything
+// after (hand model, bow, arrow line, bow aim, Full Body arm) uses it.
+// Play space -> world (rotation and translation only; the scale is the same
+// on every axis, so easing in unscaled play space is equivalent).
+inline void detail_playSpaceMtx(Mtx out) {
+    const XrVector3f ax = dusk::vr::rotateYawXr(XrVector3f{1.f, 0.f, 0.f}, detail::s_playSpaceYawRad);
+    const XrVector3f ay = dusk::vr::rotateYawXr(XrVector3f{0.f, 1.f, 0.f}, detail::s_playSpaceYawRad);
+    const XrVector3f az = dusk::vr::rotateYawXr(XrVector3f{0.f, 0.f, 1.f}, detail::s_playSpaceYawRad);
+    out[0][0] = ax.x; out[0][1] = ay.x; out[0][2] = az.x; out[0][3] = detail::s_playSpaceOrigin.x;
+    out[1][0] = ax.y; out[1][1] = ay.y; out[1][2] = az.y; out[1][3] = detail::s_playSpaceOrigin.y;
+    out[2][0] = ax.z; out[2][1] = ay.z; out[2][2] = az.z; out[2][3] = detail::s_playSpaceOrigin.z;
+}
+
 inline void detail_smoothBowHand(daAlink_c* link, float dt) {
     const bool active = link && detail::s_handMtxValid && isFirstPerson(link) &&
-                        !isHandTrackingSuspended(link) && daPy_py_c::checkBowItem(link->getEquipItem());
+                        !isHandTrackingSuspended(link) &&
+                        (daPy_py_c::checkBowItem(link->getEquipItem()) || isPhysicalSlingshotMode(link));
     if (!active) {
         detail::s_bowHandSmoothValid = false;
         return;
     }
     const bool left = isLeftHandedBow(link) || link->checkBowGrabLeftHand();
     MtxP hand = left ? detail::s_leftHandMtx : detail::s_rightHandMtx;
+    // Smoothed in play space, not the world: walking or turning moves the
+    // whole play space, and easing that made the hand trail behind Link.
+    Mtx fromPlay, toPlay, local;
+    detail_playSpaceMtx(fromPlay);
+    MTXInverse(fromPlay, toPlay);
+    MTXConcat(toPlay, hand, local);
     if (!detail::s_bowHandSmoothValid || detail::s_bowHandSmoothLeft != left) {
-        MTXCopy(hand, detail::s_bowHandSmoothMtx);
+        MTXCopy(local, detail::s_bowHandSmoothMtx);
         detail::s_bowHandSmoothValid = true;
         detail::s_bowHandSmoothLeft = left;
         return;
@@ -3910,7 +3955,7 @@ inline void detail_smoothBowHand(daAlink_c* link, float dt) {
 
     Quaternion qPrev, qCur, qOut;
     QUATMtx(&qPrev, detail::s_bowHandSmoothMtx);
-    QUATMtx(&qCur, hand);
+    QUATMtx(&qCur, local);
     if (qPrev.x * qCur.x + qPrev.y * qCur.y + qPrev.z * qCur.z + qPrev.w * qCur.w < 0.0f) {
         qCur.x = -qCur.x;
         qCur.y = -qCur.y;
@@ -3921,10 +3966,40 @@ inline void detail_smoothBowHand(daAlink_c* link, float dt) {
     Mtx out;
     MTXQuat(out, &qOut);
     for (int r = 0; r < 3; ++r) {
-        out[r][3] = detail::s_bowHandSmoothMtx[r][3] + (hand[r][3] - detail::s_bowHandSmoothMtx[r][3]) * t;
+        out[r][3] = detail::s_bowHandSmoothMtx[r][3] + (local[r][3] - detail::s_bowHandSmoothMtx[r][3]) * t;
     }
     MTXCopy(out, detail::s_bowHandSmoothMtx);
-    MTXCopy(out, hand);
+    MTXConcat(fromPlay, out, hand);
+}
+
+// Two-point aim: once loaded, the shot points from the draw hand's item point
+// to the grip (faded in as the hand pulls away, the direction is noise up
+// close). The grip hand is turned onto that line by the shortest rotation
+// about `grip` (which stays put), so it still sets the bow's/slingshot's cant,
+// and everything after (item model, hand model, aim dot) follows it. Updates
+// `dir`; false if it didn't change.
+inline bool detail_applyTwoPointAim(cXyz& dir, const cXyz& grip, const cXyz& itemWorld, MtxP gripHandMtx) {
+    const cXyz toGrip = grip - itemWorld;
+    const f32 span = toGrip.abs();
+    f32 w = (span - kBowTwoPointAimStartUnits) / (kBowTwoPointAimFullUnits - kBowTwoPointAimStartUnits);
+    if (w > 1.0f) w = 1.0f;
+    if (w <= 0.0f) return false;
+    cXyz aimDir = dir * (1.0f - w) + toGrip * (w / span);
+    if (aimDir.abs() <= 0.001f) return false;
+    aimDir.normalize();
+    Mtx rot;
+    detail::ikRotFromTo(dir, aimDir, rot);
+    Mtx turned;
+    MTXConcat(rot, gripHandMtx, turned);
+    const cXyz offset(gripHandMtx[0][3] - grip.x, gripHandMtx[1][3] - grip.y, gripHandMtx[2][3] - grip.z);
+    cXyz turnedOffset;
+    mDoMtx_multVecSR(rot, &offset, &turnedOffset);
+    turned[0][3] = grip.x + turnedOffset.x;
+    turned[1][3] = grip.y + turnedOffset.y;
+    turned[2][3] = grip.z + turnedOffset.z;
+    MTXCopy(turned, gripHandMtx);
+    dir = aimDir;
+    return true;
 }
 
 inline void updatePhysicalBowState(const Vec3f& rightAimForward, const Vec3f& leftAimForward, float dt) {
@@ -3970,29 +4045,9 @@ inline void updatePhysicalBowState(const Vec3f& rightAimForward, const Vec3f& le
             cXyz itemWorld;
             mDoMtx_multVec(drawHandMtx, &itemLocal, &itemWorld);
 
-            // Two-point aim: once nocked, the arrow points from the draw hand
-            // to the bow grip (faded in as the hand pulls away, the direction
-            // is noise up close). The bow hand is turned onto that line by the
-            // shortest rotation, so it still sets the bow's cant, and
-            // everything after (bow, hand model, aim dot) follows it.
-            const cXyz toGrip = grip - itemWorld;
-            const f32 span = toGrip.abs();
-            f32 w = (span - kBowTwoPointAimStartUnits) / (kBowTwoPointAimFullUnits - kBowTwoPointAimStartUnits);
-            if (w > 1.0f) w = 1.0f;
-            if (w > 0.0f) {
-                cXyz aimDir = dir * (1.0f - w) + toGrip * (w / span);
-                if (aimDir.abs() > 0.001f) {
-                    aimDir.normalize();
-                    Mtx rot;
-                    detail::ikRotFromTo(dir, aimDir, rot);
-                    Mtx turned;
-                    MTXConcat(rot, bowHandMtx, turned);
-                    for (int r = 0; r < 3; ++r) turned[r][3] = bowHandMtx[r][3];
-                    MTXCopy(turned, bowHandMtx);
-                    dir = aimDir;
-                    detail::s_bowArrowDirWorld = dir;
-                    detail::s_bowArrowDirWorldValid = true;
-                }
+            if (detail_applyTwoPointAim(dir, grip, itemWorld, bowHandMtx)) {
+                detail::s_bowArrowDirWorld = dir;
+                detail::s_bowArrowDirWorldValid = true;
             }
 
             // How far the draw hand is behind the grip, measured along the aim.
@@ -4046,21 +4101,21 @@ inline void detail_poseBowString(daAlink_c* link) {
         detail::s_bowStringFrac = 0.0f;
         return;
     }
-    detail_findBowStringJoint(link, bow, bck);
+    detail_findDrawAnimJoint(link, bow, bck, detail::s_bowString, "bowstring");
 
     f32 frac = 0.0f;
     bool pinToTail = false;
     cXyz tail;
-    const int joint = detail::s_bowStringJoint;
+    const int joint = detail::s_bowString.joint;
     if (detail::s_bowArrowMtxValid && joint >= 0) {
         tail.set(detail::s_bowArrowMtx[0][3], detail::s_bowArrowMtx[1][3], detail::s_bowArrowMtx[2][3]);
         Mtx inv;
         MTXInverse(bow->getBaseTRMtx(), inv);
         cXyz tailLocal;
         mDoMtx_multVec(inv, &tail, &tailLocal);
-        const cXyz seg = detail::s_bowStringDrawnLocal - detail::s_bowStringRestLocal;
+        const cXyz seg = detail::s_bowString.drawnLocal - detail::s_bowString.restLocal;
         const f32 len2 = seg.inprod(seg);
-        const f32 along = (tailLocal - detail::s_bowStringRestLocal).inprod(seg);
+        const f32 along = (tailLocal - detail::s_bowString.restLocal).inprod(seg);
         if (len2 > 0.0001f && along > 0.0f) {
             frac = along / len2;
             if (frac > 1.0f) frac = 1.0f;
@@ -4121,6 +4176,191 @@ inline void refreshPhysicalBowArrowLive() {
     }
     arrow->mpModel->calc();
     markModelJointsLive(arrow->mpModel);
+}
+
+// ---------------------------------------------------------------------------
+// Physical slingshot (game.vrPhysicalSlingshot)
+// ---------------------------------------------------------------------------
+//
+// The physical bow's flow without an arrow actor (the seed is never shown).
+// The slingshot sits in the LEFT tracked hand (isLeftHandedBow() covers it).
+// With the item button held (reload or charge wait), bringing the right hand
+// to the slingshot loads the seed; from then on it aims along the two-point
+// line (pouch -> band's rest point between the posts), the pouch follows the right hand back, and
+// checkUpperItemActionBow() only shoots on release while drawn
+// (isPhysicalSlingshotDrawn()); otherwise the seed is put away. The stone
+// leaves from the pouch (getPhysicalSlingshotShotPos()).
+namespace detail {
+inline bool s_slingNocked = false;
+inline float s_slingDrawnLatchSec = 0.0f;
+inline float s_slingPullUnits = 0.0f;
+inline bool s_slingPouchValid = false;
+inline cXyz s_slingPouchPos;
+// Where the pouch was when the button was let go. The stone is made on the
+// tick after the release, when nothing is loaded any more.
+inline float s_slingShotPosSec = 0.0f;
+inline cXyz s_slingShotPos;
+inline DrawAnimJoint s_slingPouch;  // PRELORD
+// The pouch at rest between the posts: the joint PSHOOT moves furthest, at
+// its last frame. Kept in the left (slingshot) hand's frame, refreshed each
+// frame the slingshot is placed, since the hand lock needs it before that.
+inline DrawAnimJoint s_slingRest;  // PSHOOT
+inline bool s_slingAnchorValid = false;
+inline cXyz s_slingAnchorInHand;
+}  // namespace detail
+
+constexpr float kSlingNockRadiusUnits = 20.0f;   // pinch point this close to the band loads the seed
+constexpr float kSlingMaxPullUnits = 50.0f;
+constexpr float kSlingMinDrawPullUnits = 15.0f;  // pulled at least this far counts as drawn
+constexpr float kSlingShotPosHoldSec = 0.25f;    // covers the tick that makes the stone
+
+inline bool isPhysicalSlingshotNocked() {
+    return detail::s_slingNocked;
+}
+
+inline bool isPhysicalSlingshotDrawn() {
+    return detail::s_slingDrawnLatchSec > 0.0f;
+}
+
+// Where the stone should leave from: the pouch while loaded, or where it was
+// let go just now. False -> the game's own position.
+inline bool getPhysicalSlingshotShotPos(cXyz& out) {
+    if (detail::s_slingNocked && detail::s_slingPouchValid) {
+        out = detail::s_slingPouchPos;
+        return true;
+    }
+    if (detail::s_slingShotPosSec > 0.0f) {
+        out = detail::s_slingShotPos;
+        return true;
+    }
+    return false;
+}
+
+// Frame of the slingshot's draw animation (PRELORD) matching the current pull.
+inline f32 getPhysicalSlingshotBandFrame(f32 frameMax) {
+    f32 frac = detail::s_slingPullUnits / kSlingMaxPullUnits;
+    if (frac > 1.0f) frac = 1.0f;
+    return (frameMax - 0.001f) * frac;
+}
+
+// Called once per real frame from tick(), right after updatePhysicalBowState()
+// (which resets the shared aim line) and before anything poses the hands/arms
+// or calcs the slingshot. Loads/pulls from the real controllers, then (while
+// loaded) moves the right hand so its pinch point sits on the pouch.
+inline void updatePhysicalSlingshotState(const Vec3f& leftAimForward, float dt) {
+    if (detail::s_slingDrawnLatchSec > 0.0f) detail::s_slingDrawnLatchSec -= dt;
+    if (detail::s_slingShotPosSec > 0.0f) detail::s_slingShotPosSec -= dt;
+
+    auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    cXyz dir(leftAimForward.x, leftAimForward.y, leftAimForward.z);
+    const bool held = isPhysicalSlingshotMode(link) && detail::s_handMtxValid &&
+                      !isHandTrackingSuspended(link) &&
+                      (link->checkBowReloadAnime() || link->checkBowChargeWaitAnime()) && link->itemButton() &&
+                      dir.abs() > 0.001f;
+    if (!held) {
+        if (detail::s_slingNocked && detail::s_slingPouchValid) {
+            detail::s_slingShotPos = detail::s_slingPouchPos;
+            detail::s_slingShotPosSec = kSlingShotPosHoldSec;
+        }
+        detail::s_slingNocked = false;
+        detail::s_slingPouchValid = false;
+        detail::s_slingPullUnits = 0.0f;
+        return;
+    }
+    dir.normalize();
+    MtxP gripHandMtx = detail::s_leftHandMtx;
+    MtxP drawHandMtx = detail::s_rightHandMtx;
+    // The band's rest point between the posts (the hand itself until the
+    // slingshot has been seen at rest once).
+    cXyz grip(gripHandMtx[0][3], gripHandMtx[1][3], gripHandMtx[2][3]);
+    if (detail::s_slingAnchorValid) mDoMtx_multVec(gripHandMtx, &detail::s_slingAnchorInHand, &grip);
+
+    // Where the right hand pinches the pouch (the game's own pull pose).
+    const cXyz itemLocal = detail_arrowPointInDrawHand(link, true);
+    cXyz itemWorld;
+    mDoMtx_multVec(drawHandMtx, &itemLocal, &itemWorld);
+
+    if (!detail::s_slingNocked && (itemWorld - grip).abs() <= kSlingNockRadiusUnits) {
+        detail::s_slingNocked = true;
+        detail::s_bowNockEvent = true;  // same haptic pulse as nocking an arrow
+    }
+    if (!detail::s_slingNocked) return;
+
+    // Aim: the slingshot hand's pointing, turned onto the two-point line.
+    // Shared with the bow's aim line (setBodyAngleToCamera() reads it).
+    detail_applyTwoPointAim(dir, grip, itemWorld, gripHandMtx);
+    detail::s_bowArrowDirWorld = dir;
+    detail::s_bowArrowDirWorldValid = true;
+
+    f32 pull = (grip - itemWorld).inprod(dir);
+    if (pull < 0.0f) pull = 0.0f;
+    if (pull > kSlingMaxPullUnits) pull = kSlingMaxPullUnits;
+    detail::s_slingPullUnits = pull;
+    if (pull >= kSlingMinDrawPullUnits) detail::s_slingDrawnLatchSec = kBowDrawnLatchSec;
+
+    const cXyz pouch = grip - dir * pull;
+    detail::s_slingPouchPos = pouch;
+    detail::s_slingPouchValid = true;
+
+    // Lock the hand to the pouch (only moves it past full pull or while the
+    // two-point aim is still fading in).
+    const cXyz delta = pouch - itemWorld;
+    drawHandMtx[0][3] += delta.x;
+    drawHandMtx[1][3] += delta.y;
+    drawHandMtx[2][3] += delta.z;
+}
+
+// Records the band's rest point in the slingshot hand's frame, from the
+// slingshot as placed this frame.
+inline void detail_updateSlingAnchor(daAlink_c* link, J3DModel* sling, J3DAnmTransform* bck) {
+    if (link->mAnmHeap9.getIdx() == dRes_ID_ALANM_BCK_PSHOOT_e) {
+        if (detail::s_slingRest.data != sling->getModelData()) {
+            detail_findDrawAnimJoint(link, sling, bck, detail::s_slingRest, "slingrest");
+            // The search leaves the model at PSHOOT's last frame; put this
+            // tick's frame back.
+            link->mItemBck.entry(sling->getModelData(), link->field_0x33dc);
+            sling->calc();
+        }
+    }
+    if (detail::s_slingRest.data != sling->getModelData() || detail::s_slingRest.joint < 0) return;
+    cXyz world;
+    mDoMtx_multVec(sling->getBaseTRMtx(), &detail::s_slingRest.drawnLocal, &world);
+    Mtx inv;
+    MTXInverse(detail::s_leftHandMtx, inv);
+    mDoMtx_multVec(inv, &world, &detail::s_slingAnchorInHand);
+    detail::s_slingAnchorValid = true;
+}
+
+// Pouch follows the right hand once loaded: PRELORD's frame follows the pull
+// (stretches the bands), then the pouch joint itself is pinned to the pouch
+// point. Called once per real frame from tick(), after
+// refreshTrackedHeldItemMtxLive() placed the slingshot.
+inline void refreshPhysicalSlingshotLive() {
+    auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (!link || !detail::s_heldItemTrackedThisFrame || !isPhysicalSlingshotMode(link)) return;
+    J3DModel* sling = link->getHeldItemModel();
+    J3DAnmTransform* bck = link->mItemBck.getBckAnm();
+    if (!sling || !bck) return;
+    detail_updateSlingAnchor(link, sling, bck);
+
+    // Until loaded the game keeps the slingshot at rest (PSHOOT's last
+    // frame); once loaded it switches to PRELORD, possibly a tick later.
+    if (!detail::s_slingNocked || !detail::s_slingPouchValid ||
+        link->mAnmHeap9.getIdx() != dRes_ID_ALANM_BCK_PRELORD_e) {
+        return;
+    }
+    detail_findDrawAnimJoint(link, sling, bck, detail::s_slingPouch, "slingpouch");
+
+    link->mItemBck.entry(sling->getModelData(), getPhysicalSlingshotBandFrame(bck->getFrameMax()));
+    sling->calc();
+    if (detail::s_slingPouch.joint >= 0) {
+        MtxP m = sling->getAnmMtx(detail::s_slingPouch.joint);
+        m[0][3] = detail::s_slingPouchPos.x;
+        m[1][3] = detail::s_slingPouchPos.y;
+        m[2][3] = detail::s_slingPouchPos.z;
+    }
+    if (sling->getModelData()->getWEvlpMtxNum() > 0) sling->calcWeightEnvelopeMtx();
+    markModelJointsLive(sling);
 }
 
 // See dusk::vr::getTrackedHandWorldPos() (vr_main.hpp) for the

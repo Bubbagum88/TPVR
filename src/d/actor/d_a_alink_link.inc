@@ -159,13 +159,17 @@ BOOL daAlink_c::setBodyAngleToCamera() {
                 } else if (mEquipItem == dItemNo_W_HOOKSHOT_e) {
                     leftHand = getHookshotLeft();
                 } else if (dusk::vr::isLeftHandedBow(this)) {
-                    leftHand = true;  // "Left-Handed Bow": the bow is in the left hand
+                    // "Left-Handed Bow" / Physical Slingshot: the bow or
+                    // slingshot is in the left hand
+                    leftHand = true;
                 }
-                // Physical Bow: aim along the bow's own arrow line, so the
-                // aim dot matches where the nocked arrow points.
-                if (!checkBowItem(mEquipItem) || !dusk::vr::isPhysicalBowMode(this) ||
-                    !dusk::vr::getPhysicalBowAimAngles(&aimYawS, &aimPitchS))
-                {
+                // Physical Bow / Slingshot: aim along the loaded shot's line
+                // (the bow's arrow, the slingshot's pouch -> grip), so the aim
+                // dot matches it.
+                const bool vrPhysicalAim =
+                    (checkBowItem(mEquipItem) && dusk::vr::isPhysicalBowMode(this)) ||
+                    (mEquipItem == dItemNo_PACHINKO_e && dusk::vr::isPhysicalSlingshotMode(this));
+                if (!vrPhysicalAim || !dusk::vr::getPhysicalBowAimAngles(&aimYawS, &aimPitchS)) {
                     dusk::vr::getControllerAimAnglesForHand(leftHand, &aimYawS, &aimPitchS);
                 }
             }

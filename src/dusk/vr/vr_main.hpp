@@ -416,6 +416,17 @@ bool getPhysicalBowAimAngles(s16* outYawS, s16* outPitchS);
 void logModelMaterialNamesOnce(J3DModel* model, const char* tag);
 // Frame of the bow's draw animation (BARELORD) matching the current pull.
 float getPhysicalBowStringFrame(float frameMax);
+// Physical slingshot (game.vrPhysicalSlingshot): slingshot in the left hand,
+// loaded by bringing the right hand to it with the button held, aimed along
+// the two-point line (shares getPhysicalBowAimAngles()). Drawn = pulled back
+// far enough to shoot (latched like the bow's).
+bool isPhysicalSlingshotMode(daAlink_c* link);
+bool isPhysicalSlingshotNocked();
+bool isPhysicalSlingshotDrawn();
+// Where the stone should leave from (the pouch, or where it was let go).
+bool getPhysicalSlingshotShotPos(float& outX, float& outY, float& outZ);
+// Frame of the slingshot's draw animation (PRELORD) matching the current pull.
+float getPhysicalSlingshotBandFrame(float frameMax);
 
 // Real right-controller-pointing aim yaw/pitch (same s16 BAMS unit as
 // daAlink_c::shape_angle.y / mBodyAngle.x), for first-person item aiming

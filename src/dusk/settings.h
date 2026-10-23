@@ -469,6 +469,11 @@ struct UserSettings {
         ConfigVar<bool> vrLeftHandedBow;
         ConfigVar<int> vrBowSwapMirrorAxis;
         ConfigVar<int> vrBowSwapExtraFlipAxis;
+        // Physical slingshot: slingshot in the left hand; hold the item
+        // button and bring the right hand to it to load a seed, pull back,
+        // release to shoot. Aims along the pouch -> grip line. Uses the
+        // Left-Handed Bow mirror axes for its grip.
+        ConfigVar<bool> vrPhysicalSlingshot;
         // Hides the world-space aim dot (drawAimCrosshair()) for every aimed
         // item (bow, slingshot, hookshot, boomerang).
         ConfigVar<bool> vrHideAimCrosshair;

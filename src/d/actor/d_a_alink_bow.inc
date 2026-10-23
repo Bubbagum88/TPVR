@@ -257,6 +257,11 @@ BOOL daAlink_c::checkUpperItemActionBow() {
     if (mEquipItem == dItemNo_PACHINKO_e) {
         static const Vec slingLocalPos = {10.0f, 10.0f, 0.0f};
         mDoMtx_multVec(getLeftItemMatrix(), &slingLocalPos, &mHeldItemRootPos);
+#if TARGET_PC
+        // VR physical slingshot: the stone (and the aim line) leave from the
+        // pouch in the right hand, or where it was just let go.
+        dusk::vr::getPhysicalSlingshotShotPos(mHeldItemRootPos.x, mHeldItemRootPos.y, mHeldItemRootPos.z);
+#endif
     }
 
     if (checkBowChargeWaitAnime()) {
@@ -266,9 +271,15 @@ BOOL daAlink_c::checkUpperItemActionBow() {
         // pulled back, and only charge while it's held drawn.
         const bool vrPhysicalBow = dusk::vr::isPhysicalBowMode(this);
         const bool vrBowDrawn = vrPhysicalBow && dusk::vr::isPhysicalBowDrawn();
+        // Same for the VR physical slingshot (its seed is loaded and pulled
+        // by hand; the slingshot has no charge).
+        const bool vrPhysicalSling = dusk::vr::isPhysicalSlingshotMode(this);
+        const bool vrSlingDrawn = vrPhysicalSling && dusk::vr::isPhysicalSlingshotDrawn();
 #else
         const bool vrPhysicalBow = false;
         const bool vrBowDrawn = false;
+        const bool vrPhysicalSling = false;
+        const bool vrSlingDrawn = false;
 #endif
 
         if (mEquipItem != dItemNo_PACHINKO_e && (!vrPhysicalBow || vrBowDrawn)) {
@@ -308,9 +319,9 @@ BOOL daAlink_c::checkUpperItemActionBow() {
 
                 changeItemBck(bck_res_id, mpHIO->mItem.mBow.m.mShootAnm.mStartFrame);
                 mItemVar0.field_0x3018 = 0;
-            } else if (vrPhysicalBow && !vrBowDrawn && !itemButton()) {
-                // Released without drawing: put the arrow away. Pressing
-                // the button again loads a new one.
+            } else if (((vrPhysicalBow && !vrBowDrawn) || (vrPhysicalSling && !vrSlingDrawn)) && !itemButton()) {
+                // Released without drawing: put the arrow (or seed) away.
+                // Pressing the button again loads a new one.
                 deleteArrow();
                 resetFacePriAnime();
                 setBowReadyAnime();
@@ -457,6 +468,18 @@ BOOL daAlink_c::checkUpperItemActionBow() {
             }
         } else {
             changeItemBck(dRes_ID_ALANM_BCK_BASHOOT_e, -1.0f);
+        }
+    }
+    // Same for the VR physical slingshot: at rest (PSHOOT's last frame) until
+    // the seed is loaded, then PRELORD at the pull.
+    if (dusk::vr::isPhysicalSlingshotMode(this) && (checkBowReloadAnime() || checkBowChargeWaitAnime())) {
+        if (dusk::vr::isPhysicalSlingshotNocked()) {
+            changeItemBck(dRes_ID_ALANM_BCK_PRELORD_e, 0.0f);
+            if (mItemBck.getBckAnm() != NULL) {
+                field_0x33dc = dusk::vr::getPhysicalSlingshotBandFrame(mItemBck.getBckAnm()->getFrameMax());
+            }
+        } else {
+            changeItemBck(dRes_ID_ALANM_BCK_PSHOOT_e, -1.0f);
         }
     }
 #endif

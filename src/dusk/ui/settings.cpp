@@ -1216,6 +1216,14 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                             "aims with the left controller. Off puts them the way the game "
                             "does: bow in the right hand, arrow in the left."
             });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrPhysicalSlingshot,
+            {
+                .key = "Physical Slingshot",
+                .helpText = "Holds the slingshot in your left hand. Hold the slingshot button "
+                            "and bring your right hand to the slingshot to load a seed, pull it "
+                            "back, then release the button to shoot. Both hands aim it. "
+                            "Releasing without pulling back puts the seed away."
+            });
         config_bool_select(leftPane, rightPane, getSettings().game.vrHideAimCrosshair,
             {
                 .key = "Hide Aim Crosshair",

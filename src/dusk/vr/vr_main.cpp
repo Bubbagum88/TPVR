@@ -799,6 +799,31 @@ float getPhysicalBowStringFrame(float frameMax) {
     return vr_link::getPhysicalBowStringFrame(frameMax);
 }
 
+bool isPhysicalSlingshotMode(daAlink_c* link) {
+    return isImmersiveVr() && vr_link::isPhysicalSlingshotMode(link);
+}
+
+bool isPhysicalSlingshotNocked() {
+    return isImmersiveVr() && vr_link::isPhysicalSlingshotNocked();
+}
+
+bool isPhysicalSlingshotDrawn() {
+    return vr_link::isPhysicalSlingshotDrawn();
+}
+
+bool getPhysicalSlingshotShotPos(float& outX, float& outY, float& outZ) {
+    cXyz pos;
+    if (!isImmersiveVr() || !vr_link::getPhysicalSlingshotShotPos(pos)) return false;
+    outX = pos.x;
+    outY = pos.y;
+    outZ = pos.z;
+    return true;
+}
+
+float getPhysicalSlingshotBandFrame(float frameMax) {
+    return vr_link::getPhysicalSlingshotBandFrame(frameMax);
+}
+
 
 void getControllerAimAngles(s16* outYawS, s16* outPitchS) {
     *outYawS = g_controllerAimYawS;
@@ -3066,6 +3091,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // hand to the arrow and pose the bow string -- before anything below
     // poses the hands/arms or calcs the bow.
     vr_link::updatePhysicalBowState(g_rightAimForward, g_leftAimForward, pacing.dt);
+    vr_link::updatePhysicalSlingshotState(g_leftAimForward, pacing.dt);
     if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
         dusk::vr::refreshTrackedHandDrawMtxLive(link->getHandModel());
     }
@@ -3118,6 +3144,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
     // Physical bow arrow model (after the item joints above, the un-nocked
     // arrow reads getLeftItemMatrix()).
     vr_link::refreshPhysicalBowArrowLive();
+    vr_link::refreshPhysicalSlingshotLive();
     if (vr_link::consumeBowNockEvent()) {
         XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
         info.action = g_hapticAction;

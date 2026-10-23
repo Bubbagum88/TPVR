@@ -15974,3 +15974,42 @@ slerp + position lerp, `t = 1 - exp(-dt/kBowHandSmoothingSec)`, 0.05s -- and wri
 into s_left/s_rightHandMtx, so hand, bow, arrow line, bow aim and Full Body arm all use
 it. Resets (snaps) when not holding a bow or the hand changes. Retune
 `kBowHandSmoothingSec` if it feels laggy (lower) or still shaky (higher).
+
+### "Physical Slingshot" (default ON) — CONFIRMED WORKING IN-HEADSET 2026-10-22
+
+`game.vrPhysicalSlingshot`, VR tab > Combat after Left-Handed Bow. Same flow as Physical
+Bow, but no arrow actor (the seed is never shown). Gate `vr_link::isPhysicalSlingshotMode()`:
+setting + first person + PACHINKO + !checkBowGrabLeftHand().
+- Left hand: `isLeftHandedBow()` now also returns true in this mode, so the slingshot
+  reuses the Left-Handed Bow placement (vrBowSwapMirrorAxis/ExtraFlipAxis), the hand-pose
+  swap in setDrawHand(), left-controller aim and the bow-hand smoothing.
+- `updatePhysicalSlingshotState()` (tick(), right after updatePhysicalBowState()): with
+  the item button held during reload or charge wait, the right hand within 20 units of the
+  left grip loads the seed (same haptic via s_bowNockEvent). Loaded: two-point aim (shared
+  `detail_applyTwoPointAim()`, factored out of the bow) from the right hand's pinch point
+  (`detail_arrowPointInDrawHand(link, true)`) to the grip, written to the shared
+  s_bowArrowDirWorld so `setBodyAngleToCamera()` aims along it via getPhysicalBowAimAngles().
+  Pull clamped 0..50, drawn at >= 15 (latched 0.15s). Right hand locked to the pouch.
+  Button release stores the pouch as the shot origin for 0.25s.
+- Game side (checkUpperItemActionBow()): mHeldItemRootPos (stone origin + sight line) =
+  `getPhysicalSlingshotShotPos()`; release undrawn -> setBowReadyAnime() (no shot);
+  item bck stays PSHOOT's last frame until loaded, then PRELORD at pull/max.
+- `refreshPhysicalSlingshotLive()` (after refreshPhysicalBowArrowLive()) poses PRELORD at
+  the pull and pins the joint PRELORD moves furthest (`detail_findDrawAnimJoint()`, the
+  bow's string finder generalized; logs `[dusk::vr::slingpouch] joint N (name)`) to the pouch.
+Untested risks: mirrored grip may need its own flip (uses the bow's axes); PRELORD frame 0
+may not be the resting band (pouch is pinned regardless); the shot line runs pouch -> hand
+grip, slightly below the fork; nock radius/pull tunables (kSling* in vr_link_visibility.hpp).
+
+**Follow-up (2026-10-22): user tested — "pretty good"; two issues fixed — CONFIRMED FIXED IN-HEADSET ("FIXED").**
+- Pull line started mid-slingshot and went down (it ran pinch point -> hand origin). Now
+  anchored at the band's rest point between the posts: `detail_updateSlingAnchor()` finds
+  the joint PSHOOT moves furthest (`[dusk::vr::slingrest]` log) while PSHOOT is active, takes
+  its last-frame (rest) position, and stores it in the left hand's frame each frame the
+  slingshot is placed. Loading = pinch point within 20 of that anchor; two-point line and
+  pull run pinch -> anchor. `detail_applyTwoPointAim()` now turns the grip hand about the
+  grip point instead of the hand origin (identical for the bow, whose grip IS the origin).
+- Hand lagged while walking: `detail_smoothBowHand()` eased the WORLD pose, so locomotion
+  was smoothed too. Now eased in play space (`detail_playSpaceMtx()`, from
+  `s_playSpaceOrigin`/`s_playSpaceYawRad` recorded in computeTrackedHandMatrices():
+  hand = origin + Ry(yaw)*controller*scale). Also fixes the same lag on the bow.
