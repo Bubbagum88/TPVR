@@ -120,6 +120,7 @@ UserSettings g_userSettings = {
         .vrLeftHandedBow {"game.vrLeftHandedBow", true},
         .vrBowSwapMirrorAxis {"game.vrBowSwapMirrorAxis", 2},
         .vrBowSwapExtraFlipAxis {"game.vrBowSwapExtraFlipAxis", -1},
+        .vrHideAimCrosshair {"game.vrHideAimCrosshair", false},
         // Key string deliberately kept as the original "game.vrSwapGripMirrorAxis"
         // (not renamed to match the C++ member) so a value the user already
         // tuned before the sword/shield split (2026-08-20) carries over
@@ -455,6 +456,7 @@ void registerSettings() {
     Register(g_userSettings.game.vrLeftHandedBow);
     Register(g_userSettings.game.vrBowSwapMirrorAxis);
     Register(g_userSettings.game.vrBowSwapExtraFlipAxis);
+    Register(g_userSettings.game.vrHideAimCrosshair);
     Register(g_userSettings.game.vrSwapSwordGripMirrorAxis);
     Register(g_userSettings.game.vrSwapShieldGripMirrorAxis);
     Register(g_userSettings.game.vrSwapSwordExtraFlipAxis);

@@ -1216,6 +1216,12 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                             "aims with the left controller. Off puts them the way the game "
                             "does: bow in the right hand, arrow in the left."
             });
+        config_bool_select(leftPane, rightPane, getSettings().game.vrHideAimCrosshair,
+            {
+                .key = "Hide Aim Crosshair",
+                .helpText = "Hides the aim dot shown while aiming the bow, slingshot, "
+                            "hookshot or boomerang. Off by default."
+            });
 
         leftPane.add_section("Performance");
         config_bool_select(leftPane, rightPane, getSettings().game.vrSinglePassStereo,

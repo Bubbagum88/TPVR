@@ -3615,6 +3615,10 @@ constexpr float kBowNockRadiusUnits = 20.0f;   // draw hand this close to the gr
 constexpr float kBowMaxPullUnits = 70.0f;      // arrow is 95 units long
 constexpr float kBowMinDrawPullUnits = 25.0f;  // pulled at least this far counts as drawn
 constexpr float kBowDrawnLatchSec = 0.15f;     // covers the 30Hz release check
+// Nocked: draw-hand-to-grip distance over which the aim fades from the bow
+// hand's own pointing to the two-point (draw hand -> grip) line.
+constexpr float kBowTwoPointAimStartUnits = 10.0f;
+constexpr float kBowTwoPointAimFullUnits = 25.0f;
 
 // Same conditions the game side uses (d_a_alink_bow.inc), minus the
 // per-frame charge-wait/arrow checks.
@@ -3961,8 +3965,38 @@ inline void updatePhysicalBowState(const Vec3f& rightAimForward, const Vec3f& le
         }
 
         if (detail::s_bowNocked) {
+            // Where the draw hand holds the arrow, before the lock below.
+            const cXyz itemLocal = detail_arrowPointInDrawHand(link, leftHandedBow);
+            cXyz itemWorld;
+            mDoMtx_multVec(drawHandMtx, &itemLocal, &itemWorld);
+
+            // Two-point aim: once nocked, the arrow points from the draw hand
+            // to the bow grip (faded in as the hand pulls away, the direction
+            // is noise up close). The bow hand is turned onto that line by the
+            // shortest rotation, so it still sets the bow's cant, and
+            // everything after (bow, hand model, aim dot) follows it.
+            const cXyz toGrip = grip - itemWorld;
+            const f32 span = toGrip.abs();
+            f32 w = (span - kBowTwoPointAimStartUnits) / (kBowTwoPointAimFullUnits - kBowTwoPointAimStartUnits);
+            if (w > 1.0f) w = 1.0f;
+            if (w > 0.0f) {
+                cXyz aimDir = dir * (1.0f - w) + toGrip * (w / span);
+                if (aimDir.abs() > 0.001f) {
+                    aimDir.normalize();
+                    Mtx rot;
+                    detail::ikRotFromTo(dir, aimDir, rot);
+                    Mtx turned;
+                    MTXConcat(rot, bowHandMtx, turned);
+                    for (int r = 0; r < 3; ++r) turned[r][3] = bowHandMtx[r][3];
+                    MTXCopy(turned, bowHandMtx);
+                    dir = aimDir;
+                    detail::s_bowArrowDirWorld = dir;
+                    detail::s_bowArrowDirWorldValid = true;
+                }
+            }
+
             // How far the draw hand is behind the grip, measured along the aim.
-            f32 pull = (grip - hand).inprod(dir);
+            f32 pull = (grip - itemWorld).inprod(dir);
             if (pull < 0.0f) pull = 0.0f;
             if (pull > kBowMaxPullUnits) pull = kBowMaxPullUnits;
             detail::s_bowPullUnits = pull;
@@ -3984,9 +4018,6 @@ inline void updatePhysicalBowState(const Vec3f& rightAimForward, const Vec3f& le
             // it so its item point (where the arrow is held) lands on the tail.
             // Everything after this (hand model, Full Body arm IK,
             // getLeft/RightItemMatrix()) reads the moved hand.
-            const cXyz itemLocal = detail_arrowPointInDrawHand(link, leftHandedBow);
-            cXyz itemWorld;
-            mDoMtx_multVec(drawHandMtx, &itemLocal, &itemWorld);
             const cXyz delta = tail - itemWorld;
             drawHandMtx[0][3] += delta.x;
             drawHandMtx[1][3] += delta.y;

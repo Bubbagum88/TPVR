@@ -3532,7 +3532,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         g_perfEyePainterMs += perfMs(perfT2, perfT3);
 
         if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
-            if (link->getAimSightVisible()) {
+            if (link->getAimSightVisible() && !dusk::getSettings().game.vrHideAimCrosshair.getValue()) {
                 vr_render::drawAimCrosshair(*link->getLineTopPosP());
             }
         }
@@ -3663,7 +3663,7 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         // boomerang 2D reticle -- see drawAimCrosshair()'s own comment
         // (vr_stereo_render.hpp) for the full "all items" scoping.
         if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
-            if (link->getAimSightVisible()) {
+            if (link->getAimSightVisible() && !dusk::getSettings().game.vrHideAimCrosshair.getValue()) {
                 vr_render::drawAimCrosshair(*link->getLineTopPosP());
             }
         }

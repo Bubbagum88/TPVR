@@ -469,6 +469,9 @@ struct UserSettings {
         ConfigVar<bool> vrLeftHandedBow;
         ConfigVar<int> vrBowSwapMirrorAxis;
         ConfigVar<int> vrBowSwapExtraFlipAxis;
+        // Hides the world-space aim dot (drawAimCrosshair()) for every aimed
+        // item (bow, slingshot, hookshot, boomerang).
+        ConfigVar<bool> vrHideAimCrosshair;
         // Which local axis (0=X, 1=Y, 2=Z) mirrorLocalMtxAxis()
         // (vr_link_visibility.hpp) reflects the sword's grip data through
         // when vrSwapSwordShieldHands is on -- see that function's own

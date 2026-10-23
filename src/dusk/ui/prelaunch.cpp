@@ -1113,7 +1113,7 @@ void Prelaunch::update() {
     if (mVersion != nullptr) {
         // Fixed label for the VR fork, instead of the git describe string
         // (BOREALIS_APP_DESCRIBE, e.g. "2.2.0-21-dirty").
-        constexpr std::string_view versionStr = "2.4.0";
+        constexpr std::string_view versionStr = "2.5.0";
         set_text_content(mVersion, Rml::String{versionStr});
     }
     if (mUpdateStatus != nullptr && mUpdateMessage != nullptr) {

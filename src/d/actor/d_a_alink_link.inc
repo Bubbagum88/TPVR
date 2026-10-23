@@ -169,6 +169,17 @@ BOOL daAlink_c::setBodyAngleToCamera() {
                     dusk::vr::getControllerAimAnglesForHand(leftHand, &aimYawS, &aimPitchS);
                 }
             }
+            // Magnetic boots (Goron Mines walls/ceilings): shape_angle.y and
+            // mBodyAngle.x are in the boots' frame (mMagneBootMtx, see
+            // checkBowCameraArrowPosP()), but the VR aim is a world direction.
+            // Unconverted, aim came out reversed while upside down.
+            if (checkMagneBootsOn()) {
+                const f32 cosPitch = cM_scos(aimPitchS);
+                cXyz dir(cM_ssin(aimYawS) * cosPitch, -cM_ssin(aimPitchS), cM_scos(aimYawS) * cosPitch);
+                multVecMagneBootInvMtx(&dir);
+                aimYawS = cM_atan2s(dir.x, dir.z);
+                aimPitchS = -cM_atan2s(dir.y, dir.absXZ());
+            }
             shape_angle.y = aimYawS;
             sp8 = aimPitchS;
 
