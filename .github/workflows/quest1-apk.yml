@@ -1,0 +1,88 @@
+name: Quest 1 APK
+
+# Builds only the Quest (Android arm64) APK for the quest1 branch, signed with
+# the debug key in platforms/android/ci-debug.keystore so it installs with adb.
+
+on:
+  push:
+    branches: [quest1]
+    paths-ignore:
+      - '*.md'
+      - '*LICENSE'
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  ANDROID_NDK_VERSION: "29.0.14206865"
+
+jobs:
+  build-quest-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # The pinned extern/aurora commit lives on JoeyAW/aurora, not the
+      # encounter/aurora URL in .gitmodules (see CLAUDE.md).
+      - name: Checkout submodules
+        run: |
+          git config submodule.extern/aurora.url https://github.com/JoeyAW/aurora.git
+          git submodule update --init --recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.1.0" "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Install Rust Android target
+        run: |
+          rustup toolchain install stable
+          rustup target add aarch64-linux-android
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure CMake
+        run: cmake --preset x-android-ci-arm64
+
+      - name: Build native library
+        run: cmake --build --preset x-android-ci-arm64 --target dusklight
+
+      - name: Build bundled mods
+        run: cmake --build --preset x-android-ci-arm64 --target dusklight_mods
+
+      - name: Build APK
+        working-directory: platforms/android
+        env:
+          DUSK_ANDROID_KEYSTORE: ${{ github.workspace }}/platforms/android/ci-debug.keystore
+          DUSK_ANDROID_KEYSTORE_PASSWORD: android
+          DUSK_ANDROID_KEY_ALIAS: androiddebugkey
+        run: ./gradlew :app:assembleRelease --rerun-tasks
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: tpvr-quest1-apk
+          path: platforms/android/app/build/outputs/apk/release/app-arm64-v8a-release*.apk
