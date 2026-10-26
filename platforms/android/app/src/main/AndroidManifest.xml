@@ -47,10 +47,10 @@
              menu) instead of being suspended outright, standard for a
              native OpenXR app on Horizon OS. -->
         <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
-        <!-- Informational only (store/filtering); doesn't affect a
-             sideloaded/adb-installed debug build. Update if support is ever
-             extended to other Quest models. -->
-        <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|quest3s" />
+        <!-- Quest 1 build: the Quest 1 VR runtime aborts at launch on any
+             name it doesn't know ("Unknown device to support: quest3"), so
+             list only names it knows. -->
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest|quest2" />
 
         <provider
             android:name="dev.encounter.borealis.BorealisDocumentsProvider"
