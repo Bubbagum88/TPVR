@@ -37,12 +37,8 @@ jobs:
           git config submodule.extern/aurora.url https://github.com/JoeyAW/aurora.git
           git submodule update --init --recursive
 
-      - name: Apply Quest 1 Aurora patches
-        run: |
-          git -C extern/aurora apply ../../platforms/android/quest1/aurora-arraylength-both-buffers.patch
-          git -C extern/aurora apply ../../platforms/android/quest1/aurora-draw-stats.patch
-          git -C extern/aurora apply ../../platforms/android/quest1/aurora-marker-clear.patch
-          git -C extern/aurora apply ../../platforms/android/quest1/aurora-upload-snapshot.patch
+      - name: Apply Quest 1 Aurora patch
+        run: git -C extern/aurora apply ../../platforms/android/quest1/aurora-arraylength-both-buffers.patch
 
       - name: Install dependencies
         run: |
@@ -94,33 +90,3 @@ jobs:
         with:
           name: tpvr-quest1-apk
           path: platforms/android/app/build/outputs/apk/release/app-arm64-v8a-release*.apk
-
-      # Debuggable APK with the Khronos Vulkan validation layer inside it, so
-      # Android's GPU debug-layer settings can load it on the headset and log
-      # what the driver is given (logcat tag VALIDATION).
-      - name: Get Vulkan validation layer
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download vulkan-sdk-1.3.296.0 --repo KhronosGroup/Vulkan-ValidationLayers \
-            --pattern 'android-binaries-*.zip' --dir "$RUNNER_TEMP/vvl"
-          unzip -q "$RUNNER_TEMP"/vvl/android-binaries-*.zip -d "$RUNNER_TEMP/vvl/unzipped"
-          mkdir -p "$RUNNER_TEMP/vvl-jnilibs/arm64-v8a"
-          find "$RUNNER_TEMP/vvl/unzipped" -path '*arm64-v8a*' -name libVkLayer_khronos_validation.so \
-            -exec cp {} "$RUNNER_TEMP/vvl-jnilibs/arm64-v8a/" \;
-          test -f "$RUNNER_TEMP/vvl-jnilibs/arm64-v8a/libVkLayer_khronos_validation.so"
-
-      - name: Build debug APK (with validation layer)
-        working-directory: platforms/android
-        env:
-          DUSK_ANDROID_KEYSTORE: ${{ github.workspace }}/platforms/android/ci-debug.keystore
-          DUSK_ANDROID_KEYSTORE_PASSWORD: android
-          DUSK_ANDROID_KEY_ALIAS: androiddebugkey
-          ANDROID_STAGE_STRIP: "0"
-        run: ./gradlew -PDUSK_ANDROID_EXTRA_JNILIBS="$RUNNER_TEMP/vvl-jnilibs" :app:assembleDebug
-
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v7
-        with:
-          name: tpvr-quest1-debug-apk
-          path: platforms/android/app/build/outputs/apk/debug/app-arm64-v8a-debug*.apk

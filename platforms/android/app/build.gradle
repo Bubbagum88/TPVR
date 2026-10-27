@@ -64,14 +64,6 @@ if (dusklightPropertiesFile.isFile()) {
     }
 }
 
-// Optional extra native libraries, for example the Vulkan validation layer in
-// the Quest 1 debug APK: a folder laid out like jniLibs (arm64-v8a/lib*.so),
-// given as -PDUSK_ANDROID_EXTRA_JNILIBS=<folder>. Not set, nothing changes.
-def extraJniLibs = findProperty('DUSK_ANDROID_EXTRA_JNILIBS')
-if (extraJniLibs) {
-    android.sourceSets.main.jniLibs.srcDirs += [file(extraJniLibs)]
-}
-
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
 }
