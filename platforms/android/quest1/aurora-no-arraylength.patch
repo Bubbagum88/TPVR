@@ -1,0 +1,16 @@
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 69f70e6..cfa4f1f 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -1719,7 +1719,10 @@ fn load_word(p: ptr<storage, array<u32>>, word_idx: u32) -> u32 {{
+   // It appears to discourage some Adreno drivers/optimizers from storage buffer
+   // optimizations that can cause visual artifacts, including vertex explosions
+   // in Dusklight.
+-  if (word_idx < arrayLength(p)) {{
++  // Quest 1: the Adreno 540 driver crashes in vkCmdDrawIndexed when a
++  // shader uses arrayLength() on these buffers, so compare against the
++  // larger buffer's size (VertexBufferSize / 4) instead.
++  if (word_idx < 2621440u) {{
+     return p[word_idx];
+   }}
+   return 0u;
