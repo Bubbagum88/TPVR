@@ -38,7 +38,7 @@ jobs:
           git submodule update --init --recursive
 
       - name: Apply Quest 1 Aurora patch
-        run: git -C extern/aurora apply ../../platforms/android/quest1/aurora-no-arraylength.patch
+        run: git -C extern/aurora apply ../../platforms/android/quest1/aurora-arraylength-both-buffers.patch
 
       - name: Install dependencies
         run: |

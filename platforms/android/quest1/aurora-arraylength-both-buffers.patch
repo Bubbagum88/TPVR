@@ -1,0 +1,17 @@
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 69f70e6..fc18fef 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -2063,6 +2063,12 @@ fn vs_main(
+     @builtin(vertex_index) vidx: u32{3}
+ ) -> VertexOutput {{
+     var out: VertexOutput;{7}{4}
++    // Quest 1 (Adreno 540): the driver sizes its buffer-length table from the
++    // storage buffers a shader queries, but fills it for every bound one.
++    // Query both bound buffers so the table covers bindings 0 and 1.
++    if (arrayLength(&vbuf) == 0u || arrayLength(&abuf) == 0u) {{
++        out.pos = vec4f(0.0);
++    }}
+     return out;
+ }}
+ 
