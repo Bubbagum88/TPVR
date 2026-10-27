@@ -1298,6 +1298,595 @@ struct VOut {
                    got[0], got[1], expectV, expectS, verdict);
     duskVrLog(msg);
 }
+
+// Quest 1 diagnostic: does this driver decode GameCube vertex data the way
+// the GX shader expects? The WGSL below the bindings is Aurora's own fetch
+// helpers, copied verbatim from extern/aurora/lib/gx/shader.cpp (bswap32
+// through fetch_f32_4). Known big-endian bytes go in a vertex-only storage
+// buffer at unaligned offsets (as in a real vertex stream); four points each
+// decode one case and write the result to their own pixel of a 4x1 target.
+// Logs to dusklight_vr; runs once, changes nothing.
+static void probeVertexDecode() {
+    using namespace aurora::webgpu;
+    constexpr uint32_t kSentinel = 0xDEAD;
+    constexpr uint32_t kCases = 4;
+
+    // Test bytes, big-endian like the GameCube's vertex data; 0xEE fills gaps.
+    uint8_t bytes[256];
+    std::memset(bytes, 0xEE, sizeof(bytes));
+    const auto putBe32 = [&](uint32_t off, uint32_t v) {
+        bytes[off] = uint8_t(v >> 24);
+        bytes[off + 1] = uint8_t(v >> 16);
+        bytes[off + 2] = uint8_t(v >> 8);
+        bytes[off + 3] = uint8_t(v);
+    };
+    const auto putBe16 = [&](uint32_t off, uint16_t v) {
+        bytes[off] = uint8_t(v >> 8);
+        bytes[off + 1] = uint8_t(v);
+    };
+    const auto f32Bits = [](float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        return u;
+    };
+    // Case 0: three f32 at byte 1 (every one straddles a word boundary).
+    putBe32(1, f32Bits(1.5f));
+    putBe32(5, f32Bits(-2.25f));
+    putBe32(9, f32Bits(100.0f));
+    // Case 1: three s16, frac 8, at byte 15.
+    putBe16(15, uint16_t(int16_t(-300)));
+    putBe16(17, uint16_t(1000));
+    putBe16(19, uint16_t(32767));
+    // Case 2: three s8, frac 6, at byte 22.
+    bytes[22] = uint8_t(int8_t(-5));
+    bytes[23] = 7;
+    bytes[24] = 127;
+    // Case 3: a matrix index byte (27 -> 27/3 = 9) at 26, an INDEX16 index at
+    // 27 (crosses into the next word), three u16 at 30.
+    bytes[26] = 27;
+    putBe16(27, 0x1234);
+    putBe16(30, 0x0102);
+    putBe16(32, 0xFFFF);
+    putBe16(34, 0x8000);
+
+    const uint32_t expected[kCases][4] = {
+        {f32Bits(1.5f), f32Bits(-2.25f), f32Bits(100.0f), f32Bits(1.5f)},
+        {f32Bits(-300.0f / 256.0f), f32Bits(1000.0f / 256.0f), f32Bits(32767.0f / 256.0f), 0xFED4u},
+        {f32Bits(-5.0f / 64.0f), f32Bits(7.0f / 64.0f), f32Bits(127.0f / 64.0f), 7u},
+        {9u, 0x1234u, f32Bits(65535.0f), f32Bits(32768.0f)},
+    };
+    const char* caseNames[kCases] = {"f32x3 @1", "s16x3 frac8 @15", "s8x3 frac6 @22", "u8 idx/u16 idx/u16x3 @26"};
+
+    g_device.PushErrorScope(wgpu::ErrorFilter::Validation);
+
+    const std::string code = std::string(R"WGSL(
+@group(0) @binding(0) var<storage, read> vbuf: array<u32>;
+@group(0) @binding(1) var<storage, read> abuf: array<u32>;
+)WGSL") + R"WGSL(
+fn bswap32(v: u32, le: bool) -> u32 {
+  if (le) {
+    return v;
+  }
+  return ((v & 0x000000FFu) << 24u) |
+         ((v & 0x0000FF00u) << 8u) |
+         ((v & 0x00FF0000u) >> 8u) |
+         ((v & 0xFF000000u) >> 24u);
+}
+
+fn bswap16(v: u32, le: bool) -> u32 {
+  return select(((v & 0xFFu) << 8u) | (v >> 8u), v, le);
+}
+
+fn load_word(p: ptr<storage, array<u32>>, word_idx: u32) -> u32 {
+  // This guard is not expected to handle routine out-of-bounds accesses.
+  // It appears to discourage some Adreno drivers/optimizers from storage buffer
+  // optimizations that can cause visual artifacts, including vertex explosions
+  // in Dusklight.
+  if (word_idx < arrayLength(p)) {
+    return p[word_idx];
+  }
+  return 0u;
+}
+
+fn load_u8(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {
+  let word = load_word(p, byte_off / 4u);
+  let shift = (byte_off & 3u) * 8u;
+  return (word >> shift) & 0xFFu;
+}
+
+fn load_u32_raw(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {
+  let word_idx = byte_off >> 2u;
+  let sub = byte_off & 3u;
+  let lo = load_word(p, word_idx);
+  if (sub == 0u) {
+    return lo;
+  }
+  let hi = load_word(p, word_idx + 1u);
+  let shift = sub * 8u;
+  return (lo >> shift) | (hi << (32u - shift));
+}
+
+fn load_u16(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {
+  let word_idx = byte_off >> 2u;
+  let sub = byte_off & 3u;
+  let word = load_word(p, word_idx);
+  if (sub <= 2u) {
+    return bswap16(extractBits(word, sub * 8u, 16u), le);
+  }
+  let next = load_word(p, word_idx + 1u);
+  let raw = extractBits(word, 24u, 8u) | (extractBits(next, 0u, 8u) << 8u);
+  return bswap16(raw, le);
+}
+
+fn load_u24(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {
+  let raw = load_u32_raw(p, byte_off) & 0x00FFFFFFu;
+  if (le) {
+    return raw;
+  }
+  return ((raw & 0x0000FFu) << 16u) |
+         (raw & 0x00FF00u) |
+         ((raw & 0xFF0000u) >> 16u);
+}
+
+fn load_u32(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {
+  return bswap32(load_u32_raw(p, byte_off), le);
+}
+
+fn load_f32(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> f32 {
+  return bitcast<f32>(load_u32(p, byte_off, le));
+}
+
+fn raw_fetch_u8_1(p: ptr<storage, array<u32>>, byte_off: u32) -> u32 {
+  return load_u8(p, byte_off);
+}
+
+fn raw_fetch_u8_2(p: ptr<storage, array<u32>>, byte_off: u32) -> vec2u {
+  let word_idx = byte_off >> 2u;
+  let sub = byte_off & 3u;
+  let word = load_word(p, word_idx);
+  if (sub <= 2u) {
+    let shift = sub * 8u;
+    return vec2u(
+      extractBits(word, shift + 0u, 8u),
+      extractBits(word, shift + 8u, 8u),
+    );
+  }
+  let next = load_word(p, word_idx + 1u);
+  return vec2u(
+    extractBits(word, 24u, 8u),
+    extractBits(next, 0u, 8u),
+  );
+}
+
+fn raw_fetch_u8_3(p: ptr<storage, array<u32>>, byte_off: u32) -> vec3u {
+  let raw = load_u32_raw(p, byte_off);
+  return vec3u(
+    extractBits(raw, 0u, 8u),
+    extractBits(raw, 8u, 8u),
+    extractBits(raw, 16u, 8u),
+  );
+}
+
+fn raw_fetch_u8_4(p: ptr<storage, array<u32>>, byte_off: u32) -> vec4u {
+  let raw = load_u32_raw(p, byte_off);
+  return vec4u(
+    extractBits(raw, 0u, 8u),
+    extractBits(raw, 8u, 8u),
+    extractBits(raw, 16u, 8u),
+    extractBits(raw, 24u, 8u),
+  );
+}
+
+fn raw_fetch_u16_1(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {
+  return load_u16(p, byte_off, le);
+}
+
+fn raw_fetch_u16_2(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec2u {
+  return vec2u(
+    load_u16(p, byte_off + 0u, le),
+    load_u16(p, byte_off + 2u, le),
+  );
+}
+
+fn raw_fetch_u16_3(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec3u {
+  return vec3u(
+    load_u16(p, byte_off + 0u, le),
+    load_u16(p, byte_off + 2u, le),
+    load_u16(p, byte_off + 4u, le),
+  );
+}
+
+fn raw_fetch_u16_4(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4u {
+  return vec4u(
+    load_u16(p, byte_off + 0u, le),
+    load_u16(p, byte_off + 2u, le),
+    load_u16(p, byte_off + 4u, le),
+    load_u16(p, byte_off + 6u, le),
+  );
+}
+
+fn raw_fetch_f32_1(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> f32 {
+  return load_f32(p, byte_off, le);
+}
+
+fn raw_fetch_f32_2(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec2f {
+  return vec2f(
+    load_f32(p, byte_off + 0u, le),
+    load_f32(p, byte_off + 4u, le),
+  );
+}
+
+fn raw_fetch_f32_3(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec3f {
+  return vec3f(
+    load_f32(p, byte_off + 0u, le),
+    load_f32(p, byte_off + 4u, le),
+    load_f32(p, byte_off + 8u, le),
+  );
+}
+
+fn raw_fetch_f32_4(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {
+  return vec4f(
+    load_f32(p, byte_off + 0u, le),
+    load_f32(p, byte_off + 4u, le),
+    load_f32(p, byte_off + 8u, le),
+    load_f32(p, byte_off + 12u, le),
+  );
+}
+
+fn fetch_u8_1(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> f32 {
+  let v = raw_fetch_u8_1(p, byte_off);
+  return f32(v) / f32(1u << frac);
+}
+
+fn fetch_s8_1(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> f32 {
+  let v = (bitcast<i32>(raw_fetch_u8_1(p, byte_off)) << 24) >> 24;
+  return f32(v) / f32(1u << frac);
+}
+
+fn fetch_u8_2(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec2f {
+  let v = raw_fetch_u8_2(p, byte_off);
+  return vec2f(v) / f32(1u << frac);
+}
+
+fn fetch_s8_2(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec2f {
+  let v = (bitcast<vec2i>(raw_fetch_u8_2(p, byte_off)) << vec2u(24u)) >> vec2u(24u);
+  return vec2f(v) / f32(1u << frac);
+}
+
+fn fetch_u8_3(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec3f {
+  let v = raw_fetch_u8_3(p, byte_off);
+  return vec3f(v) / f32(1u << frac);
+}
+
+fn fetch_s8_3(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec3f {
+  let v = (bitcast<vec3i>(raw_fetch_u8_3(p, byte_off)) << vec3u(24u)) >> vec3u(24u);
+  return vec3f(v) / f32(1u << frac);
+}
+
+fn fetch_u8_4(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec4f {
+  let v = raw_fetch_u8_4(p, byte_off);
+  return vec4f(v) / f32(1u << frac);
+}
+
+fn fetch_s8_4(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec4f {
+  let v = (bitcast<vec4i>(raw_fetch_u8_4(p, byte_off)) << vec4u(24u)) >> vec4u(24u);
+  return vec4f(v) / f32(1u << frac);
+}
+
+fn fetch_u16_1(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> f32 {
+  let v = raw_fetch_u16_1(p, byte_off, le);
+  return f32(v) / f32(1u << frac);
+}
+
+fn fetch_s16_1(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> f32 {
+  let v = bitcast<i32>(raw_fetch_u16_1(p, byte_off, le) << 16u) >> 16;
+  return f32(v) / f32(1u << frac);
+}
+
+fn fetch_u16_2(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec2f {
+  let v = raw_fetch_u16_2(p, byte_off, le);
+  return vec2f(v) / f32(1u << frac);
+}
+
+fn fetch_s16_2(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec2f {
+  let v = (bitcast<vec2i>(raw_fetch_u16_2(p, byte_off, le)) << vec2u(16u)) >> vec2u(16u);
+  return vec2f(v) / f32(1u << frac);
+}
+
+fn fetch_u16_3(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec3f {
+  let v = raw_fetch_u16_3(p, byte_off, le);
+  return vec3f(v) / f32(1u << frac);
+}
+
+fn fetch_s16_3(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec3f {
+  let v = (bitcast<vec3i>(raw_fetch_u16_3(p, byte_off, le)) << vec3u(16u)) >> vec3u(16u);
+  return vec3f(v) / f32(1u << frac);
+}
+
+fn fetch_u16_4(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec4f {
+  let v = raw_fetch_u16_4(p, byte_off, le);
+  return vec4f(v) / f32(1u << frac);
+}
+
+fn fetch_s16_4(p: ptr<storage, array<u32>>, byte_off: u32, frac: u32, le: bool) -> vec4f {
+  let v = (bitcast<vec4i>(raw_fetch_u16_4(p, byte_off, le)) << vec4u(16u)) >> vec4u(16u);
+  return vec4f(v) / f32(1u << frac);
+}
+
+fn fetch_f32_1(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> f32 {
+  return raw_fetch_f32_1(p, byte_off, le);
+}
+
+fn fetch_f32_2(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec2f {
+  return raw_fetch_f32_2(p, byte_off, le);
+}
+
+fn fetch_f32_3(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec3f {
+  return raw_fetch_f32_3(p, byte_off, le);
+}
+
+fn fetch_f32_4(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {
+  return raw_fetch_f32_4(p, byte_off, le);
+}
+struct VOut {
+    @builtin(position) pos: vec4f,
+    @location(0) @interpolate(flat, either) vals: vec4u,
+};
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
+    var o: VOut;
+    o.pos = vec4f(-0.75 + 0.5 * f32(i), 0.0, 0.0, 1.0);
+    var v = vec4u(0u);
+    if (i == 0u) {
+        let p = fetch_f32_3(&vbuf, 1u, false);
+        v = vec4u(bitcast<vec3u>(p), load_u32(&vbuf, 1u, false));
+    } else if (i == 1u) {
+        let p = fetch_s16_3(&vbuf, 15u, 8u, false);
+        v = vec4u(bitcast<vec3u>(p), load_u16(&vbuf, 15u, false));
+    } else if (i == 2u) {
+        let p = fetch_s8_3(&vbuf, 22u, 6u, false);
+        v = vec4u(bitcast<vec3u>(p), raw_fetch_u8_1(&vbuf, 23u));
+    } else {
+        let q = fetch_u16_3(&vbuf, 30u, 0u, false);
+        v = vec4u(raw_fetch_u8_1(&vbuf, 26u) / 3u, raw_fetch_u16_1(&vbuf, 27u, false),
+                  bitcast<u32>(q.y), bitcast<u32>(q.z));
+    }
+    if (arrayLength(&abuf) == 0u) {
+        v = vec4u(0u);
+    }
+    o.vals = v;
+    return o;
+}
+@fragment fn fs(i: VOut) -> @location(0) vec4u {
+    return i.vals;
+}
+)WGSL";
+    wgpu::ShaderSourceWGSL wgsl{};
+    wgsl.code = code.c_str();
+    wgpu::ShaderModuleDescriptor smDesc{};
+    smDesc.nextInChain = &wgsl;
+    smDesc.label = "vr vertex decode probe";
+    const wgpu::ShaderModule module = g_device.CreateShaderModule(&smDesc);
+
+    wgpu::BindGroupLayoutEntry bglEntries[2]{};
+    bglEntries[0].binding = 0;
+    bglEntries[0].visibility = wgpu::ShaderStage::Vertex;
+    bglEntries[0].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    bglEntries[1].binding = 1;
+    bglEntries[1].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
+    bglEntries[1].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    wgpu::BindGroupLayoutDescriptor bglDesc{};
+    bglDesc.entryCount = 2;
+    bglDesc.entries = bglEntries;
+    const wgpu::BindGroupLayout bgl = g_device.CreateBindGroupLayout(&bglDesc);
+
+    wgpu::PipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayoutCount = 1;
+    plDesc.bindGroupLayouts = &bgl;
+    const wgpu::PipelineLayout pl = g_device.CreatePipelineLayout(&plDesc);
+
+    wgpu::ColorTargetState target{};
+    target.format = wgpu::TextureFormat::RGBA32Uint;
+    wgpu::FragmentState frag{};
+    frag.module = module;
+    frag.entryPoint = "fs";
+    frag.targetCount = 1;
+    frag.targets = &target;
+    wgpu::RenderPipelineDescriptor rpDesc{};
+    rpDesc.label = "vr vertex decode probe";
+    rpDesc.layout = pl;
+    rpDesc.vertex.module = module;
+    rpDesc.vertex.entryPoint = "vs";
+    rpDesc.primitive.topology = wgpu::PrimitiveTopology::PointList;
+    rpDesc.fragment = &frag;
+    const wgpu::RenderPipeline pipeline = g_device.CreateRenderPipeline(&rpDesc);
+
+    wgpu::BufferDescriptor bufA{};
+    bufA.size = sizeof(bytes);
+    bufA.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    const wgpu::Buffer a = g_device.CreateBuffer(&bufA);
+    g_queue.WriteBuffer(a, 0, bytes, sizeof(bytes));
+    wgpu::BufferDescriptor bufB{};
+    bufB.size = 256;
+    bufB.usage = wgpu::BufferUsage::Storage;
+    const wgpu::Buffer b = g_device.CreateBuffer(&bufB);
+    wgpu::BindGroupEntry bgEntries[2]{};
+    bgEntries[0].binding = 0;
+    bgEntries[0].buffer = a;
+    bgEntries[0].size = bufA.size;
+    bgEntries[1].binding = 1;
+    bgEntries[1].buffer = b;
+    bgEntries[1].size = bufB.size;
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = bgl;
+    bgDesc.entryCount = 2;
+    bgDesc.entries = bgEntries;
+    const wgpu::BindGroup bg = g_device.CreateBindGroup(&bgDesc);
+
+    wgpu::TextureDescriptor texDesc{};
+    texDesc.size = {kCases, 1, 1};
+    texDesc.format = wgpu::TextureFormat::RGBA32Uint;
+    texDesc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+    const wgpu::Texture tex = g_device.CreateTexture(&texDesc);
+    wgpu::BufferDescriptor readDesc{};
+    readDesc.size = 256;
+    readDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    const wgpu::Buffer readback = g_device.CreateBuffer(&readDesc);
+
+    wgpu::RenderPassColorAttachment color{};
+    color.view = tex.CreateView();
+    color.loadOp = wgpu::LoadOp::Clear;
+    color.storeOp = wgpu::StoreOp::Store;
+    color.clearValue = {kSentinel, kSentinel, kSentinel, kSentinel};
+    wgpu::RenderPassDescriptor passDesc{};
+    passDesc.colorAttachmentCount = 1;
+    passDesc.colorAttachments = &color;
+    wgpu::CommandEncoder enc = g_device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&passDesc);
+    pass.SetPipeline(pipeline);
+    pass.SetBindGroup(0, bg);
+    pass.Draw(kCases);
+    pass.End();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = tex;
+    wgpu::TexelCopyBufferInfo dst{};
+    dst.buffer = readback;
+    dst.layout.bytesPerRow = 256;
+    dst.layout.rowsPerImage = 1;
+    wgpu::Extent3D extent{kCases, 1, 1};
+    enc.CopyTextureToBuffer(&src, &dst, &extent);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    g_queue.Submit(1, &cmd);
+
+    bool scopeDone = false;
+    bool scopeFailed = false;
+    std::string scopeMessage;
+    const auto scopeFuture = g_device.PopErrorScope(
+        wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView message) {
+            scopeDone = true;
+            if (status != wgpu::PopErrorScopeStatus::Success || type != wgpu::ErrorType::NoError) {
+                scopeFailed = true;
+                scopeMessage = std::string{std::string_view{message}};
+            }
+        });
+    g_instance.WaitAny(scopeFuture, 5000000000);
+    if (!scopeDone || scopeFailed) {
+        char msg[640];
+        duskVrSnprintf(msg, sizeof(msg), "[dusk::vr::check] decode probe: ERROR: Dawn rejected it (%s)\n",
+                       scopeDone ? scopeMessage.c_str() : "PopErrorScope timed out");
+        duskVrLog(msg);
+        return;
+    }
+
+    bool mapDone = false;
+    bool mapOk = false;
+    const auto mapFuture = readback.MapAsync(wgpu::MapMode::Read, 0, 256, wgpu::CallbackMode::WaitAnyOnly,
+                                             [&](wgpu::MapAsyncStatus status, wgpu::StringView /*message*/) {
+                                                 mapDone = true;
+                                                 mapOk = (status == wgpu::MapAsyncStatus::Success);
+                                             });
+    g_instance.WaitAny(mapFuture, 5000000000);
+    if (!mapDone || !mapOk) {
+        duskVrLog("[dusk::vr::check] decode probe: ERROR: readback MapAsync failed/timed out\n");
+        return;
+    }
+    uint32_t got[kCases][4];
+    std::memcpy(got, readback.GetConstMappedRange(0, sizeof(got)), sizeof(got));
+    readback.Unmap();
+    for (uint32_t c = 0; c < kCases; ++c) {
+        const bool ok = std::memcmp(got[c], expected[c], sizeof(got[c])) == 0;
+        const bool missed = got[c][0] == kSentinel && got[c][1] == kSentinel;
+        char msg[400];
+        duskVrSnprintf(msg, sizeof(msg),
+                       "[dusk::vr::check] decode probe case %u (%s): got %08x %08x %08x %08x, "
+                       "expected %08x %08x %08x %08x -- %s\n",
+                       c, caseNames[c], got[c][0], got[c][1], got[c][2], got[c][3], expected[c][0],
+                       expected[c][1], expected[c][2], expected[c][3],
+                       ok ? "OK" : missed ? "ERROR: the point was never drawn" : "ERROR: wrong decode");
+        duskVrLog(msg);
+    }
+}
+
+// Quest 1 diagnostic: did this frame's uploads reach the GPU buffers? The
+// CPU writes each frame's vertex, uniform (matrices) and storage (vertex
+// arrays) data into staging memory; the render worker copies it into the
+// GPU buffers at the same offsets before the passes. Read the first bytes of
+// each GPU buffer back and compare them with what the CPU wrote this frame
+// (Aurora patch aurora-upload-snapshot.patch). Call after
+// aurora::gfx::synchronize(), before the next frame begins.
+static void checkUploads() {
+    using namespace aurora::webgpu;
+    const auto& res = aurora::gfx::detail::resources();
+    const auto& snap = aurora::gfx::last_upload_snapshot();
+    constexpr uint64_t kBytes = aurora::gfx::UploadSnapshot::Bytes;
+    struct Area {
+        const char* name;
+        const wgpu::Buffer* buffer;
+        const aurora::gfx::UploadSnapshot::Area* cpu;
+    };
+    const Area areas[3] = {
+        {"vertex", &res.vertexBuffer, &snap.verts},
+        {"uniform", &res.uniformBuffer, &snap.uniforms},
+        {"storage", &res.storageBuffer, &snap.storage},
+    };
+    wgpu::BufferDescriptor readDesc{};
+    readDesc.size = kBytes * 3;
+    readDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    const wgpu::Buffer readback = g_device.CreateBuffer(&readDesc);
+    wgpu::CommandEncoder enc = g_device.CreateCommandEncoder();
+    for (uint32_t i = 0; i < 3; ++i) {
+        enc.CopyBufferToBuffer(*areas[i].buffer, 0, readback, kBytes * i, kBytes);
+    }
+    wgpu::CommandBuffer cmd = enc.Finish();
+    g_queue.Submit(1, &cmd);
+
+    bool mapDone = false;
+    bool mapOk = false;
+    const auto mapFuture = readback.MapAsync(wgpu::MapMode::Read, 0, readDesc.size, wgpu::CallbackMode::WaitAnyOnly,
+                                             [&](wgpu::MapAsyncStatus status, wgpu::StringView /*message*/) {
+                                                 mapDone = true;
+                                                 mapOk = (status == wgpu::MapAsyncStatus::Success);
+                                             });
+    g_instance.WaitAny(mapFuture, 1000000000);
+    if (!mapDone || !mapOk) {
+        duskVrLog("[dusk::vr::check] upload check: ERROR: readback MapAsync failed/timed out\n");
+        return;
+    }
+    const auto* gpu = static_cast<const uint8_t*>(readback.GetConstMappedRange(0, readDesc.size));
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto& cpu = *areas[i].cpu;
+        const uint8_t* g = gpu + kBytes * i;
+        uint32_t firstDiff = UINT32_MAX;
+        bool cpuAllZero = true;
+        bool gpuAllZero = true;
+        for (uint32_t b = 0; b < cpu.size; ++b) {
+            if (firstDiff == UINT32_MAX && g[b] != cpu.bytes[b]) {
+                firstDiff = b;
+            }
+            cpuAllZero = cpuAllZero && cpu.bytes[b] == 0;
+            gpuAllZero = gpuAllZero && g[b] == 0;
+        }
+        char hexCpu[3 * 16 + 1] = {};
+        char hexGpu[3 * 16 + 1] = {};
+        for (uint32_t b = 0; b < 16 && b < cpu.size; ++b) {
+            duskVrSnprintf(hexCpu + 3 * b, 4, "%02x ", cpu.bytes[b]);
+            duskVrSnprintf(hexGpu + 3 * b, 4, "%02x ", g[b]);
+        }
+        char msg[400];
+        duskVrSnprintf(msg, sizeof(msg),
+                       "[dusk::vr::check] upload check %s buffer: %u bytes compared, CPU first 16: %s| GPU first "
+                       "16: %s-- %s%s\n",
+                       areas[i].name, cpu.size, hexCpu, hexGpu,
+                       cpu.size == 0 ? "ERROR: nothing uploaded this frame"
+                       : firstDiff == UINT32_MAX ? "OK (GPU matches what the CPU wrote)"
+                                                 : "ERROR: GPU differs from what the CPU wrote",
+                       cpuAllZero && cpu.size != 0 ? " (note: the CPU data itself is all zero)"
+                       : gpuAllZero && cpu.size != 0 ? " (GPU copy is all zero)"
+                                                     : "");
+        duskVrLog(msg);
+    }
+    readback.Unmap();
+}
 #endif
 
 // Call once at startup, after an aurora::gfx device exists (per the
@@ -1724,6 +2313,7 @@ bool startup() {
 #if DUSK_VR_XR_GRAPHICS_VULKAN
         probeVertexArrayLength();
         probeGxBufferLengths();
+        probeVertexDecode();
 #endif
 
         // Phase 1 of the VR-controller-drives-the-Dusklight-menu feature
@@ -4495,6 +5085,9 @@ void submitFrame() {
                        "(pipeline not ready)=%u%s\n",
                        issued, skipped, issued == 0 ? " -- ERROR: no GX draw reached the GPU" : "");
         duskVrLog(drawMsg);
+#if DUSK_VR_XR_GRAPHICS_VULKAN
+        checkUploads();
+#endif
     }
 
     const XrResult endResult = xrEndFrame(g_session->session(), &endInfo);

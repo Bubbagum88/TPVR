@@ -2945,8 +2945,10 @@ struct FsOut {
             wgpu::Extent3D extent{1, 1, 1};
             enc.CopyTextureToBuffer(&src, &dst, &extent);
         }
-        // Whole image too: how many pixels are not the 0,0,0,0 clear value,
-        // and where. 4 bytes per texel; rows padded to 256 bytes.
+        // Whole image too: how many pixels are not the clear value, and
+        // where. The eye pass clears to magenta (aurora-marker-clear.patch),
+        // so pixels drawn as 0,0,0,0 are counted apart from untouched ones.
+        // 4 bytes per texel; rows padded to 256 bytes.
         const wgpu::TextureFormat fmt = texture.GetFormat();
         const bool fourByte = fmt == wgpu::TextureFormat::RGBA8Unorm || fmt == wgpu::TextureFormat::RGBA8UnormSrgb ||
                               fmt == wgpu::TextureFormat::BGRA8Unorm || fmt == wgpu::TextureFormat::BGRA8UnormSrgb;
@@ -3027,13 +3029,17 @@ struct FsOut {
         }
         const auto* full = static_cast<const uint8_t*>(pixelCheckFullBuf_.GetConstMappedRange(0, fullSize));
         uint64_t drawn = 0;
+        uint64_t drawnZero = 0;
         uint32_t minX = UINT32_MAX, minY = UINT32_MAX, maxX = 0, maxY = 0;
         for (uint32_t y = 0; y < height; ++y) {
             const uint8_t* row = full + uint64_t(fullRow) * y;
             for (uint32_t x = 0; x < width; ++x) {
                 const uint8_t* t = row + x * 4;
-                if (t[0] | t[1] | t[2] | t[3]) {
+                // Magenta 255,0,255,255 is the same bytes in RGBA and BGRA.
+                const bool marker = t[0] == 255 && t[1] == 0 && t[2] == 255 && t[3] == 255;
+                if (!marker) {
                     ++drawn;
+                    drawnZero += (t[0] | t[1] | t[2] | t[3]) == 0;
                     minX = std::min(minX, x);
                     minY = std::min(minY, y);
                     maxX = std::max(maxX, x);
@@ -3043,13 +3049,15 @@ struct FsOut {
         }
         pixelCheckFullBuf_.Unmap();
         if (drawn == 0) {
-            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN whole image %ux%u: 0 pixels differ from the clear value"
+            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN whole image %ux%u: every pixel is still the magenta clear"
                        " -- ERROR: nothing was drawn into the eye image\n",
                        pixelCheckFrame_ / kPixelCheckInterval, width, height);
         } else {
-            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN whole image %ux%u: %llu pixels drawn, within x %u-%u, y %u-%u\n",
-                       pixelCheckFrame_ / kPixelCheckInterval, width, height, (unsigned long long)drawn, minX, maxX,
-                       minY, maxY);
+            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN whole image %ux%u: %llu pixels drawn (%llu of them 0,0,0,0),"
+                       " within x %u-%u, y %u-%u%s\n",
+                       pixelCheckFrame_ / kPixelCheckInterval, width, height, (unsigned long long)drawn,
+                       (unsigned long long)drawnZero, minX, maxX, minY, maxY,
+                       drawnZero == drawn ? " -- ERROR: draws ran but wrote only 0,0,0,0" : "");
         }
         duskVrLog(msg);
     }

@@ -41,6 +41,8 @@ jobs:
         run: |
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-arraylength-both-buffers.patch
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-draw-stats.patch
+          git -C extern/aurora apply ../../platforms/android/quest1/aurora-marker-clear.patch
+          git -C extern/aurora apply ../../platforms/android/quest1/aurora-upload-snapshot.patch
 
       - name: Install dependencies
         run: |
