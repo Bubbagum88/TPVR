@@ -1819,6 +1819,7 @@ public:
             vkResetFences(xrDevice_, 1, &s.copyFence);
             s.copyPending = false;
             spaceWarpDebugReadbackLog(slotIndex);  // TEMP diagnostic, no-op unless pending
+            pixelCheckLogXr(slotIndex);            // Quest 1 diagnostic, no-op unless pending
         }
 
         // Dawn's Vulkan backend REQUIRES this chained struct (found via a
@@ -2012,6 +2013,10 @@ public:
         VkSemaphore waits[3];
         uint32_t waitCount = 0;
         bool needCpuWait = false;
+        const bool pixelCheckThisFrame = (pixelCheckFrame_++ % kPixelCheckInterval) == 0;
+        if (pixelCheckThisFrame) {
+            pixelCheckDawn(s.texture, width, height);
+        }
         {
             // The color slot predates ExportedImage; adapt its fields in place.
             ExportedImage color;
@@ -2094,6 +2099,9 @@ public:
         VkImageMemoryBarrier toTransferBarriers[] = {srcToTransfer, dstToTransfer};
         vkCmdPipelineBarrier(s.cmdBuf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                              nullptr, 0, nullptr, 2, toTransferBarriers);
+        if (pixelCheckThisFrame) {
+            pixelCheckRecordXr(s.cmdBuf, s.xrImage, width, height, sharedFrameSlot_);
+        }
 
         // vkCmdBlitImage, NOT vkCmdCopyImage. Measured on a Quest 3 (Adreno,
         // 2026-09-19) with per-call timing: vkCmdCopyImage into the runtime's
@@ -2891,6 +2899,168 @@ struct FsOut {
         // MV image + depth bytes to a host-visible buffer; logged once the
         // slot's fence is waited on (spaceWarpDebugReadbackLog()).
         spaceWarpDebugRecordReadback(cmdBuf, sw, slotIndexOf(sw));
+    }
+
+    // ---- Quest 1 DIAGNOSTIC: does the picture survive the hand-off? ----
+    // Every kPixelCheckInterval frames, the same few pixels of the shared
+    // image are read twice: by Dawn just before EndAccess (what the game
+    // drew), and on the XR device after the acquire barrier, right before
+    // the blit into the swapchain (what the headset side sees). Colour on
+    // the Dawn side but zeros on the XR side = the shared memory isn't
+    // shared; zeros on both = nothing was drawn. Logs to dusklight_vr.
+    static constexpr uint32_t kPixelCheckInterval = 120;
+    static constexpr uint32_t kPixelCheckPoints = 3;
+    struct PixelCheckPoint {
+        const char* name;
+        uint32_t x, y;
+    };
+    static void pixelCheckPoints(uint32_t width, uint32_t height, PixelCheckPoint out[kPixelCheckPoints]) {
+        out[0] = {"L-center", width / 4, height / 2};
+        out[1] = {"R-center", width / 4 * 3, height / 2};
+        out[2] = {"L-upper", width / 4, height / 4};
+    }
+    void pixelCheckDawn(const wgpu::Texture& texture, uint32_t width, uint32_t height) {
+        // 256-byte spacing: one texel per copy, each at an aligned offset.
+        const uint64_t bufSize = 256ull * kPixelCheckPoints;
+        if (!pixelCheckDawnBuf_) {
+            wgpu::BufferDescriptor bd{};
+            bd.label = "vr pixel check";
+            bd.size = bufSize;
+            bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+            pixelCheckDawnBuf_ = aurora::webgpu::g_device.CreateBuffer(&bd);
+        }
+        PixelCheckPoint pts[kPixelCheckPoints];
+        pixelCheckPoints(width, height, pts);
+        wgpu::CommandEncoder enc = aurora::webgpu::g_device.CreateCommandEncoder();
+        for (uint32_t i = 0; i < kPixelCheckPoints; ++i) {
+            wgpu::TexelCopyTextureInfo src{};
+            src.texture = texture;
+            src.origin = {pts[i].x, pts[i].y, 0};
+            src.aspect = wgpu::TextureAspect::All;
+            wgpu::TexelCopyBufferInfo dst{};
+            dst.buffer = pixelCheckDawnBuf_;
+            dst.layout.offset = 256ull * i;
+            dst.layout.bytesPerRow = 256;
+            dst.layout.rowsPerImage = 1;
+            wgpu::Extent3D extent{1, 1, 1};
+            enc.CopyTextureToBuffer(&src, &dst, &extent);
+        }
+        wgpu::CommandBuffer cmd = enc.Finish();
+        aurora::webgpu::g_queue.Submit(1, &cmd);
+
+        bool mapDone = false;
+        bool mapOk = false;
+        const auto future = pixelCheckDawnBuf_.MapAsync(
+            wgpu::MapMode::Read, 0, bufSize, wgpu::CallbackMode::WaitAnyOnly,
+            [&mapDone, &mapOk](wgpu::MapAsyncStatus status, wgpu::StringView /*message*/) {
+                mapDone = true;
+                mapOk = (status == wgpu::MapAsyncStatus::Success);
+            });
+        aurora::webgpu::g_instance.WaitAny(future, 1000000000);
+        char msg[512];
+        int off = duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN side:", pixelCheckFrame_ / kPixelCheckInterval);
+        if (!mapDone || !mapOk) {
+            duskVrSnprintf(msg + off, sizeof(msg) - off, " ERROR: MapAsync failed/timed out (done=%d ok=%d)\n", mapDone, mapOk);
+            duskVrLog(msg);
+            return;
+        }
+        const auto* bytes = static_cast<const uint8_t*>(pixelCheckDawnBuf_.GetConstMappedRange(0, bufSize));
+        for (uint32_t i = 0; i < kPixelCheckPoints; ++i) {
+            const uint8_t* p = bytes + 256 * i;
+            off += duskVrSnprintf(msg + off, sizeof(msg) - off, " %s(%u,%u)=%u,%u,%u,%u;", pts[i].name, pts[i].x,
+                                  pts[i].y, p[0], p[1], p[2], p[3]);
+        }
+        duskVrSnprintf(msg + off, sizeof(msg) - off, "\n");
+        duskVrLog(msg);
+        pixelCheckDawnBuf_.Unmap();
+    }
+    void pixelCheckRecordXr(VkCommandBuffer cmdBuf, VkImage image, uint32_t width, uint32_t height, uint32_t slot) {
+        if (pixelCheckXrPendingSlot_ != UINT32_MAX) {
+            return;  // previous check not logged yet
+        }
+        const VkDeviceSize bufSize = 4ull * kPixelCheckPoints;
+        if (pixelCheckXrBuf_ == VK_NULL_HANDLE) {
+            VkBufferCreateInfo bufCI{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bufCI.size = bufSize;
+            bufCI.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            if (vkCreateBuffer(xrDevice_, &bufCI, nullptr, &pixelCheckXrBuf_) != VK_SUCCESS) {
+                duskVrLog("[dusk::vr] pixel check XR side: ERROR: vkCreateBuffer failed\n");
+                return;
+            }
+            VkMemoryRequirements memReq{};
+            vkGetBufferMemoryRequirements(xrDevice_, pixelCheckXrBuf_, &memReq);
+            VkPhysicalDeviceMemoryProperties memProps{};
+            vkGetPhysicalDeviceMemoryProperties(xrPhysicalDevice_, &memProps);
+            uint32_t memTypeIndex = UINT32_MAX;
+            const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((memReq.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & required) == required) {
+                    memTypeIndex = i;
+                    break;
+                }
+            }
+            VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocInfo.allocationSize = memReq.size;
+            allocInfo.memoryTypeIndex = memTypeIndex;
+            if (memTypeIndex == UINT32_MAX ||
+                vkAllocateMemory(xrDevice_, &allocInfo, nullptr, &pixelCheckXrMemory_) != VK_SUCCESS) {
+                duskVrLog("[dusk::vr] pixel check XR side: ERROR: no host-visible memory for the readback\n");
+                vkDestroyBuffer(xrDevice_, pixelCheckXrBuf_, nullptr);
+                pixelCheckXrBuf_ = VK_NULL_HANDLE;
+                return;
+            }
+            vkBindBufferMemory(xrDevice_, pixelCheckXrBuf_, pixelCheckXrMemory_, 0);
+        }
+        PixelCheckPoint pts[kPixelCheckPoints];
+        pixelCheckPoints(width, height, pts);
+        VkBufferImageCopy regions[kPixelCheckPoints]{};
+        for (uint32_t i = 0; i < kPixelCheckPoints; ++i) {
+            regions[i].bufferOffset = 4ull * i;
+            regions[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            regions[i].imageSubresource.layerCount = 1;
+            regions[i].imageOffset = {static_cast<int32_t>(pts[i].x), static_cast<int32_t>(pts[i].y), 0};
+            regions[i].imageExtent = {1, 1, 1};
+        }
+        // The image is in TRANSFER_SRC_OPTIMAL here (the acquire barrier above).
+        vkCmdCopyImageToBuffer(cmdBuf, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pixelCheckXrBuf_,
+                               kPixelCheckPoints, regions);
+        VkBufferMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        hostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostBarrier.buffer = pixelCheckXrBuf_;
+        hostBarrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                             &hostBarrier, 0, nullptr);
+        pixelCheckXrPendingSlot_ = slot;
+        pixelCheckXrWidth_ = width;
+        pixelCheckXrHeight_ = height;
+    }
+    void pixelCheckLogXr(uint32_t slot) {
+        if (pixelCheckXrPendingSlot_ != slot) {
+            return;
+        }
+        pixelCheckXrPendingSlot_ = UINT32_MAX;
+        void* mapped = nullptr;
+        if (vkMapMemory(xrDevice_, pixelCheckXrMemory_, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+            duskVrLog("[dusk::vr] pixel check XR side: ERROR: vkMapMemory failed\n");
+            return;
+        }
+        PixelCheckPoint pts[kPixelCheckPoints];
+        pixelCheckPoints(pixelCheckXrWidth_, pixelCheckXrHeight_, pts);
+        const auto* bytes = static_cast<const uint8_t*>(mapped);
+        char msg[512];
+        int off = duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check XR side (before blit):");
+        for (uint32_t i = 0; i < kPixelCheckPoints; ++i) {
+            const uint8_t* p = bytes + 4 * i;
+            off += duskVrSnprintf(msg + off, sizeof(msg) - off, " %s(%u,%u)=%u,%u,%u,%u;", pts[i].name, pts[i].x,
+                                  pts[i].y, p[0], p[1], p[2], p[3]);
+        }
+        duskVrSnprintf(msg + off, sizeof(msg) - off, "\n");
+        duskVrLog(msg);
+        vkUnmapMemory(xrDevice_, pixelCheckXrMemory_);
     }
 
     // ---- TEMP DIAGNOSTIC: readback of a few MV/depth texels ----
@@ -4036,6 +4206,14 @@ private:
     VkDeviceMemory swDebugReadbackMemory_ = VK_NULL_HANDLE;
     uint32_t swDebugPendingSlot_ = UINT32_MAX;
     uint32_t swDebugFramesLogged_ = 0;
+    // Quest 1 pixel-check diagnostic (see pixelCheckDawn()).
+    uint32_t pixelCheckFrame_ = 0;
+    wgpu::Buffer pixelCheckDawnBuf_;
+    VkBuffer pixelCheckXrBuf_ = VK_NULL_HANDLE;
+    VkDeviceMemory pixelCheckXrMemory_ = VK_NULL_HANDLE;
+    uint32_t pixelCheckXrPendingSlot_ = UINT32_MAX;
+    uint32_t pixelCheckXrWidth_ = 0;
+    uint32_t pixelCheckXrHeight_ = 0;
 #else
     // --- fence sync state ---
     Microsoft::WRL::ComPtr<ID3D12Device> xrDevice_;

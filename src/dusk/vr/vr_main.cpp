@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -893,6 +894,183 @@ void getHeadAimAngles(s16* outYawS, s16* outPitchS) {
     *outPitchS = g_headAimPitchS;
 }
 
+#if DUSK_VR_XR_GRAPHICS_VULKAN
+// Quest 1 diagnostic: what does the driver report for arrayLength() in a
+// VERTEX shader that binds two storage buffers the way Aurora's GX shader
+// does (binding 0 vertex-only, binding 1 vertex+fragment) and queries both?
+// One point is drawn into a 1x1 RG32Uint target; the vertex shader passes
+// both lengths through to the fragment shader, which writes them out. The
+// target is cleared to 0xDEAD first, so "never drawn" can't look like 0.
+// Logs to dusklight_vr; runs once, changes nothing.
+static void probeVertexArrayLength() {
+    using namespace aurora::webgpu;
+    constexpr uint32_t kWordsA = 1024;  // 4 KiB
+    constexpr uint32_t kWordsB = 2048;  // 8 KiB
+    constexpr uint32_t kSentinel = 0xDEAD;
+
+    g_device.PushErrorScope(wgpu::ErrorFilter::Validation);
+
+    const char* code = R"(
+@group(0) @binding(0) var<storage, read> a: array<u32>;
+@group(0) @binding(1) var<storage, read> b: array<u32>;
+struct VOut {
+    @builtin(position) pos: vec4f,
+    @location(0) @interpolate(flat, either) lens: vec2u,
+};
+@vertex fn vs() -> VOut {
+    var o: VOut;
+    o.pos = vec4f(0.0, 0.0, 0.0, 1.0);
+    o.lens = vec2u(arrayLength(&a), arrayLength(&b));
+    return o;
+}
+@fragment fn fs(i: VOut) -> @location(0) vec2u {
+    return i.lens;
+}
+)";
+    wgpu::ShaderSourceWGSL wgsl{};
+    wgsl.code = code;
+    wgpu::ShaderModuleDescriptor smDesc{};
+    smDesc.nextInChain = &wgsl;
+    smDesc.label = "vr arrayLength probe";
+    const wgpu::ShaderModule module = g_device.CreateShaderModule(&smDesc);
+
+    wgpu::BindGroupLayoutEntry bglEntries[2]{};
+    bglEntries[0].binding = 0;
+    bglEntries[0].visibility = wgpu::ShaderStage::Vertex;
+    bglEntries[0].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    bglEntries[1].binding = 1;
+    bglEntries[1].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
+    bglEntries[1].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    wgpu::BindGroupLayoutDescriptor bglDesc{};
+    bglDesc.entryCount = 2;
+    bglDesc.entries = bglEntries;
+    const wgpu::BindGroupLayout bgl = g_device.CreateBindGroupLayout(&bglDesc);
+
+    wgpu::PipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayoutCount = 1;
+    plDesc.bindGroupLayouts = &bgl;
+    const wgpu::PipelineLayout pl = g_device.CreatePipelineLayout(&plDesc);
+
+    wgpu::ColorTargetState target{};
+    target.format = wgpu::TextureFormat::RG32Uint;
+    wgpu::FragmentState frag{};
+    frag.module = module;
+    frag.entryPoint = "fs";
+    frag.targetCount = 1;
+    frag.targets = &target;
+    wgpu::RenderPipelineDescriptor rpDesc{};
+    rpDesc.label = "vr arrayLength probe";
+    rpDesc.layout = pl;
+    rpDesc.vertex.module = module;
+    rpDesc.vertex.entryPoint = "vs";
+    rpDesc.primitive.topology = wgpu::PrimitiveTopology::PointList;
+    rpDesc.fragment = &frag;
+    const wgpu::RenderPipeline pipeline = g_device.CreateRenderPipeline(&rpDesc);
+
+    wgpu::BufferDescriptor bufA{};
+    bufA.size = kWordsA * 4;
+    bufA.usage = wgpu::BufferUsage::Storage;
+    const wgpu::Buffer a = g_device.CreateBuffer(&bufA);
+    wgpu::BufferDescriptor bufB{};
+    bufB.size = kWordsB * 4;
+    bufB.usage = wgpu::BufferUsage::Storage;
+    const wgpu::Buffer b = g_device.CreateBuffer(&bufB);
+    wgpu::BindGroupEntry bgEntries[2]{};
+    bgEntries[0].binding = 0;
+    bgEntries[0].buffer = a;
+    bgEntries[0].size = bufA.size;
+    bgEntries[1].binding = 1;
+    bgEntries[1].buffer = b;
+    bgEntries[1].size = bufB.size;
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = bgl;
+    bgDesc.entryCount = 2;
+    bgDesc.entries = bgEntries;
+    const wgpu::BindGroup bg = g_device.CreateBindGroup(&bgDesc);
+
+    wgpu::TextureDescriptor texDesc{};
+    texDesc.size = {1, 1, 1};
+    texDesc.format = wgpu::TextureFormat::RG32Uint;
+    texDesc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+    const wgpu::Texture tex = g_device.CreateTexture(&texDesc);
+    wgpu::BufferDescriptor readDesc{};
+    readDesc.size = 256;
+    readDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    const wgpu::Buffer readback = g_device.CreateBuffer(&readDesc);
+
+    wgpu::RenderPassColorAttachment color{};
+    color.view = tex.CreateView();
+    color.loadOp = wgpu::LoadOp::Clear;
+    color.storeOp = wgpu::StoreOp::Store;
+    color.clearValue = {kSentinel, kSentinel, 0, 0};
+    wgpu::RenderPassDescriptor passDesc{};
+    passDesc.colorAttachmentCount = 1;
+    passDesc.colorAttachments = &color;
+    wgpu::CommandEncoder enc = g_device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&passDesc);
+    pass.SetPipeline(pipeline);
+    pass.SetBindGroup(0, bg);
+    pass.Draw(1);
+    pass.End();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = tex;
+    wgpu::TexelCopyBufferInfo dst{};
+    dst.buffer = readback;
+    dst.layout.bytesPerRow = 256;
+    dst.layout.rowsPerImage = 1;
+    wgpu::Extent3D extent{1, 1, 1};
+    enc.CopyTextureToBuffer(&src, &dst, &extent);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    g_queue.Submit(1, &cmd);
+
+    bool scopeDone = false;
+    bool scopeFailed = false;
+    std::string scopeMessage;
+    const auto scopeFuture = g_device.PopErrorScope(
+        wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView message) {
+            scopeDone = true;
+            if (status != wgpu::PopErrorScopeStatus::Success || type != wgpu::ErrorType::NoError) {
+                scopeFailed = true;
+                scopeMessage = std::string{std::string_view{message}};
+            }
+        });
+    g_instance.WaitAny(scopeFuture, 5000000000);
+    if (!scopeDone || scopeFailed) {
+        char msg[640];
+        duskVrSnprintf(msg, sizeof(msg), "[dusk::vr::check] arrayLength probe: ERROR: Dawn rejected it (%s)\n",
+                       scopeDone ? scopeMessage.c_str() : "PopErrorScope timed out");
+        duskVrLog(msg);
+        return;
+    }
+
+    bool mapDone = false;
+    bool mapOk = false;
+    const auto mapFuture = readback.MapAsync(wgpu::MapMode::Read, 0, 256, wgpu::CallbackMode::WaitAnyOnly,
+                                             [&](wgpu::MapAsyncStatus status, wgpu::StringView /*message*/) {
+                                                 mapDone = true;
+                                                 mapOk = (status == wgpu::MapAsyncStatus::Success);
+                                             });
+    g_instance.WaitAny(mapFuture, 5000000000);
+    if (!mapDone || !mapOk) {
+        duskVrLog("[dusk::vr::check] arrayLength probe: ERROR: readback MapAsync failed/timed out\n");
+        return;
+    }
+    uint32_t got[2];
+    std::memcpy(got, readback.GetConstMappedRange(0, 8), 8);
+    readback.Unmap();
+    const char* verdict = (got[0] == kWordsA && got[1] == kWordsB) ? "OK"
+                          : (got[0] == kSentinel && got[1] == kSentinel)
+                              ? "ERROR: the point was never drawn"
+                              : "ERROR: wrong length";
+    char msg[256];
+    duskVrSnprintf(msg, sizeof(msg),
+                   "[dusk::vr::check] arrayLength probe (vertex stage): a=%u b=%u, expected %u %u -- %s\n", got[0],
+                   got[1], kWordsA, kWordsB, verdict);
+    duskVrLog(msg);
+}
+#endif
+
 // Call once at startup, after an aurora::gfx device exists (per the
 // existing TODO in initSession() -- same timing requirement applies here).
 // Returns false on any XR/D3D12 setup failure; caller should proceed
@@ -1314,6 +1492,9 @@ bool startup() {
         }
         VrLog.info("startup succeeded: runtime={} swapchain={}x{} dxgiFormat={}",
                    sysProps.systemName, eyeWidth * 2, eyeHeight, dxgiFormat);
+#if DUSK_VR_XR_GRAPHICS_VULKAN
+        probeVertexArrayLength();
+#endif
 
         // Phase 1 of the VR-controller-drives-the-Dusklight-menu feature
         // (see vr_menu_gamepad.hpp's own header comment) -- attach once
@@ -4043,8 +4224,43 @@ void submitFrame() {
     endInfo.layerCount = 1;
     endInfo.layers = layers;
 
-    if (XR_FAILED(xrEndFrame(g_session->session(), &endInfo))) {
-        duskVrLog("[dusk::vr::submitFrame] FAILED: xrEndFrame\n");
+    // Quest 1 diagnostic: every 120 frames, log what goes to the compositor
+    // (the projection layer's views: pose, field of view, swapchain rect),
+    // with an ERROR when something in it can't show anything.
+    static uint32_t s_layerCheckFrame = 0;
+    if (s_layerCheckFrame++ % 120 == 0) {
+        char msg[768];
+        int off = duskVrSnprintf(msg, sizeof(msg), "[dusk::vr::submitFrame] layer check: viewCount=%u",
+                                 g_pendingSubmit.viewCount);
+        bool bad = g_pendingSubmit.viewCount == 0;
+        for (uint32_t eye = 0; eye < g_pendingSubmit.viewCount && eye < 2; ++eye) {
+            const XrCompositionLayerProjectionView& v = g_pendingSubmit.projViews[eye];
+            const XrRect2Di& r = v.subImage.imageRect;
+            const XrQuaternionf& q = v.pose.orientation;
+            const float qLen = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+            if (v.subImage.swapchain == XR_NULL_HANDLE || r.extent.width <= 0 || r.extent.height <= 0 ||
+                qLen < 0.9f || qLen > 1.1f) {
+                bad = true;
+            }
+            off += duskVrSnprintf(msg + off, sizeof(msg) - off,
+                                  " | eye%u pos=(%.2f,%.2f,%.2f) quatLen2=%.3f fov=(%.2f,%.2f,%.2f,%.2f) "
+                                  "rect=(%d,%d %dx%d) swapchain=%s",
+                                  eye, v.pose.position.x, v.pose.position.y, v.pose.position.z, qLen,
+                                  v.fov.angleLeft, v.fov.angleRight, v.fov.angleUp, v.fov.angleDown, r.offset.x,
+                                  r.offset.y, r.extent.width, r.extent.height,
+                                  v.subImage.swapchain == XR_NULL_HANDLE ? "NULL" : "ok");
+        }
+        duskVrSnprintf(msg + off, sizeof(msg) - off, "%s\n",
+                       bad ? " -- ERROR: this layer can't show anything" : "");
+        duskVrLog(msg);
+    }
+
+    const XrResult endResult = xrEndFrame(g_session->session(), &endInfo);
+    if (XR_FAILED(endResult)) {
+        char msg[96];
+        duskVrSnprintf(msg, sizeof(msg), "[dusk::vr::submitFrame] FAILED: xrEndFrame, XrResult=%d\n",
+                       static_cast<int>(endResult));
+        duskVrLog(msg);
     }
 
     // Model-replay stats accumulate every frame; nothing logs them anymore,
