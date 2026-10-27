@@ -37,6 +37,7 @@
 #include "dusk/settings.h"                      // dusk::getSettings().game.vrDesktopMirror
 #include "dusk/logging.h"                       // DuskLog
 #include <aurora/lib/thread.hpp>                // aurora::thread::native_thread_id_for -- Quest thread hints
+#include <aurora/lib/gfx/resources.hpp>         // aurora::gfx::detail::resources -- Quest 1 GX buffer probe
 #if defined(__ANDROID__)
 #include <unistd.h>                             // gettid()
 #endif
@@ -1151,6 +1152,152 @@ struct FOut {
                    kTagB + kImmLast, immVerdict);
     duskVrLog(msg);
 }
+
+// Quest 1 diagnostic: arrayLength() of the game's OWN GX buffers, through
+// the very bind group GX draws use (the 10 MiB vertex buffer and 8 MiB
+// storage buffer, bound whole). The GX shader only reads a word when its
+// index is below arrayLength(), so a wrong length here means every vertex
+// reads as 0. Reads lengths only; writes nothing to the game's buffers.
+static void probeGxBufferLengths() {
+    using namespace aurora::webgpu;
+    const auto& res = aurora::gfx::detail::resources();
+    if (!res.staticBindGroup || !res.staticBindGroupLayout) {
+        duskVrLog("[dusk::vr::check] GX buffer probe: ERROR: Aurora's GX bind group doesn't exist yet\n");
+        return;
+    }
+    constexpr uint32_t kSentinel = 0xDEAD;
+    const uint32_t expectV = static_cast<uint32_t>(res.vertexBuffer.GetSize() / 4);
+    const uint32_t expectS = static_cast<uint32_t>(res.storageBuffer.GetSize() / 4);
+
+    g_device.PushErrorScope(wgpu::ErrorFilter::Validation);
+
+    const char* code = R"(
+@group(0) @binding(0) var<storage, read> vbuf: array<u32>;
+@group(0) @binding(1) var<storage, read> abuf: array<u32>;
+struct VOut {
+    @builtin(position) pos: vec4f,
+    @location(0) @interpolate(flat, either) lens: vec4u,
+};
+@vertex fn vs() -> VOut {
+    var o: VOut;
+    o.pos = vec4f(0.0, 0.0, 0.0, 1.0);
+    o.lens = vec4u(arrayLength(&vbuf), arrayLength(&abuf), 0u, 0u);
+    return o;
+}
+@fragment fn fs(i: VOut) -> @location(0) vec4u {
+    return i.lens;
+}
+)";
+    wgpu::ShaderSourceWGSL wgsl{};
+    wgsl.code = code;
+    wgpu::ShaderModuleDescriptor smDesc{};
+    smDesc.nextInChain = &wgsl;
+    smDesc.label = "vr GX buffer probe";
+    const wgpu::ShaderModule module = g_device.CreateShaderModule(&smDesc);
+
+    wgpu::PipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayoutCount = 1;
+    plDesc.bindGroupLayouts = &res.staticBindGroupLayout;
+    const wgpu::PipelineLayout pl = g_device.CreatePipelineLayout(&plDesc);
+
+    wgpu::ColorTargetState target{};
+    target.format = wgpu::TextureFormat::RGBA32Uint;
+    wgpu::FragmentState frag{};
+    frag.module = module;
+    frag.entryPoint = "fs";
+    frag.targetCount = 1;
+    frag.targets = &target;
+    wgpu::RenderPipelineDescriptor rpDesc{};
+    rpDesc.label = "vr GX buffer probe";
+    rpDesc.layout = pl;
+    rpDesc.vertex.module = module;
+    rpDesc.vertex.entryPoint = "vs";
+    rpDesc.primitive.topology = wgpu::PrimitiveTopology::PointList;
+    rpDesc.fragment = &frag;
+    const wgpu::RenderPipeline pipeline = g_device.CreateRenderPipeline(&rpDesc);
+
+    wgpu::TextureDescriptor texDesc{};
+    texDesc.size = {1, 1, 1};
+    texDesc.format = wgpu::TextureFormat::RGBA32Uint;
+    texDesc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+    const wgpu::Texture tex = g_device.CreateTexture(&texDesc);
+    wgpu::BufferDescriptor readDesc{};
+    readDesc.size = 256;
+    readDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    const wgpu::Buffer readback = g_device.CreateBuffer(&readDesc);
+
+    wgpu::RenderPassColorAttachment color{};
+    color.view = tex.CreateView();
+    color.loadOp = wgpu::LoadOp::Clear;
+    color.storeOp = wgpu::StoreOp::Store;
+    color.clearValue = {kSentinel, kSentinel, kSentinel, kSentinel};
+    wgpu::RenderPassDescriptor passDesc{};
+    passDesc.colorAttachmentCount = 1;
+    passDesc.colorAttachments = &color;
+    wgpu::CommandEncoder enc = g_device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&passDesc);
+    pass.SetPipeline(pipeline);
+    pass.SetBindGroup(0, res.staticBindGroup);
+    pass.Draw(1);
+    pass.End();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = tex;
+    wgpu::TexelCopyBufferInfo dst{};
+    dst.buffer = readback;
+    dst.layout.bytesPerRow = 256;
+    dst.layout.rowsPerImage = 1;
+    wgpu::Extent3D extent{1, 1, 1};
+    enc.CopyTextureToBuffer(&src, &dst, &extent);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    g_queue.Submit(1, &cmd);
+
+    bool scopeDone = false;
+    bool scopeFailed = false;
+    std::string scopeMessage;
+    const auto scopeFuture = g_device.PopErrorScope(
+        wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView message) {
+            scopeDone = true;
+            if (status != wgpu::PopErrorScopeStatus::Success || type != wgpu::ErrorType::NoError) {
+                scopeFailed = true;
+                scopeMessage = std::string{std::string_view{message}};
+            }
+        });
+    g_instance.WaitAny(scopeFuture, 5000000000);
+    if (!scopeDone || scopeFailed) {
+        char msg[640];
+        duskVrSnprintf(msg, sizeof(msg), "[dusk::vr::check] GX buffer probe: ERROR: Dawn rejected it (%s)\n",
+                       scopeDone ? scopeMessage.c_str() : "PopErrorScope timed out");
+        duskVrLog(msg);
+        return;
+    }
+
+    bool mapDone = false;
+    bool mapOk = false;
+    const auto mapFuture = readback.MapAsync(wgpu::MapMode::Read, 0, 256, wgpu::CallbackMode::WaitAnyOnly,
+                                             [&](wgpu::MapAsyncStatus status, wgpu::StringView /*message*/) {
+                                                 mapDone = true;
+                                                 mapOk = (status == wgpu::MapAsyncStatus::Success);
+                                             });
+    g_instance.WaitAny(mapFuture, 5000000000);
+    if (!mapDone || !mapOk) {
+        duskVrLog("[dusk::vr::check] GX buffer probe: ERROR: readback MapAsync failed/timed out\n");
+        return;
+    }
+    uint32_t got[2];
+    std::memcpy(got, readback.GetConstMappedRange(0, 8), 8);
+    readback.Unmap();
+    const char* verdict = (got[0] == expectV && got[1] == expectS) ? "OK"
+                          : (got[0] == kSentinel && got[1] == kSentinel)
+                              ? "ERROR: the point was never drawn"
+                              : "ERROR: wrong length (GX vertex reads past it return 0)";
+    char msg[320];
+    duskVrSnprintf(msg, sizeof(msg),
+                   "[dusk::vr::check] GX buffer probe (game's own bind group): arrayLength vbuf=%u abuf=%u "
+                   "(expected %u %u) -- %s\n",
+                   got[0], got[1], expectV, expectS, verdict);
+    duskVrLog(msg);
+}
 #endif
 
 // Call once at startup, after an aurora::gfx device exists (per the
@@ -1576,6 +1723,7 @@ bool startup() {
                    sysProps.systemName, eyeWidth * 2, eyeHeight, dxgiFormat);
 #if DUSK_VR_XR_GRAPHICS_VULKAN
         probeVertexArrayLength();
+        probeGxBufferLengths();
 #endif
 
         // Phase 1 of the VR-controller-drives-the-Dusklight-menu feature
