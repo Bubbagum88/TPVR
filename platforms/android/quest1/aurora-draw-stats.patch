@@ -1,0 +1,36 @@
+diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
+index f0e4207..7ecf689 100644
+--- a/lib/gx/pipeline.cpp
++++ b/lib/gx/pipeline.cpp
+@@ -10,8 +10,20 @@
+ 
+ #include <tracy/Tracy.hpp>
+ 
++#include <atomic>
++
+ namespace aurora::gx {
+ 
++// Quest 1 diagnostic: GX draws actually issued vs. skipped because their
++// pipeline wasn't compiled yet. Read and reset by the VR layer check.
++static std::atomic<uint32_t> g_drawsIssued{0};
++static std::atomic<uint32_t> g_drawsSkipped{0};
++
++void take_draw_stats(uint32_t& issued, uint32_t& skipped) {
++  issued = g_drawsIssued.exchange(0);
++  skipped = g_drawsSkipped.exchange(0);
++}
++
+ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+   ZoneScoped;
+   const auto shader = build_shader(config.shaderConfig, layout);
+@@ -22,8 +34,10 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+ 
+ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+   if (!gfx::bind_pipeline(data.pipeline, pass)) {
++    g_drawsSkipped.fetch_add(1, std::memory_order_relaxed);
+     return;
+   }
++  g_drawsIssued.fetch_add(1, std::memory_order_relaxed);
+ 
+   const auto& resources = gfx::detail::resources();
+   DrawImmediateData immediates = data.immediateData;

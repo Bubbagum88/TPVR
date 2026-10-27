@@ -2945,6 +2945,39 @@ struct FsOut {
             wgpu::Extent3D extent{1, 1, 1};
             enc.CopyTextureToBuffer(&src, &dst, &extent);
         }
+        // Whole image too: how many pixels are not the 0,0,0,0 clear value,
+        // and where. 4 bytes per texel; rows padded to 256 bytes.
+        const wgpu::TextureFormat fmt = texture.GetFormat();
+        const bool fourByte = fmt == wgpu::TextureFormat::RGBA8Unorm || fmt == wgpu::TextureFormat::RGBA8UnormSrgb ||
+                              fmt == wgpu::TextureFormat::BGRA8Unorm || fmt == wgpu::TextureFormat::BGRA8UnormSrgb;
+        if (!fourByte) {
+            char fmtMsg[160];
+            duskVrSnprintf(fmtMsg, sizeof(fmtMsg),
+                           "[dusk::vr] pixel check: ERROR: eye image format %d is not 4 bytes per pixel, whole-image check skipped\n",
+                           static_cast<int>(fmt));
+            duskVrLog(fmtMsg);
+        }
+        const uint32_t fullRow = (width * 4 + 255) / 256 * 256;
+        const uint64_t fullSize = uint64_t(fullRow) * height;
+        if (fourByte && (!pixelCheckFullBuf_ || pixelCheckFullSize_ != fullSize)) {
+            wgpu::BufferDescriptor bd{};
+            bd.label = "vr pixel check full";
+            bd.size = fullSize;
+            bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+            pixelCheckFullBuf_ = aurora::webgpu::g_device.CreateBuffer(&bd);
+            pixelCheckFullSize_ = fullSize;
+        }
+        if (fourByte) {
+            wgpu::TexelCopyTextureInfo src{};
+            src.texture = texture;
+            src.aspect = wgpu::TextureAspect::All;
+            wgpu::TexelCopyBufferInfo dst{};
+            dst.buffer = pixelCheckFullBuf_;
+            dst.layout.bytesPerRow = fullRow;
+            dst.layout.rowsPerImage = height;
+            wgpu::Extent3D extent{width, height, 1};
+            enc.CopyTextureToBuffer(&src, &dst, &extent);
+        }
         wgpu::CommandBuffer cmd = enc.Finish();
         aurora::webgpu::g_queue.Submit(1, &cmd);
 
@@ -2973,6 +3006,52 @@ struct FsOut {
         duskVrSnprintf(msg + off, sizeof(msg) - off, "\n");
         duskVrLog(msg);
         pixelCheckDawnBuf_.Unmap();
+        if (!fourByte) {
+            return;
+        }
+
+        bool fullDone = false;
+        bool fullOk = false;
+        const auto fullFuture = pixelCheckFullBuf_.MapAsync(
+            wgpu::MapMode::Read, 0, fullSize, wgpu::CallbackMode::WaitAnyOnly,
+            [&fullDone, &fullOk](wgpu::MapAsyncStatus status, wgpu::StringView /*message*/) {
+                fullDone = true;
+                fullOk = (status == wgpu::MapAsyncStatus::Success);
+            });
+        aurora::webgpu::g_instance.WaitAny(fullFuture, 1000000000);
+        if (!fullDone || !fullOk) {
+            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN whole image: ERROR: MapAsync failed/timed out (done=%d ok=%d)\n",
+                       pixelCheckFrame_ / kPixelCheckInterval, fullDone, fullOk);
+            duskVrLog(msg);
+            return;
+        }
+        const auto* full = static_cast<const uint8_t*>(pixelCheckFullBuf_.GetConstMappedRange(0, fullSize));
+        uint64_t drawn = 0;
+        uint32_t minX = UINT32_MAX, minY = UINT32_MAX, maxX = 0, maxY = 0;
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* row = full + uint64_t(fullRow) * y;
+            for (uint32_t x = 0; x < width; ++x) {
+                const uint8_t* t = row + x * 4;
+                if (t[0] | t[1] | t[2] | t[3]) {
+                    ++drawn;
+                    minX = std::min(minX, x);
+                    minY = std::min(minY, y);
+                    maxX = std::max(maxX, x);
+                    maxY = std::max(maxY, y);
+                }
+            }
+        }
+        pixelCheckFullBuf_.Unmap();
+        if (drawn == 0) {
+            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN whole image %ux%u: 0 pixels differ from the clear value"
+                       " -- ERROR: nothing was drawn into the eye image\n",
+                       pixelCheckFrame_ / kPixelCheckInterval, width, height);
+        } else {
+            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr] pixel check #%u DAWN whole image %ux%u: %llu pixels drawn, within x %u-%u, y %u-%u\n",
+                       pixelCheckFrame_ / kPixelCheckInterval, width, height, (unsigned long long)drawn, minX, maxX,
+                       minY, maxY);
+        }
+        duskVrLog(msg);
     }
     void pixelCheckRecordXr(VkCommandBuffer cmdBuf, VkImage image, uint32_t width, uint32_t height, uint32_t slot) {
         if (pixelCheckXrPendingSlot_ != UINT32_MAX) {
@@ -4209,6 +4288,8 @@ private:
     // Quest 1 pixel-check diagnostic (see pixelCheckDawn()).
     uint32_t pixelCheckFrame_ = 0;
     wgpu::Buffer pixelCheckDawnBuf_;
+    wgpu::Buffer pixelCheckFullBuf_;
+    uint64_t pixelCheckFullSize_ = 0;
     VkBuffer pixelCheckXrBuf_ = VK_NULL_HANDLE;
     VkDeviceMemory pixelCheckXrMemory_ = VK_NULL_HANDLE;
     uint32_t pixelCheckXrPendingSlot_ = UINT32_MAX;

@@ -54,6 +54,11 @@
 #include "dusk/vr/vr_menu_gamepad.hpp"          // dusk::vr::ensureVrMenuGamepadAttached, etc.
 #include "dusk/vr/vr_main.hpp"
 
+namespace aurora::gx {
+// Quest 1 diagnostic counters (Aurora patch aurora-draw-stats.patch).
+void take_draw_stats(uint32_t& issued, uint32_t& skipped);
+}  // namespace aurora::gx
+
 // TEMP DIAGNOSTIC (VR black-screen-after-save investigation): plain,
 // unmangled, non-namespaced global mirroring g_renderedToHeadsetThisFrame
 // below, purely so it can be used as a Visual Studio conditional-breakpoint
@@ -895,36 +900,71 @@ void getHeadAimAngles(s16* outYawS, s16* outPitchS) {
 }
 
 #if DUSK_VR_XR_GRAPHICS_VULKAN
-// Quest 1 diagnostic: what does the driver report for arrayLength() in a
-// VERTEX shader that binds two storage buffers the way Aurora's GX shader
-// does (binding 0 vertex-only, binding 1 vertex+fragment) and queries both?
-// One point is drawn into a 1x1 RG32Uint target; the vertex shader passes
-// both lengths through to the fragment shader, which writes them out. The
-// target is cleared to 0xDEAD first, so "never drawn" can't look like 0.
+// Quest 1 diagnostic: what does a VERTEX shader that binds two storage
+// buffers the way Aurora's GX shader does (binding 0 vertex-only, binding 1
+// vertex+fragment) see on this driver -- both arrayLength()s, and a value
+// read from each buffer (the way GX fetches every vertex)? One point is
+// drawn into a 1x1 RGBA32Uint target; the vertex shader passes the four
+// values through to the fragment shader, which writes them out. The target
+// is cleared to 0xDEAD first, so "never drawn" can't look like 0.
 // Logs to dusklight_vr; runs once, changes nothing.
 static void probeVertexArrayLength() {
     using namespace aurora::webgpu;
     constexpr uint32_t kWordsA = 1024;  // 4 KiB
     constexpr uint32_t kWordsB = 2048;  // 8 KiB
     constexpr uint32_t kSentinel = 0xDEAD;
+    constexpr uint32_t kTagA = 0xA0000000u;  // a[i] = kTagA + i
+    constexpr uint32_t kTagB = 0xB0000000u;  // b[i] = kTagB + i
+    constexpr uint32_t kReadA = 5;
+    constexpr uint32_t kReadB = kWordsB - 1;  // the last word, like a fetch near a buffer's end
+    // Push constants, laid out like GX's 64-byte Immediate block. The first
+    // word (vtx_start's place) and the last (array_start2.w's) carry indexes
+    // the shader reads a/b at, so wrong push constants show as wrong reads.
+    constexpr uint32_t kImmFirst = 7;
+    constexpr uint32_t kImmLast = kWordsB - 2;
+    uint32_t imm[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+        imm[i] = 0xC0000000u + i;
+    }
+    imm[0] = kImmFirst;
+    imm[15] = kImmLast;
 
     g_device.PushErrorScope(wgpu::ErrorFilter::Validation);
 
     const char* code = R"(
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> b: array<u32>;
+struct Immediate {
+    vtx_start: u32,
+    current_pnmtx: u32,
+    fog_range_base: u32,
+    stereo_eye: u32,
+    array_start0: vec4u,
+    array_start1: vec4u,
+    array_start2: vec4u,
+};
+var<immediate> imm: Immediate;
 struct VOut {
     @builtin(position) pos: vec4f,
-    @location(0) @interpolate(flat, either) lens: vec2u,
+    @location(0) @interpolate(flat, either) vals: vec4u,
+    @location(1) @interpolate(flat, either) imms: vec4u,
+};
+struct FOut {
+    @location(0) vals: vec4u,
+    @location(1) imms: vec4u,
 };
 @vertex fn vs() -> VOut {
     var o: VOut;
     o.pos = vec4f(0.0, 0.0, 0.0, 1.0);
-    o.lens = vec2u(arrayLength(&a), arrayLength(&b));
+    o.vals = vec4u(arrayLength(&a), arrayLength(&b), a[5], b[2047]);
+    o.imms = vec4u(imm.vtx_start, imm.array_start2.w, a[imm.vtx_start], b[imm.array_start2.w]);
     return o;
 }
-@fragment fn fs(i: VOut) -> @location(0) vec2u {
-    return i.lens;
+@fragment fn fs(i: VOut) -> FOut {
+    var f: FOut;
+    f.vals = i.vals;
+    f.imms = i.imms;
+    return f;
 }
 )";
     wgpu::ShaderSourceWGSL wgsl{};
@@ -949,15 +989,17 @@ struct VOut {
     wgpu::PipelineLayoutDescriptor plDesc{};
     plDesc.bindGroupLayoutCount = 1;
     plDesc.bindGroupLayouts = &bgl;
+    plDesc.immediateSize = sizeof(imm);
     const wgpu::PipelineLayout pl = g_device.CreatePipelineLayout(&plDesc);
 
-    wgpu::ColorTargetState target{};
-    target.format = wgpu::TextureFormat::RG32Uint;
+    wgpu::ColorTargetState targets[2]{};
+    targets[0].format = wgpu::TextureFormat::RGBA32Uint;
+    targets[1].format = wgpu::TextureFormat::RGBA32Uint;
     wgpu::FragmentState frag{};
     frag.module = module;
     frag.entryPoint = "fs";
-    frag.targetCount = 1;
-    frag.targets = &target;
+    frag.targetCount = 2;
+    frag.targets = targets;
     wgpu::RenderPipelineDescriptor rpDesc{};
     rpDesc.label = "vr arrayLength probe";
     rpDesc.layout = pl;
@@ -970,11 +1012,24 @@ struct VOut {
     wgpu::BufferDescriptor bufA{};
     bufA.size = kWordsA * 4;
     bufA.usage = wgpu::BufferUsage::Storage;
+    bufA.usage |= wgpu::BufferUsage::CopyDst;
     const wgpu::Buffer a = g_device.CreateBuffer(&bufA);
     wgpu::BufferDescriptor bufB{};
     bufB.size = kWordsB * 4;
     bufB.usage = wgpu::BufferUsage::Storage;
+    bufB.usage |= wgpu::BufferUsage::CopyDst;
     const wgpu::Buffer b = g_device.CreateBuffer(&bufB);
+    {
+        std::vector<uint32_t> words(kWordsB);
+        for (uint32_t i = 0; i < kWordsB; ++i) {
+            words[i] = kTagA + i;
+        }
+        g_queue.WriteBuffer(a, 0, words.data(), kWordsA * 4);
+        for (uint32_t i = 0; i < kWordsB; ++i) {
+            words[i] = kTagB + i;
+        }
+        g_queue.WriteBuffer(b, 0, words.data(), kWordsB * 4);
+    }
     wgpu::BindGroupEntry bgEntries[2]{};
     bgEntries[0].binding = 0;
     bgEntries[0].buffer = a;
@@ -990,11 +1045,12 @@ struct VOut {
 
     wgpu::TextureDescriptor texDesc{};
     texDesc.size = {1, 1, 1};
-    texDesc.format = wgpu::TextureFormat::RG32Uint;
+    texDesc.format = wgpu::TextureFormat::RGBA32Uint;
     texDesc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
     const wgpu::Texture tex = g_device.CreateTexture(&texDesc);
+    const wgpu::Texture texImm = g_device.CreateTexture(&texDesc);
     wgpu::BufferDescriptor readDesc{};
-    readDesc.size = 256;
+    readDesc.size = 512;
     readDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
     const wgpu::Buffer readback = g_device.CreateBuffer(&readDesc);
 
@@ -1002,14 +1058,17 @@ struct VOut {
     color.view = tex.CreateView();
     color.loadOp = wgpu::LoadOp::Clear;
     color.storeOp = wgpu::StoreOp::Store;
-    color.clearValue = {kSentinel, kSentinel, 0, 0};
+    color.clearValue = {kSentinel, kSentinel, kSentinel, kSentinel};
+    wgpu::RenderPassColorAttachment colors[2] = {color, color};
+    colors[1].view = texImm.CreateView();
     wgpu::RenderPassDescriptor passDesc{};
-    passDesc.colorAttachmentCount = 1;
-    passDesc.colorAttachments = &color;
+    passDesc.colorAttachmentCount = 2;
+    passDesc.colorAttachments = colors;
     wgpu::CommandEncoder enc = g_device.CreateCommandEncoder();
     wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&passDesc);
     pass.SetPipeline(pipeline);
     pass.SetBindGroup(0, bg);
+    pass.SetImmediates(0, imm, sizeof(imm));
     pass.Draw(1);
     pass.End();
     wgpu::TexelCopyTextureInfo src{};
@@ -1019,6 +1078,9 @@ struct VOut {
     dst.layout.bytesPerRow = 256;
     dst.layout.rowsPerImage = 1;
     wgpu::Extent3D extent{1, 1, 1};
+    enc.CopyTextureToBuffer(&src, &dst, &extent);
+    src.texture = texImm;
+    dst.layout.offset = 256;
     enc.CopyTextureToBuffer(&src, &dst, &extent);
     wgpu::CommandBuffer cmd = enc.Finish();
     g_queue.Submit(1, &cmd);
@@ -1046,7 +1108,7 @@ struct VOut {
 
     bool mapDone = false;
     bool mapOk = false;
-    const auto mapFuture = readback.MapAsync(wgpu::MapMode::Read, 0, 256, wgpu::CallbackMode::WaitAnyOnly,
+    const auto mapFuture = readback.MapAsync(wgpu::MapMode::Read, 0, 512, wgpu::CallbackMode::WaitAnyOnly,
                                              [&](wgpu::MapAsyncStatus status, wgpu::StringView /*message*/) {
                                                  mapDone = true;
                                                  mapOk = (status == wgpu::MapAsyncStatus::Success);
@@ -1056,17 +1118,37 @@ struct VOut {
         duskVrLog("[dusk::vr::check] arrayLength probe: ERROR: readback MapAsync failed/timed out\n");
         return;
     }
-    uint32_t got[2];
-    std::memcpy(got, readback.GetConstMappedRange(0, 8), 8);
+    uint32_t got[4];
+    std::memcpy(got, readback.GetConstMappedRange(0, 16), 16);
+    uint32_t gotImm[4];
+    std::memcpy(gotImm, static_cast<const uint8_t*>(readback.GetConstMappedRange(0, 512)) + 256, 16);
     readback.Unmap();
-    const char* verdict = (got[0] == kWordsA && got[1] == kWordsB) ? "OK"
-                          : (got[0] == kSentinel && got[1] == kSentinel)
-                              ? "ERROR: the point was never drawn"
-                              : "ERROR: wrong length";
-    char msg[256];
+    const bool lengthsOk = got[0] == kWordsA && got[1] == kWordsB;
+    const bool readsOk = got[2] == kTagA + kReadA && got[3] == kTagB + kReadB;
+    const char* verdict = (lengthsOk && readsOk) ? "OK"
+                          : (got[0] == kSentinel && got[1] == kSentinel) ? "ERROR: the point was never drawn"
+                          : !lengthsOk                                   ? "ERROR: wrong length"
+                                                                         : "ERROR: wrong value read";
+    char msg[320];
     duskVrSnprintf(msg, sizeof(msg),
-                   "[dusk::vr::check] arrayLength probe (vertex stage): a=%u b=%u, expected %u %u -- %s\n", got[0],
-                   got[1], kWordsA, kWordsB, verdict);
+                   "[dusk::vr::check] storage probe (vertex stage): lengths a=%u b=%u (expected %u %u), "
+                   "a[%u]=0x%08x (expected 0x%08x), b[%u]=0x%08x (expected 0x%08x) -- %s\n",
+                   got[0], got[1], kWordsA, kWordsB, kReadA, got[2], kTagA + kReadA, kReadB, got[3],
+                   kTagB + kReadB, verdict);
+    duskVrLog(msg);
+
+    const bool immOk = gotImm[0] == kImmFirst && gotImm[1] == kImmLast && gotImm[2] == kTagA + kImmFirst &&
+                       gotImm[3] == kTagB + kImmLast;
+    const char* immVerdict = immOk                        ? "OK"
+                             : gotImm[0] == kSentinel     ? "ERROR: the point was never drawn"
+                             : (gotImm[0] != kImmFirst || gotImm[1] != kImmLast)
+                                 ? "ERROR: push constants arrived wrong"
+                                 : "ERROR: wrong value read at a push-constant index";
+    duskVrSnprintf(msg, sizeof(msg),
+                   "[dusk::vr::check] push-constant probe (vertex stage): first=%u last=%u (expected %u %u), "
+                   "a[first]=0x%08x (expected 0x%08x), b[last]=0x%08x (expected 0x%08x) -- %s\n",
+                   gotImm[0], gotImm[1], kImmFirst, kImmLast, gotImm[2], kTagA + kImmFirst, gotImm[3],
+                   kTagB + kImmLast, immVerdict);
     duskVrLog(msg);
 }
 #endif
@@ -4253,6 +4335,18 @@ void submitFrame() {
         duskVrSnprintf(msg + off, sizeof(msg) - off, "%s\n",
                        bad ? " -- ERROR: this layer can't show anything" : "");
         duskVrLog(msg);
+
+        // GX draws since the last check: issued vs. skipped because their
+        // pipeline wasn't compiled yet.
+        uint32_t issued = 0;
+        uint32_t skipped = 0;
+        aurora::gx::take_draw_stats(issued, skipped);
+        char drawMsg[192];
+        duskVrSnprintf(drawMsg, sizeof(drawMsg),
+                       "[dusk::vr::submitFrame] draw check (last 120 frames): GX draws issued=%u, skipped "
+                       "(pipeline not ready)=%u%s\n",
+                       issued, skipped, issued == 0 ? " -- ERROR: no GX draw reached the GPU" : "");
+        duskVrLog(drawMsg);
     }
 
     const XrResult endResult = xrEndFrame(g_session->session(), &endInfo);
