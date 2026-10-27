@@ -14,3 +14,20 @@ index 69f70e6..cfa4f1f 100644
      return p[word_idx];
    }}
    return 0u;
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index 0da5cab..b2a38ab 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -1099,6 +1099,12 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+         // "skip_validation",
+         // "disable_robustness",
+ #endif
++#ifdef ANDROID
++        // Quest 1: Tint's robustness clamps every storage-buffer index with
++        // arrayLength(), which crashes the Adreno 540 driver in
++        // vkCmdDrawIndexed. Vulkan's robustBufferAccess still bounds reads.
++        "disable_robustness",
++#endif
+ #ifndef ANDROID
+         "use_user_defined_labels_in_backend",
+ #endif
