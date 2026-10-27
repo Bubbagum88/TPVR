@@ -79,6 +79,7 @@ jobs:
           DUSK_ANDROID_KEYSTORE: ${{ github.workspace }}/platforms/android/ci-debug.keystore
           DUSK_ANDROID_KEYSTORE_PASSWORD: android
           DUSK_ANDROID_KEY_ALIAS: androiddebugkey
+          ANDROID_STAGE_STRIP: "0"
         run: ./gradlew :app:assembleRelease --rerun-tasks
 
       - name: Upload APK
