@@ -485,9 +485,30 @@ static void RememberSwapped(void* start, void* end) {
 // After the swap, float positions should be ordinary numbers. Count values
 // that are NaN, infinite, denormal-sized or huge, which is what a wrong
 // byte order or a wrong offset gives, and decode the first one both ways.
+// Model files pad each array to 0x20 bytes with the text "This is padding
+// data to align", which the loader's 32-bit swap turns into "sihT" and so on.
+// Those words are not positions: return how many trailing words are padding.
+static size_t PaddingWords(const u8* p, size_t count) {
+    static constexpr char kPad[] = "This is padding data to align";
+    constexpr size_t kPadLen = sizeof(kPad) - 1;
+    for (size_t s = count > 8 ? count - 8 : 0; s < count; ++s) {
+        bool match = true;
+        for (size_t b = 0; b < (count - s) * 4 && b < kPadLen && match; ++b) {
+            const size_t word = s + b / 4;
+            const u8 fileByte = p[word * 4 + (3 - b % 4)]; // undo the swap
+            match = fileByte == static_cast<u8>(kPad[b]);
+        }
+        if (match) {
+            return count - s;
+        }
+    }
+    return 0;
+}
+
 static void CheckPositionsSane(const void* start, const void* end) {
     const u8* p = static_cast<const u8*>(start);
-    const size_t count = static_cast<size_t>((const u8*)end - p) / 4;
+    size_t count = static_cast<size_t>((const u8*)end - p) / 4;
+    count -= PaddingWords(p, count);
     size_t junk = 0;
     size_t firstJunk = SIZE_MAX;
     for (size_t i = 0; i < count; ++i) {

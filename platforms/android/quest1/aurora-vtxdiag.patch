@@ -1,3 +1,124 @@
+diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
+index f0f16b4..0e9e2e8 100644
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstdint>
+ #include <cstring>
+ #include <string>
+@@ -37,6 +38,7 @@ namespace {
+ constexpr Module Log{"aurora::gfx"};
+ PipelineRef g_currentPipeline;
+ uint32_t g_stereoEye = 0;
++thread_local uint32_t t_vtxdiagReplay = 0; // [vtxdiag-gpu] current stereo pass number
+ 
+ // Stereo replay: map a viewport/scissor recorded against the full
+ // double-wide target into one eye's half.
+@@ -145,6 +147,20 @@ void render_pass_commands(const wgpu::RenderPassEncoder& pass, FramePacket& fram
+   pass.SetBindGroup(0, resources().staticBindGroup);
+   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
+ 
++  // [vtxdiag-gpu] the viewport and scissor each eye really gets: the first
++  // 6 stereo replays, then every 600th. Lines per replay are capped at 4 of
++  // each so one replay can't flood the log.
++  const uint32_t vtxdiagReplay = t_vtxdiagReplay;
++  const bool vtxdiagLog = stereo && (vtxdiagReplay < 6 || vtxdiagReplay % 600 == 0);
++  uint32_t vtxdiagVpLogged = 0;
++  uint32_t vtxdiagScLogged = 0;
++  uint32_t vtxdiagDraws = 0;
++  uint32_t vtxdiagEmptyDraws = 0;
++  if (vtxdiagLog) {
++    Log.info("[vtxdiag-gpu] stereo replay {} eye {} '{}': target {}x{}, half width {}", vtxdiagReplay, stereoEye,
++             passInfo.label, targetSize.width, targetSize.height, halfWidthI);
++  }
++
+   for (auto& cmd : passInfo.commands) {
+ #ifdef AURORA_GFX_DEBUG_GROUPS
+     {
+@@ -170,18 +186,43 @@ void render_pass_commands(const wgpu::RenderPassEncoder& pass, FramePacket& fram
+       apply_viewport(pass, vp);
+       currentViewport = vp;
+       hasViewport = true;
++      if (vtxdiagLog && vtxdiagVpLogged++ < 4) {
++        const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
++        const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
++        Log.info("[vtxdiag-gpu]   eye {} viewport recorded ({},{} {}x{}) -> applied ({},{} {}x{}) depth {}-{}{}",
++                 stereoEye, cmd.data.setViewport.left, cmd.data.setViewport.top, cmd.data.setViewport.width,
++                 cmd.data.setViewport.height, vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth,
++                 (vp.width <= 0.f || vp.height <= 0.f || vp.left >= targetSize.width || vp.top >= targetSize.height)
++                     ? "  ERROR: covers no pixels"
++                     : "");
++      }
+     } break;
+     case CommandType::SetScissor: {
+       const auto sc = stereo ? stereo_scissor(cmd.data.setScissor, stereoEye, halfWidthI) : cmd.data.setScissor;
+       apply_scissor(pass, sc, targetSize);
+       currentScissor = sc;
+       hasScissor = true;
++      if (vtxdiagLog && vtxdiagScLogged++ < 4) {
++        const bool empty = sc.width <= 0 || sc.height <= 0 || sc.x >= static_cast<int32_t>(targetSize.width) ||
++                           sc.y >= static_cast<int32_t>(targetSize.height);
++        Log.info("[vtxdiag-gpu]   eye {} scissor recorded ({},{} {}x{}) -> applied ({},{} {}x{}){}", stereoEye,
++                 cmd.data.setScissor.x, cmd.data.setScissor.y, cmd.data.setScissor.width,
++                 cmd.data.setScissor.height, sc.x, sc.y, sc.width, sc.height,
++                 empty ? "  ERROR: covers no pixels" : "");
++      }
+     } break;
+     case CommandType::Draw: {
+       auto& draw = cmd.data.draw;
+       if (draw.encoder != nullptr) {
+         draw.encoder(draw.payload.data(), pass, passInfo);
+       }
++      if (vtxdiagLog) {
++        ++vtxdiagDraws;
++        if (!hasViewport || !hasScissor || currentViewport.width <= 0.f || currentViewport.height <= 0.f ||
++            currentScissor.width <= 0 || currentScissor.height <= 0) {
++          ++vtxdiagEmptyDraws;
++        }
++      }
+     } break;
+     case CommandType::CustomDraw: {
+       render_custom_draw(cmd.data.customDraw, pass, passInfo);
+@@ -208,12 +249,19 @@ void render_pass_commands(const wgpu::RenderPassEncoder& pass, FramePacket& fram
+     pass.PopDebugGroup();
+   }
+ #endif
++  if (vtxdiagLog) {
++    Log.info("[vtxdiag-gpu]   eye {}: {} draws, {} of them with no viewport/scissor set or an empty one{}", stereoEye,
++             vtxdiagDraws, vtxdiagEmptyDraws, vtxdiagEmptyDraws != 0 ? "  ERROR" : "");
++  }
+   g_stereoEye = 0;
+ }
+ 
+ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, RenderPass& passInfo) {
+   ZoneScoped;
+   if (passInfo.stereoReplay) {
++    // [vtxdiag-gpu] one number per stereo pass, shared by both eyes' logs.
++    static std::atomic<uint32_t> s_vtxdiagStereoReplays{0};
++    t_vtxdiagReplay = s_vtxdiagStereoReplays.fetch_add(1, std::memory_order_relaxed);
+     // Single-pass stereo: the same command list once per half. Left then
+     // right; the halves never overlap so ordering between them is free.
+     render_pass_commands(pass, frame, passInfo, 0);
+@@ -225,6 +273,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
+ 
+ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
+   ZoneScoped;
++  gx::vtxprobe_poll();
+   if (!passInfo.sealed) {
+     return;
+   }
+@@ -306,6 +355,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+   render_pass(pass, frame, passInfo);
+   pass.End();
++  gx::vtxprobe_after_pass(cmd);
+ 
+   if (passInfo.captureDepthSnapshot) {
+     depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView,
 diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
 index 3cc2a95..aa6493b 100644
 --- a/lib/gfx/recording.cpp
@@ -58,7 +179,7 @@ index c799d7a..7f5e0dc 100644
  void push_draw_command(DrawData data);
  template <typename DrawData>
 diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
-index d51516f..95afbeb 100644
+index d51516f..9873cdb 100644
 --- a/lib/gx/command_processor.cpp
 +++ b/lib/gx/command_processor.cpp
 @@ -2,6 +2,7 @@
@@ -82,7 +203,7 @@ index d51516f..95afbeb 100644
  #include <vector>
  
  namespace aurora::gx::fifo {
-@@ -423,6 +427,789 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
+@@ -423,6 +427,845 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
    return vtxSize;
  }
  
@@ -558,8 +679,36 @@ index d51516f..95afbeb 100644
 +  return true;
 +}
 +
-+void check_draw(const PipelineConfig& config, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
-+                u32 numIndices, const DrawImmediateData& imm, bool stereo, u32 vtxSize) noexcept {
++// [vtxprobe] which stereo draws of a deep frame get re-run through the probe:
++// the first 4, then every 10th, at most 12 (gx::vtxprobe_* in pipeline.cpp).
++struct ProbePick {
++  u64 frameId = UINT64_MAX;
++  u32 requested = 0;
++};
++ProbePick s_probePick;
++
++bool probe_pick(u64 frameId, u32 stereoDrawNo, GXPrimitive prim) {
++  if (frameId == UINT64_MAX || prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS ||
++      !vtxprobe_accepting()) {
++    return false;
++  }
++  // One frame's draws per round. A round whose draws never reached the GPU
++  // (dropped) is given up after 60 frames, so the probe can't stall.
++  if (s_probePick.frameId != frameId) {
++    if (s_probePick.requested != 0 && frameId < s_probePick.frameId + 60) {
++      return false;
++    }
++    s_probePick = {.frameId = frameId};
++  }
++  if (s_probePick.requested >= 12 || !(stereoDrawNo < 4 || stereoDrawNo % 10 == 0)) {
++    return false;
++  }
++  ++s_probePick.requested;
++  return true;
++}
++
++u32 check_draw(const PipelineConfig& config, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
++               u32 numIndices, const DrawImmediateData& imm, bool stereo, u32 vtxSize) noexcept {
 +  auto& st = s_state;
 +  auto& state = g_gxState;
 +  const auto& sc = config.shaderConfig;
@@ -573,9 +722,12 @@ index d51516f..95afbeb 100644
 +    }
 +  }
 +  const u32 drawNo = st.frame.draws++;
++  const u32 stereoDrawNo = st.frame.stereoDraws;
 +  if (stereo) {
 +    ++st.frame.stereoDraws;
 +  }
++  const bool probe = st.deep && stereo && sc.stereo && probe_pick(frameId, stereoDrawNo, prim);
++  VtxProbeRequest probeReq;
 +  const u32 errorsBefore = error_total();
 +
 +  const auto& pos = sc.attrs[GX_VA_POS];
@@ -743,6 +895,11 @@ index d51516f..95afbeb 100644
 +    u32 firstPn = imm.currentPnMtx;
 +    const u32 eyes = sc.stereo ? 2u : 1u;
 +    for (u32 v = 0; v < readable; ++v) {
++      VtxProbeVertex* pv = nullptr;
++      if (probe && v < VtxProbeWidth) {
++        pv = &probeReq.verts.emplace_back();
++        pv->vidx = v;
++      }
 +      const u8* rec = s_vertexData + u64(v) * sc.vtxStride;
 +      const u8* posSrc = nullptr;
 +      bool posLe = false;
@@ -826,6 +983,11 @@ index d51516f..95afbeb 100644
 +        if (v == 0 && eye == 0) {
 +          std::memcpy(firstClip, clip, sizeof(clip));
 +        }
++        if (pv != nullptr && eye == 0) {
++          pv->decoded = true;
++          std::memcpy(pv->pos.data(), p, sizeof(p));
++          std::memcpy(pv->clip.data(), clip, sizeof(clip));
++        }
 +        inside = inside || clip_inside(clip);
 +        behind = behind && !(clip[3] > 0.f);
 +      }
@@ -865,6 +1027,21 @@ index d51516f..95afbeb 100644
 +  if (error_total() == errorsBefore) {
 +    ++st.frame.cleanDraws;
 +  }
++  if (probe) {
++    probeReq.id = vtxprobe_next_id();
++    probeReq.config = config;
++    probeReq.label = draw();
++    if (probeReq.verts.empty()) {
++      probeReq.label += " (vertex stream not readable on the CPU: GPU values only)";
++      for (u32 v = 0; v < std::min<u32>(vtxCount, VtxProbeWidth); ++v) {
++        probeReq.verts.push_back({.vidx = v});
++      }
++    }
++    const u32 id = probeReq.id;
++    vtxprobe_request(std::move(probeReq));
++    return id;
++  }
++  return 0;
 +}
 +} // namespace vtxdiag
 +} // namespace
@@ -872,17 +1049,25 @@ index d51516f..95afbeb 100644
  static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                           u32 numIndices) noexcept {
    auto& state = g_gxState;
-@@ -500,6 +1287,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+@@ -500,6 +1343,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
  
    state.dirty &= ~DirtyImmediates;
  
-+  vtxdiag::check_draw(cache.config, prim, fmt, vtxCount, vertRange, numIndices, immediates, stereo,
-+                      calc_vtx_size(fmt));
++  const u32 probeId = vtxdiag::check_draw(cache.config, prim, fmt, vtxCount, vertRange, numIndices, immediates,
++                                         stereo, calc_vtx_size(fmt));
 +
    if (cache.freshOnlyDestCount != 0 && fresh_only_dests_stale(cache)) {
      // Drop the draw. Leave the texture state dirty so the next draw can't
      // merge into whatever was pushed before this one (draw_prim() only
-@@ -577,6 +1367,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+@@ -534,6 +1380,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+       .instanceCount = instanceCount,
+       .bindGroups = cache.bindGroups,
+       .dstAlpha = state.dstAlpha,
++      .probeId = probeId,
+   });
+ }
+ 
+@@ -577,6 +1424,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
  
    // Try to merge with previous draw call
    if (canMerge) {
@@ -890,7 +1075,7 @@ index d51516f..95afbeb 100644
      u32 numIndices = 0;
      gfx::Range idxRange;
      static ByteBuffer idxBuf;
-@@ -610,7 +1401,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+@@ -610,7 +1458,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
      return;
    }
  
@@ -900,7 +1085,7 @@ index d51516f..95afbeb 100644
  }
  
  static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
-@@ -812,7 +1605,9 @@ void handle_aurora(ByteReader& reader) noexcept {
+@@ -812,7 +1662,9 @@ void handle_aurora(ByteReader& reader) noexcept {
      const auto vertexData = reader.take(totalVtxBytes);
      const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
      if (indexCount != 0) {
@@ -910,20 +1095,84 @@ index d51516f..95afbeb 100644
      }
    } else if (subCmd == GX_AURORA_SET_STEREO) {
      auto& stereo = g_gxState.stereo;
+diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
+index 27f7145..4d793fb 100644
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -409,6 +409,31 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
+   return g_device.CreateRenderPipeline(&descriptor);
+ }
+ 
++wgpu::RenderPipeline build_vtxprobe_pipeline(const wgpu::ShaderModule& shader, const char* label) noexcept {
++  const std::array<wgpu::ColorTargetState, 2> targets{
++      wgpu::ColorTargetState{.format = wgpu::TextureFormat::RGBA32Uint},
++      wgpu::ColorTargetState{.format = wgpu::TextureFormat::RGBA32Uint},
++  };
++  const wgpu::FragmentState fragmentState{
++      .module = shader,
++      .entryPoint = "fs_probe",
++      .targetCount = targets.size(),
++      .targets = targets.data(),
++  };
++  const wgpu::RenderPipelineDescriptor descriptor{
++      .label = label,
++      .layout = sPipelineLayout,
++      .vertex =
++          {
++              .module = shader,
++              .entryPoint = "vs_main",
++          },
++      .primitive = {.topology = wgpu::PrimitiveTopology::PointList},
++      .fragment = &fragmentState,
++  };
++  return g_device.CreateRenderPipeline(&descriptor);
++}
++
+ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
+   ZoneScoped;
+ 
+diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
+index 71213a3..9948408 100644
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -582,6 +582,14 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
+                                     ArrayRef<wgpu::VertexBufferLayout> vtxBuffers, wgpu::ShaderModule shader,
+                                     const char* label) noexcept;
+ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment = UINT32_MAX) noexcept;
++// [vtxprobe] Quest 1 diagnostics: build_shader_source() adds the probe's
++// outputs and fs_probe while this is set (it returns "" when the shader has
++// no room for them). The probe hands back VtxProbeWidth vertices per draw.
++constexpr u32 VtxProbeWidth = 64;
++extern thread_local bool g_buildVtxProbe;
++// A point-list pipeline for fs_probe: two RGBA32Uint targets, no depth, no
++// blending, the GX pipeline layout.
++wgpu::RenderPipeline build_vtxprobe_pipeline(const wgpu::ShaderModule& shader, const char* label) noexcept;
+ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout) noexcept;
+ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
+ 
 diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
-index f0e4207..1ae4fc7 100644
+index f0e4207..60b75f5 100644
 --- a/lib/gx/pipeline.cpp
 +++ b/lib/gx/pipeline.cpp
-@@ -10,6 +10,8 @@
+@@ -6,10 +6,17 @@
+ #include "../gfx/resource_cache.hpp"
+ 
+ #include "gx_fmt.hpp"
++#include "../webgpu/gpu.hpp"
+ #include "shader_info.hpp"
  
  #include <tracy/Tracy.hpp>
  
 +#include <atomic>
++#include <cmath>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
 +
  namespace aurora::gx {
  
  wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
-@@ -20,10 +22,42 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+@@ -20,10 +27,382 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
    return build_pipeline(config, layout, {}, shader, label.c_str());
  }
  
@@ -946,7 +1195,347 @@ index f0e4207..1ae4fc7 100644
 +}
 +} // namespace
 +
++namespace {
++// ---- [vtxprobe] ----
++constexpr uint32_t kProbeMaxDraws = 12;
++constexpr uint32_t kProbeRounds = 3;
++constexpr uint32_t kProbeLinesPerDraw = 8;
++// Passes encoded between the probe's copy and its MapAsync: the copy's
++// command buffer must be submitted before the buffer is mapped, and a frame
++// is about 15 passes.
++constexpr uint32_t kProbeMapAfterPasses = 200;
++constexpr uint32_t kProbeGiveUpPasses = 5000;
++constexpr uint32_t kProbeRowBytes = VtxProbeWidth * 16; // RGBA32Uint, a multiple of 256
++
++enum ProbeState : int { PS_ACCEPTING, PS_COPIED, PS_MAPPING, PS_MAPPED, PS_FAILED, PS_DONE };
++std::atomic<int> s_probeState{PS_ACCEPTING};
++std::atomic<uint32_t> s_probeNextId{1};
++std::mutex s_probeMutex;
++std::unordered_map<uint32_t, VtxProbeRequest> s_probePending; // command processor -> render worker
++
++// Render worker only.
++struct ProbeCaptured {
++  VtxProbeRequest request;
++  DrawData data;
++};
++std::vector<ProbeCaptured> s_probeCaptured; // draws of the pass being encoded
++std::vector<ProbeCaptured> s_probeInFlight; // draws in the copy being read back
++std::vector<std::string> s_probeSkipped;
++wgpu::Buffer s_probeReadback;
++uint32_t s_probeRows = 0;
++uint32_t s_probePasses = 0;
++uint32_t s_probeRound = 0;
++
++void probe_capture(const DrawData& data) {
++  if (gfx::detail::current_stereo_eye() != 0) {
++    return; // a stereo pass encodes each draw twice; the left eye's is enough
++  }
++  VtxProbeRequest request;
++  {
++    std::lock_guard lock{s_probeMutex};
++    const auto it = s_probePending.find(data.probeId);
++    if (it == s_probePending.end()) {
++      return;
++    }
++    request = std::move(it->second);
++    s_probePending.erase(it);
++  }
++  s_probeCaptured.push_back({std::move(request), data});
++}
++
++std::string probe_lengths(uint32_t packed) {
++  const auto one = [](uint32_t zeroBit, uint32_t units, uint32_t expected) {
++    if (zeroBit != 0) {
++      return fmt::format("0 (ERROR: every read returns 0; expected {})", expected);
++    }
++    const uint32_t lo = units << 8;
++    const bool ok = expected >= lo && expected < lo + 256u;
++    return fmt::format("{}..{} words{}", lo, lo + 255u,
++                       ok ? "" : fmt::format(" (ERROR: expected {})", expected));
++  };
++  return fmt::format("vbuf {} | abuf {}", one(packed >> 31, (packed >> 16) & 0x7fffu, gfx::VertexBufferSize / 4u),
++                     one((packed >> 15) & 1u, packed & 0x7fffu, gfx::StorageBufferSize / 4u));
++}
++
++bool probe_close(float cpu, float gpu) {
++  if (!std::isfinite(gpu)) {
++    return false;
++  }
++  return std::fabs(cpu - gpu) <= 1e-3f * std::max(1.f, std::fabs(cpu));
++}
++
++void probe_report() {
++  const auto* bytes = static_cast<const uint8_t*>(s_probeReadback.GetConstMappedRange(0, s_probeReadback.GetSize()));
++  if (bytes == nullptr) {
++    Log.error("[vtxprobe] round {}: the readback buffer mapped but GetConstMappedRange returned null", s_probeRound);
++    return;
++  }
++  const size_t planeBytes = size_t(kProbeRowBytes) * s_probeRows;
++  Log.info("[vtxprobe] round {}: {} draws re-run through their own shader with probe outputs (left eye)", s_probeRound,
++           s_probeInFlight.size());
++  for (const auto& note : s_probeSkipped) {
++    Log.warn("[vtxprobe]   skipped: {}", note);
++  }
++  for (uint32_t row = 0; row < s_probeInFlight.size(); ++row) {
++    const auto& req = s_probeInFlight[row].request;
++    Log.info("[vtxprobe] draw {}: {}", row, req.label);
++    uint32_t written = 0, notWritten = 0, posOk = 0, posBad = 0, clipOk = 0, clipBad = 0, lines = 0;
++    bool lensLogged = false;
++    for (const auto& v : req.verts) {
++      if (v.vidx >= VtxProbeWidth) {
++        continue;
++      }
++      std::array<uint32_t, 4> a{}, b{};
++      std::memcpy(a.data(), bytes + size_t(row) * kProbeRowBytes + size_t(v.vidx) * 16u, 16);
++      std::memcpy(b.data(), bytes + planeBytes + size_t(row) * kProbeRowBytes + size_t(v.vidx) * 16u, 16);
++      if (a[0] == 0xFFFFFFFFu && a[1] == 0xFFFFFFFFu && a[2] == 0xFFFFFFFFu && a[3] == 0xFFFFFFFFu) {
++        ++notWritten;
++        if (lines < kProbeLinesPerDraw) {
++          ++lines;
++          Log.error("[vtxprobe]   vertex {}: ERROR the GPU never wrote this vertex's pixel (vertex shader did not "
++                    "run for it, or its point was dropped)", v.vidx);
++        }
++        continue;
++      }
++      ++written;
++      if (!lensLogged) {
++        lensLogged = true;
++        Log.info("[vtxprobe]   arrayLength on the GPU: {}", probe_lengths(a[3]));
++      }
++      std::array<float, 3> gpuPos{};
++      std::array<float, 4> gpuClip{};
++      std::memcpy(gpuPos.data(), a.data(), 12);
++      std::memcpy(gpuClip.data(), b.data(), 16);
++      if (!v.decoded) {
++        if (lines < kProbeLinesPerDraw) {
++          ++lines;
++          Log.info("[vtxprobe]   vertex {}: GPU pos=({},{},{}) clip=({},{},{},{}) (no CPU value for this vertex)",
++                   v.vidx, gpuPos[0], gpuPos[1], gpuPos[2], gpuClip[0], gpuClip[1], gpuClip[2], gpuClip[3]);
++        }
++        continue;
++      }
++      const bool pOk = probe_close(v.pos[0], gpuPos[0]) && probe_close(v.pos[1], gpuPos[1]) &&
++                       probe_close(v.pos[2], gpuPos[2]);
++      const bool cOk = probe_close(v.clip[0], gpuClip[0]) && probe_close(v.clip[1], gpuClip[1]) &&
++                       probe_close(v.clip[2], gpuClip[2]) && probe_close(v.clip[3], gpuClip[3]);
++      posOk += pOk ? 1u : 0u;
++      posBad += pOk ? 0u : 1u;
++      clipOk += cOk ? 1u : 0u;
++      clipBad += cOk ? 0u : 1u;
++      if (lines < kProbeLinesPerDraw && (!pOk || !cOk || lines < 2)) {
++        ++lines;
++        Log.info("[vtxprobe]   vertex {}: pos CPU ({},{},{}) GPU ({},{},{}) bits [{:08x} {:08x} {:08x}] {} | clip CPU "
++                 "({},{},{},{}) GPU ({},{},{},{}) {}",
++                 v.vidx, v.pos[0], v.pos[1], v.pos[2], gpuPos[0], gpuPos[1], gpuPos[2], a[0], a[1], a[2],
++                 pOk ? "same" : "DIFFERENT", v.clip[0], v.clip[1], v.clip[2], v.clip[3], gpuClip[0], gpuClip[1],
++                 gpuClip[2], gpuClip[3], cOk ? "same" : "DIFFERENT");
++      }
++    }
++    const bool bad = notWritten != 0 || posBad != 0 || clipBad != 0 || written == 0;
++    Log.info("[vtxprobe]   draw {} summary: {} vertices written, {} not written | position same {} different {} | "
++             "clip position same {} different {}{}",
++             row, written, notWritten, posOk, posBad, clipOk, clipBad, bad ? "  ERROR" : "  (GPU matches CPU)");
++  }
++}
++
++void probe_finish_round(ProbeState next) {
++  s_probeInFlight.clear();
++  s_probeSkipped.clear();
++  s_probeReadback = {};
++  s_probeRows = 0;
++  ++s_probeRound;
++  s_probeState.store(s_probeRound >= kProbeRounds ? PS_DONE : next, std::memory_order_release);
++}
++} // namespace
++
++bool vtxprobe_accepting() noexcept { return s_probeState.load(std::memory_order_acquire) == PS_ACCEPTING; }
++
++uint32_t vtxprobe_next_id() noexcept { return s_probeNextId.fetch_add(1, std::memory_order_relaxed); }
++
++void vtxprobe_request(VtxProbeRequest&& request) noexcept {
++  std::lock_guard lock{s_probeMutex};
++  s_probePending.emplace(request.id, std::move(request));
++}
++
++void vtxprobe_poll() noexcept {
++  const int state = s_probeState.load(std::memory_order_acquire);
++  if (state == PS_COPIED) {
++    if (++s_probePasses < kProbeMapAfterPasses) {
++      return;
++    }
++    s_probeState.store(PS_MAPPING, std::memory_order_release);
++    s_probePasses = 0;
++    s_probeReadback.MapAsync(wgpu::MapMode::Read, 0, s_probeReadback.GetSize(), wgpu::CallbackMode::AllowSpontaneous,
++                             [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
++                               if (status != wgpu::MapAsyncStatus::Success) {
++                                 Log.error("[vtxprobe] readback map failed: status {} {}", static_cast<int>(status),
++                                           std::string_view(message.data, message.length));
++                               }
++                               s_probeState.store(status == wgpu::MapAsyncStatus::Success ? PS_MAPPED : PS_FAILED,
++                                                  std::memory_order_release);
++                             });
++  } else if (state == PS_MAPPING) {
++    if (++s_probePasses == kProbeGiveUpPasses) {
++      Log.error("[vtxprobe] round {}: readback never completed after {} passes", s_probeRound, kProbeGiveUpPasses);
++    }
++  } else if (state == PS_MAPPED) {
++    probe_report();
++    s_probeReadback.Unmap();
++    probe_finish_round(PS_ACCEPTING);
++  } else if (state == PS_FAILED) {
++    probe_finish_round(PS_ACCEPTING);
++  }
++}
++
++void vtxprobe_after_pass(const wgpu::CommandEncoder& cmd) noexcept {
++  if (s_probeCaptured.empty()) {
++    return;
++  }
++  auto captured = std::move(s_probeCaptured);
++  s_probeCaptured.clear();
++  if (s_probeState.load(std::memory_order_acquire) != PS_ACCEPTING) {
++    return;
++  }
++
++  // One pipeline per draw, from the draw's own config with the probe outputs.
++  std::vector<wgpu::RenderPipeline> pipelines;
++  std::vector<ProbeCaptured> rows;
++  for (auto& c : captured) {
++    if (rows.size() >= kProbeMaxDraws) {
++      break;
++    }
++    if (c.data.instanceCount != 1) {
++      s_probeSkipped.push_back(fmt::format("{}: instanced (lines/points) draws are not probed", c.request.label));
++      continue;
++    }
++    g_buildVtxProbe = true;
++    const auto source = build_shader_source(c.request.config.shaderConfig);
++    g_buildVtxProbe = false;
++    if (source.empty()) {
++      s_probeSkipped.push_back(fmt::format("{}: no spare inter-stage locations for the probe outputs", c.request.label));
++      continue;
++    }
++    wgpu::ShaderSourceWGSL wgsl{};
++    wgsl.code = source.c_str();
++    const auto label = fmt::format("vtxprobe {}", c.request.id);
++    const wgpu::ShaderModuleDescriptor moduleDesc{.nextInChain = &wgsl, .label = label.c_str()};
++    // Any device error is fatal in Aurora, so the probe's own shader and
++    // pipeline are made inside error scopes: a probe that the driver refuses
++    // is reported and skipped, never used and never fatal.
++    auto& device = webgpu::g_device;
++    device.PushErrorScope(wgpu::ErrorFilter::OutOfMemory);
++    device.PushErrorScope(wgpu::ErrorFilter::Internal);
++    device.PushErrorScope(wgpu::ErrorFilter::Validation);
++    const auto module = device.CreateShaderModule(&moduleDesc);
++    auto probePipeline = build_vtxprobe_pipeline(module, label.c_str());
++    std::string errors;
++    bool allPopped = true;
++    for (const char* filter : {"validation", "internal", "out of memory"}) {
++      bool popped = false;
++      const auto future = device.PopErrorScope(
++          wgpu::CallbackMode::WaitAnyOnly,
++          [&](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView message) {
++            popped = status == wgpu::PopErrorScopeStatus::Success;
++            if (popped && type != wgpu::ErrorType::NoError) {
++              errors += fmt::format(" [{} error: {}]", filter, std::string_view(message.data, message.length));
++            }
++          });
++      if (webgpu::g_instance.WaitAny(future, 1000000000) != wgpu::WaitStatus::Success || !popped) {
++        allPopped = false;
++      }
++    }
++    if (!allPopped || !errors.empty()) {
++      s_probeSkipped.push_back(fmt::format("{}: the probe's shader/pipeline was refused{}{}", c.request.label,
++                                           allPopped ? "" : " [error scope result never arrived]", errors));
++      continue;
++    }
++    pipelines.push_back(std::move(probePipeline));
++    rows.push_back(std::move(c));
++  }
++  if (rows.empty()) {
++    Log.warn("[vtxprobe] round {}: none of {} picked draws could be probed", s_probeRound, captured.size());
++    for (const auto& note : s_probeSkipped) {
++      Log.warn("[vtxprobe]   skipped: {}", note);
++    }
++    probe_finish_round(PS_ACCEPTING);
++    return;
++  }
++
++  s_probeRows = static_cast<uint32_t>(rows.size());
++  const wgpu::TextureDescriptor texDesc{
++      .label = "vtxprobe target",
++      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
++      .size = {VtxProbeWidth, s_probeRows, 1},
++      .format = wgpu::TextureFormat::RGBA32Uint,
++  };
++  std::array<wgpu::Texture, 2> targets{webgpu::g_device.CreateTexture(&texDesc),
++                                       webgpu::g_device.CreateTexture(&texDesc)};
++  // Unwritten pixels read back as all-ones, which no real vertex produces in
++  // every lane, so "the vertex never reached its pixel" can't pass as data.
++  constexpr double kMarker = 4294967295.0;
++  std::array<wgpu::RenderPassColorAttachment, 2> attachments{};
++  for (size_t i = 0; i < targets.size(); ++i) {
++    attachments[i] = {
++        .view = targets[i].CreateView(),
++        .loadOp = wgpu::LoadOp::Clear,
++        .storeOp = wgpu::StoreOp::Store,
++        .clearValue = {kMarker, kMarker, kMarker, kMarker},
++    };
++  }
++  const wgpu::RenderPassDescriptor passDesc{
++      .label = "vtxprobe pass",
++      .colorAttachmentCount = attachments.size(),
++      .colorAttachments = attachments.data(),
++  };
++  const auto& resources = gfx::detail::resources();
++  auto pass = cmd.BeginRenderPass(&passDesc);
++  pass.SetBindGroup(0, resources.staticBindGroup);
++  for (uint32_t row = 0; row < s_probeRows; ++row) {
++    const auto& data = rows[row].data;
++    pass.SetPipeline(pipelines[row]);
++    pass.SetViewport(0.f, static_cast<float>(row), static_cast<float>(VtxProbeWidth), 1.f, 0.f, 1.f);
++    DrawImmediateData immediates = data.immediateData;
++    immediates.stereoEye = 0;
++    pass.SetImmediates(0, &immediates, sizeof(immediates));
++    const std::array offsets{data.uniformRange.offset};
++    pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
++    pass.SetBindGroup(2, data.bindGroups.textureBindGroup ? gfx::find_bind_group(data.bindGroups.textureBindGroup)
++                                                          : g_emptyTextureBindGroup);
++    if (data.indexCount == 0) {
++      pass.Draw(data.vtxCount, 1);
++    } else {
++      pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
++      pass.DrawIndexed(data.indexCount, 1);
++    }
++  }
++  pass.End();
++
++  const wgpu::BufferDescriptor bufDesc{
++      .label = "vtxprobe readback",
++      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
++      .size = uint64_t(kProbeRowBytes) * s_probeRows * 2u,
++  };
++  s_probeReadback = webgpu::g_device.CreateBuffer(&bufDesc);
++  for (uint32_t i = 0; i < 2; ++i) {
++    const wgpu::TexelCopyTextureInfo src{.texture = targets[i]};
++    const wgpu::TexelCopyBufferInfo dst{
++        .layout = {.offset = uint64_t(kProbeRowBytes) * s_probeRows * i, .bytesPerRow = kProbeRowBytes,
++                   .rowsPerImage = s_probeRows},
++        .buffer = s_probeReadback,
++    };
++    const wgpu::Extent3D size{VtxProbeWidth, s_probeRows, 1};
++    cmd.CopyTextureToBuffer(&src, &dst, &size);
++  }
++  s_probeInFlight = std::move(rows);
++  s_probePasses = 0;
++  s_probeState.store(PS_COPIED, std::memory_order_release);
++  Log.info("[vtxprobe] round {}: {} draws encoded for readback", s_probeRound, s_probeInFlight.size());
++}
++
  void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
++  if (data.probeId != 0) {
++    probe_capture(data);
++  }
    if (!gfx::bind_pipeline(data.pipeline, pass)) {
 +    s_droppedDraws.fetch_add(1, std::memory_order_relaxed);
 +    if (s_droppedLogged.fetch_add(1, std::memory_order_relaxed) < 20) {
@@ -966,8 +1555,61 @@ index f0e4207..1ae4fc7 100644
  
    const auto& resources = gfx::detail::resources();
    DrawImmediateData immediates = data.immediateData;
+diff --git a/lib/gx/pipeline.hpp b/lib/gx/pipeline.hpp
+index b679362..54f5f76 100644
+--- a/lib/gx/pipeline.hpp
++++ b/lib/gx/pipeline.hpp
+@@ -3,6 +3,10 @@
+ #include "../gfx/types.hpp"
+ #include "gx.hpp"
+ 
++#include <array>
++#include <string>
++#include <vector>
++
+ namespace aurora::gx {
+ struct DrawData {
+   gfx::PipelineRef pipeline;
+@@ -15,6 +19,7 @@ struct DrawData {
+   uint32_t instanceCount;
+   GXBindGroups bindGroups;
+   uint32_t dstAlpha;
++  uint32_t probeId = 0; // [vtxprobe] nonzero: re-run this draw through the probe
+ };
+ 
+ constexpr uint32_t GXPipelineConfigVersion = 14; // 14: ShaderConfig::stereo
+@@ -39,4 +44,29 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
+ 
+ void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;
++
++// [vtxprobe] Quest 1 diagnostics. On a few deep-checked frames the command
++// processor picks some stereo draws and works out on the CPU, for the left
++// eye, what the vertex shader should compute for their first VtxProbeWidth
++// vertices. The render worker re-runs each of those draws through a copy of
++// its real shader that writes the values back, and logs both side by side.
++struct VtxProbeVertex {
++  uint32_t vidx = 0;
++  bool decoded = false; // false: the CPU could not decode this vertex (no expectation)
++  std::array<float, 3> pos{};
++  std::array<float, 4> clip{};
++};
++struct VtxProbeRequest {
++  uint32_t id = 0;
++  PipelineConfig config{};
++  std::string label;
++  std::vector<VtxProbeVertex> verts;
++};
++// Command processor thread.
++bool vtxprobe_accepting() noexcept;
++void vtxprobe_request(VtxProbeRequest&& request) noexcept;
++uint32_t vtxprobe_next_id() noexcept;
++// Render worker: after each render pass is ended, and before each is begun.
++void vtxprobe_after_pass(const wgpu::CommandEncoder& cmd) noexcept;
++void vtxprobe_poll() noexcept;
+ } // namespace aurora::gx
 diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
-index fc18fef..aa3ee52 100644
+index fc18fef..b6db92c 100644
 --- a/lib/gx/shader.cpp
 +++ b/lib/gx/shader.cpp
 @@ -10,6 +10,7 @@
@@ -978,7 +1620,16 @@ index fc18fef..aa3ee52 100644
  #include <mutex>
  #include <string_view>
  #include <utility>
-@@ -1642,7 +1643,76 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+@@ -870,6 +871,8 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8
+ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
+ } // namespace
+ 
++thread_local bool g_buildVtxProbe = false;
++
+ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment) noexcept {
+   ZoneScoped;
+   const auto hash = xxh3_hash(normalAttachment, xxh3_hash(config));
+@@ -1642,7 +1645,140 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
    } else if (!prevAlphaNormalized) {
      fragmentFn += "\n    prev.a = tev_overflow_f32(prev.a);";
    }
@@ -996,6 +1647,7 @@ index fc18fef..aa3ee52 100644
 +  // the colour. Needs one spare inter-stage location; a shader with none
 +  // left is drawn normally and logged once.
 +  bool vtxDiag = false;
++  std::string vtxDiagTail;
 +  if (stereo) {
 +    static const uint32_t s_maxInterStage = [] {
 +      wgpu::Limits limits{};
@@ -1039,6 +1691,18 @@ index fc18fef..aa3ee52 100644
 +        "\n    }}"
 +        "\n    out.diag = diag;",
 +        posOffs, posBytes, vidxAttr, config.vtxStride, posBuf == "vbuf"sv ? "true" : "false");
++    // A failed read collapses the draw (every position 0, or the zeroing
++    // above), so its colour could never be seen. Move each failed vertex
++    // into its code's tile along the top of the eye instead (codes 1-5,
++    // left to right), using the vertex index for the corner, so the failure
++    // is visible whatever the draw's own positions were.
++    vtxDiagTail =
++        "\n    // [vtxdiag-gpu] show a failed draw in its code's tile"
++        "\n    if (out.diag != 6u) {"
++        "\n        let diag_tile = f32(out.diag - 1u);"
++        "\n        let diag_corner = vec2f(f32(vidx & 1u), f32((vidx >> 1u) & 1u));"
++        "\n        out.pos = vec4f(-0.95 + diag_tile * 0.38 + diag_corner.x * 0.34, 0.4 + diag_corner.y * 0.5, 0.5, 1.0);"
++        "\n    }";
 +    uniformPre +=
 +        "\n"
 +        "fn vtxdiag_color(code: u32, depth: f32) -> vec4f {\n"
@@ -1052,11 +1716,62 @@ index fc18fef..aa3ee52 100644
 +        "    }\n"
 +        "}";
 +  }
++  // [vtxprobe] A copy of this shader that hands back what its vertex stage
++  // computed: the decoded position, the clip position, and the GPU's
++  // arrayLength() of both buffers. Only the probe asks for it (see
++  // pipeline.cpp); everything above runs unchanged, the probe only adds
++  // outputs, then puts each vertex on its own pixel (x = vertex index) so
++  // fs_probe can write those values to an integer texture.
++  std::string probeFragment;
++  bool probeNoRoom = false;
++  if (g_buildVtxProbe) {
++    static const uint32_t s_maxInterStageProbe = [] {
++      wgpu::Limits limits{};
++      webgpu::g_device.GetLimits(&limits);
++      return limits.maxInterStageShaderVariables;
++    }();
++    if (vtxOutIdx + 2 > s_maxInterStageProbe) {
++      probeNoRoom = true;
++    } else {
++      vtxOutAttrs += fmt::format("\n    @location({}) @interpolate(flat, either) probe0: vec4u,", vtxOutIdx++);
++      vtxOutAttrs += fmt::format("\n    @location({}) @interpolate(flat, either) probe1: vec4u,", vtxOutIdx++);
++      // Captured before the arrayLength() line in vs_main can zero out.pos.
++      vtxXfrAttrs += "\n    let probe_pos = out.pos;";
++      vtxDiagTail += fmt::format(
++          "\n    // [vtxprobe]"
++          "\n    let probe_vlen = arrayLength(&vbuf);"
++          "\n    let probe_alen = arrayLength(&abuf);"
++          "\n    let probe_lens = (select(0u, 1u, probe_vlen == 0u) << 31u) | (min(probe_vlen >> 8u, 0x7fffu) << 16u) |"
++          "\n                     (select(0u, 1u, probe_alen == 0u) << 15u) | min(probe_alen >> 8u, 0x7fffu);"
++          "\n    out.probe0 = vec4u(bitcast<vec3u>(in_pos), probe_lens);"
++          "\n    out.probe1 = bitcast<vec4u>(probe_pos);"
++          "\n    if (vidx < {0}u) {{"
++          "\n        out.pos = vec4f((f32(vidx) + 0.5) / {1:.1f} - 1.0, 0.0, 0.5, 1.0);"
++          "\n    }} else {{"
++          "\n        out.pos = vec4f(-2.0, -2.0, 0.5, 1.0);"
++          "\n    }}",
++          VtxProbeWidth, VtxProbeWidth / 2.0);
++      probeFragment =
++          "\n"
++          "struct ProbeOutput {\n"
++          "    @location(0) a: vec4u,\n"
++          "    @location(1) b: vec4u,\n"
++          "};\n"
++          "\n"
++          "@fragment\n"
++          "fn fs_probe(in: FragmentInput) -> ProbeOutput {\n"
++          "    var o: ProbeOutput;\n"
++          "    o.a = in.probe0;\n"
++          "    o.b = in.probe1;\n"
++          "    return o;\n"
++          "}\n";
++    }
++  }
 +  if (config.alphaCompare && !vtxDiag) {
      const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
      const auto comp1 = alpha_compare(config.alphaCompare.comp1, config.alphaCompare.ref1);
      AlphaCompareExpr pass;
-@@ -1698,6 +1768,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+@@ -1698,6 +1834,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
      fragmentReturn += "\n    return out;";
    }
  
@@ -1066,3 +1781,27 @@ index fc18fef..aa3ee52 100644
    const auto shaderSource =
        fmt::format(R"""(
  fn bswap32(v: u32, le: bool) -> u32 {{
+@@ -2068,7 +2207,7 @@ fn vs_main(
+     // Query both bound buffers so the table covers bindings 0 and 1.
+     if (arrayLength(&vbuf) == 0u || arrayLength(&abuf) == 0u) {{
+         out.pos = vec4f(0.0);
+-    }}
++    }}{12}
+     return out;
+ }}
+ 
+@@ -2076,9 +2215,13 @@ fn vs_main(
+ @fragment
+ fn fs_main(in: FragmentInput) -> {10} {{{6}{5}{11}
+ }}
++{13}
+ )""",
+                   uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn, fragmentFnPre,
+-                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn);
++                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn, vtxDiagTail, probeFragment);
++  if (probeNoRoom) {
++    return {};
++  }
+   if (EnableDebugPrints) {
+     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
+   }
