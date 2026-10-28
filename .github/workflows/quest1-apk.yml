@@ -39,7 +39,9 @@ jobs:
 
       - name: Apply Quest 1 Aurora patches
         run: |
-          git -C extern/aurora apply ../../platforms/android/quest1/aurora-buffer-sizes.patch
+          git -C extern/aurora apply ../../platforms/android/quest1/aurora-arraylength-both-buffers.patch
+          git -C extern/aurora apply ../../platforms/android/quest1/aurora-same-stage-visibility.patch
+          git -C extern/aurora apply ../../platforms/android/quest1/aurora-vtxdiag.patch
 
       - name: Install dependencies
         run: |
