@@ -1,0 +1,1068 @@
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index 3cc2a95..aa6493b 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -1480,6 +1480,35 @@ Range push_storage(const uint8_t* data, size_t length) {
+   return push(current_frame_packet().storage, data, length, resources().limits.minStorageBufferOffsetAlignment);
+ }
+ 
++const uint8_t* debug_staged_verts(Range range) noexcept {
++  if (!g_recorder.active()) {
++    return nullptr;
++  }
++  const auto& buf = current_frame_packet().verts;
++  if (static_cast<size_t>(range.offset) + range.size > buf.size()) {
++    return nullptr;
++  }
++  return buf.data() + range.offset;
++}
++
++const uint8_t* debug_staged_storage(Range range) noexcept {
++  if (!g_recorder.active()) {
++    return nullptr;
++  }
++  const auto& buf = current_frame_packet().storage;
++  if (static_cast<size_t>(range.offset) + range.size > buf.size()) {
++    return nullptr;
++  }
++  return buf.data() + range.offset;
++}
++
++uint64_t debug_recording_frame_id() noexcept {
++  if (!g_recorder.active()) {
++    return UINT64_MAX;
++  }
++  return current_frame_packet().frameId;
++}
++
+ Range push_texture_data(const uint8_t* data, u32 bytesPerRow, u32 rowsPerImage) {
+   // For CopyBufferToTexture, we need an alignment of 256 per row (see Dawn kTextureBytesPerRowAlignment)
+   const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
+diff --git a/lib/gfx/recording.hpp b/lib/gfx/recording.hpp
+index c799d7a..7f5e0dc 100644
+--- a/lib/gfx/recording.hpp
++++ b/lib/gfx/recording.hpp
+@@ -91,6 +91,14 @@ Range push_storage(const T& data) {
+ }
+ Range push_texture_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage);
+ 
++// Quest 1 vertex diagnostics: the CPU view of bytes already staged for this
++// frame's GPU vertex/storage buffers, so a check can compare them with what
++// the game handed over. nullptr when no frame is recording or the range lies
++// outside what has been staged.
++const uint8_t* debug_staged_verts(Range range) noexcept;
++const uint8_t* debug_staged_storage(Range range) noexcept;
++uint64_t debug_recording_frame_id() noexcept;
++
+ template <typename DrawData>
+ void push_draw_command(DrawData data);
+ template <typename DrawData>
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index d51516f..95afbeb 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../gfx/depth_peek.hpp"
+ #include "../gfx/recording.hpp"
++#include "../gfx/resources.hpp"
+ #include "../internal.hpp"
+ #include "dolphin/gd/GDGeometry.h"
+ #include "dolphin/gx/GXAurora.h"
+@@ -14,9 +15,12 @@
+ #include <tracy/Tracy.hpp>
+ 
+ #include <algorithm>
++#include <array>
+ #include <cmath>
+ #include <cstdint>
++#include <cstring>
+ #include <span>
++#include <string>
+ #include <vector>
+ 
+ namespace aurora::gx::fifo {
+@@ -423,6 +427,789 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
+   return vtxSize;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Quest 1 vertex diagnostics ([vtxdiag] in the log).
++//
++// Every GX draw is checked here before it is recorded, so a draw that can't
++// put pixels on screen says why instead of failing silently.
++//
++// Every draw (cheap): array pointers and sizes, whether the array was staged
++// for the GPU and at the offset the shader is given, the draw's vertex
++// stream against the GPU vertex buffer, the position matrix and projection
++// (zero / NaN), and pipeline state that can't write a pixel (no colour
++// write, depth NEVER, an alpha test no alpha value passes, empty viewport).
++//
++// Deep frames (the first 3 frames, the first 3 frames with stereo draws, and
++// then every 300th frame): every vertex of every draw is also decoded on the
++// CPU exactly as the GX vertex shader reads it: each index is checked
++// against its array's size, each position is checked for zero and for junk
++// (NaN, infinity, denormal, huge) and decoded in the other byte order too,
++// and each is projected to see whether it lands on screen. The bytes staged
++// for the GPU are compared with the game's own vertex stream and arrays.
++//
++// Each check that fails logs one error naming the check, the draw and the
++// values (a few per check per deep frame, the rest counted); each deep frame
++// ends with a summary line.
++namespace {
++namespace vtxdiag {
++enum Kind : u32 {
++  K_NOT_RECORDING,
++  K_ARRAY_NULL,
++  K_ARRAY_EMPTY,
++  K_ARRAY_STRIDE,
++  K_STAGE_MISSING,
++  K_STAGE_SIZE,
++  K_STAGE_OFFSET,
++  K_STAGE_PAST_GPU_BUFFER,
++  K_STAGE_MISMATCH,
++  K_STAGE_ZERO,
++  K_SRC_ZERO,
++  K_VTX_STRIDE,
++  K_VTX_SHORT,
++  K_VTX_PAST_GPU_BUFFER,
++  K_VTX_STAGE_MISMATCH,
++  K_INDEX_PAST_ARRAY,
++  K_POS_ALL_ZERO,
++  K_POS_JUNK,
++  K_POS_BYTE_ORDER,
++  K_PNMTX_RANGE,
++  K_MTX_ZERO,
++  K_MTX_JUNK,
++  K_PROJ_ZERO,
++  K_PROJ_JUNK,
++  K_ALL_BEHIND_EYE,
++  K_ALL_OFF_SCREEN,
++  K_NO_COLOR_WRITE,
++  K_ALPHA_ALWAYS_FAILS,
++  K_DEPTH_NEVER,
++  K_VIEWPORT_EMPTY,
++  K_COUNT,
++};
++
++struct KindInfo {
++  const char* name;
++  bool error; // false: worth knowing, but legitimate for some draws
++  const char* meaning;
++};
++constexpr std::array<KindInfo, K_COUNT> kKinds{{
++    {"NOT_RECORDING", true, "draw issued outside a recording frame: nothing is staged for it"},
++    {"ARRAY_NULL", true, "indexed attribute with no array set (GXSetArray never called)"},
++    {"ARRAY_EMPTY", true, "indexed attribute whose array has size 0 or stride 0"},
++    {"ARRAY_STRIDE", true, "stride in the shader differs from the array's stride"},
++    {"STAGE_MISSING", true, "array was not staged for the GPU: the shader reads whatever is at offset 0"},
++    {"STAGE_SIZE", true, "staged range size differs from the array size"},
++    {"STAGE_OFFSET", true, "array_start given to the shader differs from where the array was staged"},
++    {"STAGE_PAST_GPU_BUFFER", true, "staged array ends past the GPU storage buffer: reads there return 0"},
++    {"STAGE_MISMATCH", true, "bytes staged for the GPU differ from the game's array now (stale or overwritten)"},
++    {"STAGE_ZERO", true, "staged bytes are all zero but the game's array is not"},
++    {"SRC_ZERO", true, "the game's array itself is all zero"},
++    {"VTX_STRIDE", true, "vertex stride in the shader differs from the vertex format's size"},
++    {"VTX_SHORT", true, "vertex stream shorter than vertex count x stride: the shader reads past this draw"},
++    {"VTX_PAST_GPU_BUFFER", true, "vertex stream ends past the GPU vertex buffer: reads there return 0"},
++    {"VTX_STAGE_MISMATCH", true, "vertex bytes staged for the GPU differ from the game's vertex stream"},
++    {"INDEX_PAST_ARRAY", true, "a vertex index points past the end of its array: the read gets other data"},
++    {"POS_ALL_ZERO", true, "every position in the draw decodes to (0,0,0)"},
++    {"POS_JUNK", true, "position decodes to NaN, infinity, a denormal or a huge value"},
++    {"POS_BYTE_ORDER", true, "position is junk in the declared byte order but sane in the other one"},
++    {"PNMTX_RANGE", true, "position matrix index out of range"},
++    {"MTX_ZERO", true, "position matrix is all zero: every vertex lands on the origin"},
++    {"MTX_JUNK", true, "position matrix has NaN or infinity"},
++    {"PROJ_ZERO", true, "projection or eye view matrix is all zero"},
++    {"PROJ_JUNK", true, "projection or eye view matrix has NaN or infinity"},
++    {"ALL_BEHIND_EYE", false, "every vertex is behind the eye (w <= 0)"},
++    {"ALL_OFF_SCREEN", false, "no vertex lands inside the eye's view or depth range"},
++    {"NO_COLOR_WRITE", false, "colour and alpha writes are both off (depth-only draw)"},
++    {"ALPHA_ALWAYS_FAILS", true, "alpha test that no alpha value passes: every pixel is discarded"},
++    {"DEPTH_NEVER", true, "depth test NEVER: every pixel is rejected"},
++    {"VIEWPORT_EMPTY", true, "render viewport has zero width or height"},
++}};
++
++constexpr u32 kDeepEvery = 300;
++constexpr u32 kDeepFirst = 3;
++constexpr u32 kDetailPerKindPerFrame = 3;
++constexpr u32 kDetailPerKindCheapFrames = 5; // lifetime budget outside deep frames
++constexpr u32 kTraceDrawsPerDeepFrame = 8;
++
++struct Counts {
++  std::array<u32, K_COUNT> kind{};
++  u32 draws = 0;
++  u32 stereoDraws = 0;
++  u32 cleanDraws = 0;
++  u32 mergedDraws = 0;
++  u64 verts = 0;
++  u64 zeroVerts = 0;
++  u64 onScreenVerts = 0;
++};
++
++struct State {
++  u64 frameId = UINT64_MAX;
++  u32 framesSeen = 0;
++  u32 stereoDeepFramesDone = 0;
++  u32 framesSinceReport = 0;
++  bool deep = false;
++  bool frameHadStereo = false;
++  Counts frame;
++  Counts sinceReport;
++  std::array<u32, K_COUNT> loggedThisFrame{};
++  std::array<u32, K_COUNT> loggedCheap{};
++};
++State s_state;
++const u8* s_vertexData = nullptr; // the draw's vertex stream, set around push_gx_draw
++
++std::string counts_string(const std::array<u32, K_COUNT>& kind) {
++  std::string out;
++  for (u32 k = 0; k < K_COUNT; ++k) {
++    if (kind[k] != 0) {
++      out += fmt::format("{}{}={}", out.empty() ? "" : " ", kKinds[k].name, kind[k]);
++    }
++  }
++  return out.empty() ? "none" : out;
++}
++
++void flush_frame() {
++  auto& st = s_state;
++  if (st.frameId == UINT64_MAX) {
++    return;
++  }
++  for (u32 k = 0; k < K_COUNT; ++k) {
++    st.sinceReport.kind[k] += st.frame.kind[k];
++  }
++  st.sinceReport.draws += st.frame.draws;
++  st.sinceReport.stereoDraws += st.frame.stereoDraws;
++  st.sinceReport.cleanDraws += st.frame.cleanDraws;
++  st.sinceReport.mergedDraws += st.frame.mergedDraws;
++  ++st.framesSinceReport;
++  if (st.deep) {
++    const auto& f = st.frame;
++    Log.info("[vtxdiag] frame {} (deep) summary: draws={} stereo={} passed-all-checks={} merged-unchecked={} verts={} "
++             "zero-pos-verts={} on-screen-verts={} | findings: {}",
++             st.frameId, f.draws, f.stereoDraws, f.cleanDraws, f.mergedDraws, f.verts, f.zeroVerts, f.onScreenVerts,
++             counts_string(f.kind));
++    if (f.draws != 0 && f.cleanDraws == f.draws) {
++      Log.info("[vtxdiag] frame {}: every draw passed every CPU-side check; if the view is still blank, the fault is "
++               "after Aurora (GPU colours: see [vtxdiag-gpu])",
++               st.frameId);
++    }
++    const auto& s = st.sinceReport;
++    Log.info("[vtxdiag] since the last report ({} frames): draws={} stereo={} passed-all-checks={} | findings: {}",
++             st.framesSinceReport, s.draws, s.stereoDraws, s.cleanDraws, counts_string(s.kind));
++    st.sinceReport = {};
++    st.framesSinceReport = 0;
++    if (st.frameHadStereo && st.stereoDeepFramesDone < kDeepFirst) {
++      ++st.stereoDeepFramesDone;
++    }
++  }
++}
++
++void begin_frame_if_new(u64 frameId) {
++  auto& st = s_state;
++  if (frameId == st.frameId) {
++    return;
++  }
++  flush_frame();
++  st.frameId = frameId;
++  ++st.framesSeen;
++  st.deep = st.framesSeen <= kDeepFirst || st.framesSeen % kDeepEvery == 0;
++  st.frameHadStereo = false;
++  st.frame = {};
++  st.loggedThisFrame = {};
++  if (st.deep) {
++    Log.info("[vtxdiag] frame {} is a deep frame: checking every vertex of every draw", frameId);
++  }
++}
++
++// A draw appended to the previous one (draw_prim's merge path): same state,
++// not checked on its own.
++void note_merged() {
++  begin_frame_if_new(gfx::debug_recording_frame_id());
++  ++s_state.frame.mergedDraws;
++}
++
++// One finding. Returns true if the caller should log detail for it.
++bool note(Kind k) {
++  auto& st = s_state;
++  ++st.frame.kind[k];
++  if (st.deep) {
++    return st.loggedThisFrame[k]++ < kDetailPerKindPerFrame;
++  }
++  return st.loggedCheap[k]++ < kDetailPerKindCheapFrames;
++}
++
++// `draw` describes the draw being checked (a callable returning a string);
++// it is only called when a line is logged.
++template <typename D, typename... T>
++void report(Kind k, const D& draw, fmt::format_string<T...> f, T&&... args) {
++  if (!note(k)) {
++    return;
++  }
++  const auto detail = fmt::format(f, std::forward<T>(args)...);
++  if (kKinds[k].error) {
++    Log.error("[vtxdiag] {} ({}) | {} | {}", kKinds[k].name, kKinds[k].meaning, draw(), detail);
++  } else {
++    Log.warn("[vtxdiag] {} ({}) | {} | {}", kKinds[k].name, kKinds[k].meaning, draw(), detail);
++  }
++}
++
++const char* attr_name(u32 attr) {
++  static constexpr std::array<const char*, GX_VA_TEX7 + 1> names{
++      "PNMTXIDX", "TEX0MTXIDX", "TEX1MTXIDX", "TEX2MTXIDX", "TEX3MTXIDX", "TEX4MTXIDX", "TEX5MTXIDX",
++      "TEX6MTXIDX", "TEX7MTXIDX", "POS", "NRM", "CLR0", "CLR1", "TEX0", "TEX1", "TEX2", "TEX3",
++      "TEX4", "TEX5", "TEX6", "TEX7"};
++  return attr < names.size() ? names[attr] : "?";
++}
++
++const char* attr_type_name(u8 t) {
++  switch (t) {
++  case GX_NONE:
++    return "none";
++  case GX_DIRECT:
++    return "direct";
++  case GX_INDEX8:
++    return "index8";
++  case GX_INDEX16:
++    return "index16";
++  default:
++    return "?";
++  }
++}
++
++// Bytes one element read covers, as the shader reads it.
++u32 attr_extent(u32 attr, const AttrConfig& m) {
++  const auto cs = comp_type_size(static_cast<GXAttr>(attr), static_cast<GXCompType>(m.compType));
++  if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
++    return cs;
++  }
++  if (attr == GX_VA_NRM && m.nbt3) {
++    return 3u * cs; // each of the three indices points at one 3-component vector
++  }
++  return u32(m.cnt) * cs;
++}
++
++std::string hex_bytes(const u8* p, u32 n) {
++  std::string out;
++  for (u32 i = 0; i < n; ++i) {
++    out += fmt::format("{}{:02X}", i == 0 ? "" : " ", p[i]);
++  }
++  return out;
++}
++
++bool all_zero(const u8* p, size_t n) {
++  for (size_t i = 0; i < n; ++i) {
++    if (p[i] != 0) {
++      return false;
++    }
++  }
++  return true;
++}
++
++float read_comp(const u8* p, u8 compType, u8 frac, bool le) {
++  const auto rd16 = [&](const u8* q) -> u16 { return le ? u16(q[0] | (q[1] << 8)) : u16((q[0] << 8) | q[1]); };
++  const float scale = 1.f / float(1u << (frac & 31));
++  switch (compType) {
++  case GX_U8:
++    return float(p[0]) * scale;
++  case GX_S8:
++    return float(int8_t(p[0])) * scale;
++  case GX_U16:
++    return float(rd16(p)) * scale;
++  case GX_S16:
++    return float(int16_t(rd16(p))) * scale;
++  case GX_F32: {
++    const u32 u = le ? u32(p[0] | (p[1] << 8) | (p[2] << 16) | (u32(p[3]) << 24))
++                     : u32((u32(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
++    float f;
++    std::memcpy(&f, &u, 4);
++    return f;
++  }
++  default:
++    return NAN;
++  }
++}
++
++// NaN, infinity, a non-zero denormal-scale value, or something far larger
++// than any game coordinate: what a misread (wrong offset / byte order) gives.
++bool junk_value(float f) {
++  if (!std::isfinite(f)) {
++    return true;
++  }
++  const float a = std::fabs(f);
++  return (a != 0.f && a < 1e-30f) || a > 1e8f;
++}
++
++bool any_junk(const float* v, u32 n) {
++  for (u32 i = 0; i < n; ++i) {
++    if (junk_value(v[i])) {
++      return true;
++    }
++  }
++  return false;
++}
++
++template <typename M>
++bool mat_all_zero(const M& m, int rows) {
++  const Vec4<float>* r[4] = {&m.m0, &m.m1, &m.m2, nullptr};
++  if constexpr (requires { m.m3; }) {
++    r[3] = &m.m3;
++  }
++  for (int i = 0; i < rows; ++i) {
++    for (size_t c = 0; c < 4; ++c) {
++      if ((*r[i])[c] != 0.f) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++template <typename M>
++bool mat_has_nonfinite(const M& m, int rows) {
++  const Vec4<float>* r[4] = {&m.m0, &m.m1, &m.m2, nullptr};
++  if constexpr (requires { m.m3; }) {
++    r[3] = &m.m3;
++  }
++  for (int i = 0; i < rows; ++i) {
++    for (size_t c = 0; c < 4; ++c) {
++      if (!std::isfinite((*r[i])[c])) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool compare_alpha(GXCompare c, u32 a, u32 ref) {
++  switch (c) {
++  case GX_NEVER:
++    return false;
++  case GX_LESS:
++    return a < ref;
++  case GX_EQUAL:
++    return a == ref;
++  case GX_LEQUAL:
++    return a <= ref;
++  case GX_GREATER:
++    return a > ref;
++  case GX_NEQUAL:
++    return a != ref;
++  case GX_GEQUAL:
++    return a >= ref;
++  default:
++    return true;
++  }
++}
++
++bool alpha_test_can_pass(const AlphaCompare& ac) {
++  for (u32 a = 0; a < 256; ++a) {
++    const bool p0 = compare_alpha(ac.comp0, a, ac.ref0);
++    const bool p1 = compare_alpha(ac.comp1, a, ac.ref1);
++    bool pass = true;
++    switch (ac.op) {
++    case GX_AOP_AND:
++      pass = p0 && p1;
++      break;
++    case GX_AOP_OR:
++      pass = p0 || p1;
++      break;
++    case GX_AOP_XOR:
++      pass = p0 != p1;
++      break;
++    case GX_AOP_XNOR:
++      pass = p0 == p1;
++      break;
++    default:
++      break;
++    }
++    if (pass) {
++      return true;
++    }
++  }
++  return false;
++}
++
++float row3(const Vec4<float>& r, const float* x) { return r[0] * x[0] + r[1] * x[1] + r[2] * x[2] + r[3]; }
++
++// Clip-space position of a model-space point for one eye, as the GX vertex
++// shader computes it (postex matrix, then stereo_project or ubuf.proj, with
++// fill_uniform()'s reversed-Z fixup).
++void project(const ShaderConfig& sc, const Mat3x4<float>& pn, const float* v, u32 eye, float* clip) {
++  const auto& state = g_gxState;
++  const float mv[3] = {row3(pn.m0, v), row3(pn.m1, v), row3(pn.m2, v)};
++  const bool perspective = state.projType != GX_ORTHOGRAPHIC;
++  Mat4x4<float> proj = state.proj;
++  float eyePos[3] = {mv[0], mv[1], mv[2]};
++  if (sc.stereo && perspective) {
++    const auto& p = state.stereo.proj[eye];
++    proj = {};
++    proj.m0[0] = p[0];
++    proj.m0[2] = p[1];
++    proj.m1[1] = p[2];
++    proj.m1[2] = p[3];
++    proj.m2[2] = p[4];
++    proj.m2[3] = p[5];
++    proj.m3[2] = -1.0f;
++    const auto& t = state.stereo.t[eye];
++    eyePos[0] = row3(t.m0, mv);
++    eyePos[1] = row3(t.m1, mv);
++    eyePos[2] = row3(t.m2, mv);
++  }
++  if constexpr (UseReversedZ) {
++    proj.m2 = proj.m2 * Vec4{-1.f, -1.f, -1.f, -1.f};
++  } else {
++    proj.m2 = proj.m2 + proj.m3;
++  }
++  clip[0] = row3(proj.m0, eyePos);
++  clip[1] = row3(proj.m1, eyePos);
++  clip[2] = row3(proj.m2, eyePos);
++  clip[3] = row3(proj.m3, eyePos);
++}
++
++bool clip_inside(const float* c) {
++  const float w = c[3];
++  return std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]) && w > 0.f && std::fabs(c[0]) <= w &&
++         std::fabs(c[1]) <= w && c[2] >= 0.f && c[2] <= w;
++}
++
++// Error findings (not the informational kinds) recorded so far this frame.
++u32 error_total() {
++  u32 n = 0;
++  for (u32 k = 0; k < K_COUNT; ++k) {
++    n += kKinds[k].error ? s_state.frame.kind[k] : 0u;
++  }
++  return n;
++}
++
++// Checks one matrix slot once per draw; returns false if it is unusable.
++template <typename D>
++bool check_pn_matrix(u32 pnIdx, const D& draw) {
++  const auto& state = g_gxState;
++  if (pnIdx >= MaxPnMtx) {
++    report(K_PNMTX_RANGE, draw, "index {} >= {}", pnIdx, MaxPnMtx);
++    return false;
++  }
++  const auto& m = state.pnMtx[pnIdx].pos;
++  if (mat_all_zero(m, 3)) {
++    report(K_MTX_ZERO, draw, "pnmtx {} = 0", pnIdx);
++    return false;
++  }
++  if (mat_has_nonfinite(m, 3)) {
++    report(K_MTX_JUNK, draw, "pnmtx {} rows ({},{},{},{}) ({},{},{},{}) ({},{},{},{})", pnIdx, m.m0[0], m.m0[1],
++           m.m0[2], m.m0[3], m.m1[0], m.m1[1], m.m1[2], m.m1[3], m.m2[0], m.m2[1], m.m2[2], m.m2[3]);
++    return false;
++  }
++  return true;
++}
++
++void check_draw(const PipelineConfig& config, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
++                u32 numIndices, const DrawImmediateData& imm, bool stereo, u32 vtxSize) noexcept {
++  auto& st = s_state;
++  auto& state = g_gxState;
++  const auto& sc = config.shaderConfig;
++  const u64 frameId = gfx::debug_recording_frame_id();
++  begin_frame_if_new(frameId);
++  if (stereo && !st.frameHadStereo) {
++    st.frameHadStereo = true;
++    if (!st.deep && st.stereoDeepFramesDone < kDeepFirst) {
++      st.deep = true;
++      Log.info("[vtxdiag] frame {}: first stereo draws, checking the rest of this frame deeply", frameId);
++    }
++  }
++  const u32 drawNo = st.frame.draws++;
++  if (stereo) {
++    ++st.frame.stereoDraws;
++  }
++  const u32 errorsBefore = error_total();
++
++  const auto& pos = sc.attrs[GX_VA_POS];
++  // Formatted only when something is logged.
++  const auto draw = [&] {
++    return fmt::format("frame {} draw {} {} prim={} fmt={} verts={} indices={} stride={} pos={} comp={} cnt={} frac={} "
++                       "le={} vtx_start={} pnmtx={}",
++                       frameId, drawNo, stereo ? "stereo" : "mono", static_cast<int>(prim), static_cast<int>(fmt),
++                       vtxCount, numIndices, sc.vtxStride, attr_type_name(pos.attrType), pos.compType, pos.cnt,
++                       pos.frac, pos.le, imm.vtxStart, imm.currentPnMtx);
++  };
++
++  if (frameId == UINT64_MAX) {
++    report(K_NOT_RECORDING, draw, "no frame is recording");
++  }
++
++  // ---- Arrays the shader reads through an index ----
++  for (u32 a = GX_VA_POS; a <= GX_VA_TEX7; ++a) {
++    const auto& m = sc.attrs[a];
++    if (m.attrType != GX_INDEX8 && m.attrType != GX_INDEX16) {
++      continue;
++    }
++    const auto& arr = state.arrays[a];
++    const u32 start = imm.arrayStart[a - GX_VA_POS];
++    if (arr.data == nullptr) {
++      report(K_ARRAY_NULL, draw, "{}: data=null size={} stride={}", attr_name(a), arr.size, arr.stride);
++      continue;
++    }
++    if (arr.size == 0 || arr.stride == 0) {
++      report(K_ARRAY_EMPTY, draw, "{}: data={} size={} stride={}", attr_name(a), arr.data, arr.size, arr.stride);
++    }
++    if (m.stride != arr.stride) {
++      report(K_ARRAY_STRIDE, draw, "{}: shader stride={} array stride={}", attr_name(a), m.stride, arr.stride);
++    }
++    if (arr.cachedRange.size == 0 && arr.size != 0) {
++      report(K_STAGE_MISSING, draw, "{}: data={} size={} staged range=({}, {})", attr_name(a), arr.data, arr.size,
++             arr.cachedRange.offset, arr.cachedRange.size);
++    } else if (arr.cachedRange.size != arr.size) {
++      report(K_STAGE_SIZE, draw, "{}: array size={} staged size={}", attr_name(a), arr.size, arr.cachedRange.size);
++    }
++    if (start != arr.cachedRange.offset) {
++      report(K_STAGE_OFFSET, draw, "{}: array_start={} staged at {}", attr_name(a), start, arr.cachedRange.offset);
++    }
++    if (u64(arr.cachedRange.offset) + arr.cachedRange.size > gfx::StorageBufferSize) {
++      report(K_STAGE_PAST_GPU_BUFFER, draw, "{}: staged {}+{} > storage buffer {}", attr_name(a),
++             arr.cachedRange.offset, arr.cachedRange.size, gfx::StorageBufferSize);
++    }
++    // Deep frames compare on every draw, so an array the game rewrites in
++    // place after it was staged this frame is caught by the draw that reads it.
++    if (st.deep && arr.cachedRange.size != 0) {
++      const auto* src = static_cast<const u8*>(arr.data);
++      const u8* staged = gfx::debug_staged_storage(arr.cachedRange);
++      const u32 n = std::min(arr.size, arr.cachedRange.size);
++      const bool srcZero = all_zero(src, arr.size);
++      if (srcZero) {
++        report(K_SRC_ZERO, draw, "{}: data={} size={} le={}", attr_name(a), arr.data, arr.size, arr.le);
++      }
++      if (staged == nullptr) {
++        report(K_STAGE_MISSING, draw, "{}: staged range ({}, {}) is outside what this frame staged", attr_name(a),
++               arr.cachedRange.offset, arr.cachedRange.size);
++      } else if (std::memcmp(src, staged, n) != 0) {
++        u32 first = 0;
++        while (first < n && src[first] == staged[first]) {
++          ++first;
++        }
++        u32 diffBytes = 0;
++        for (u32 i = first; i < n; ++i) {
++          diffBytes += src[i] != staged[i] ? 1u : 0u;
++        }
++        const u32 show = std::min(16u, n - first);
++        if (!srcZero && all_zero(staged, n)) {
++          report(K_STAGE_ZERO, draw, "{}: {} bytes staged at {} are zero; game bytes at 0: {}", attr_name(a), n,
++                 arr.cachedRange.offset, hex_bytes(src, std::min(16u, n)));
++        } else {
++          report(K_STAGE_MISMATCH, draw, "{}: {} of {} bytes differ, first at {}: game [{}] staged [{}]", attr_name(a),
++                 diffBytes, n, first, hex_bytes(src + first, show), hex_bytes(staged + first, show));
++        }
++      }
++    }
++  }
++
++  // ---- The draw's own vertex stream ----
++  const u64 need = u64(vtxCount) * sc.vtxStride;
++  if (sc.vtxStride != vtxSize) {
++    report(K_VTX_STRIDE, draw, "shader stride={} format size={}", sc.vtxStride, vtxSize);
++  }
++  if (vertRange.size < need) {
++    report(K_VTX_SHORT, draw, "stream {} bytes, needs {}", vertRange.size, need);
++  }
++  if (u64(vertRange.offset) + need > gfx::VertexBufferSize) {
++    report(K_VTX_PAST_GPU_BUFFER, draw, "{}+{} > vertex buffer {}", vertRange.offset, need, gfx::VertexBufferSize);
++  }
++  if (st.deep && s_vertexData != nullptr && vertRange.size != 0) {
++    const u8* staged = gfx::debug_staged_verts(vertRange);
++    if (staged == nullptr) {
++      report(K_VTX_STAGE_MISMATCH, draw, "range ({}, {}) is outside what this frame staged", vertRange.offset,
++             vertRange.size);
++    } else if (std::memcmp(staged, s_vertexData, vertRange.size) != 0) {
++      u32 first = 0;
++      while (first < vertRange.size && staged[first] == s_vertexData[first]) {
++        ++first;
++      }
++      const u32 show = std::min(16u, vertRange.size - first);
++      report(K_VTX_STAGE_MISMATCH, draw, "first difference at {}: game [{}] staged [{}]", first,
++             hex_bytes(s_vertexData + first, show), hex_bytes(staged + first, show));
++    }
++  }
++
++  // ---- Matrices and projection ----
++  const bool perspective = state.projType != GX_ORTHOGRAPHIC;
++  const bool directPnMtx = sc.attrs[GX_VA_PNMTXIDX].attrType == GX_DIRECT;
++  if (!directPnMtx) {
++    check_pn_matrix(imm.currentPnMtx, draw);
++  }
++  if (sc.stereo && perspective) {
++    for (u32 eye = 0; eye < 2; ++eye) {
++      const auto& p = state.stereo.proj[eye];
++      bool zero = true;
++      bool junk = false;
++      for (float f : p) {
++        zero = zero && f == 0.f;
++        junk = junk || !std::isfinite(f);
++      }
++      if (zero || mat_all_zero(state.stereo.t[eye], 3)) {
++        report(K_PROJ_ZERO, draw, "eye {} proj=({},{},{},{},{},{}) view t zero={}", eye, p[0], p[1], p[2], p[3], p[4],
++               p[5], mat_all_zero(state.stereo.t[eye], 3));
++      } else if (junk || mat_has_nonfinite(state.stereo.t[eye], 3)) {
++        report(K_PROJ_JUNK, draw, "eye {} proj=({},{},{},{},{},{})", eye, p[0], p[1], p[2], p[3], p[4], p[5]);
++      }
++    }
++  } else if (mat_all_zero(state.proj, 4)) {
++    report(K_PROJ_ZERO, draw, "{} projection is all zero", perspective ? "perspective" : "ortho");
++  } else if (mat_has_nonfinite(state.proj, 4)) {
++    report(K_PROJ_JUNK, draw, "{} projection has NaN/inf", perspective ? "perspective" : "ortho");
++  }
++
++  // ---- Pipeline state that can't write a pixel ----
++  if (!config.colorUpdate && !config.alphaUpdate) {
++    report(K_NO_COLOR_WRITE, draw, "depthCompare={} depthUpdate={}", config.depthCompare, config.depthUpdate);
++  }
++  if (config.depthCompare && config.depthFunc == GX_NEVER) {
++    report(K_DEPTH_NEVER, draw, "depthUpdate={}", config.depthUpdate);
++  }
++  if (sc.alphaCompare && !alpha_test_can_pass(sc.alphaCompare)) {
++    report(K_ALPHA_ALWAYS_FAILS, draw, "comp0={} ref0={} op={} comp1={} ref1={}",
++           static_cast<int>(sc.alphaCompare.comp0), sc.alphaCompare.ref0, static_cast<int>(sc.alphaCompare.op),
++           static_cast<int>(sc.alphaCompare.comp1), sc.alphaCompare.ref1);
++  }
++  const auto& vp = state.renderViewport;
++  if (!(vp.width > 0.f) || !(vp.height > 0.f)) {
++    report(K_VIEWPORT_EMPTY, draw, "viewport ({},{} {}x{})", vp.left, vp.top, vp.width, vp.height);
++  }
++
++  // ---- Deep: every vertex, as the shader reads it ----
++  if (st.deep && s_vertexData != nullptr && sc.vtxStride != 0) {
++    const u32 readable = std::min<u64>(vtxCount, vertRange.size / sc.vtxStride);
++    u32 zeroVerts = 0;
++    u32 junkVerts = 0;
++    u32 behindVerts = 0;
++    u32 insideVerts = 0;
++    u32 decodedVerts = 0;
++    std::array<bool, MaxPnMtx> pnChecked{};
++    float firstPos[3] = {0.f, 0.f, 0.f};
++    float firstClip[4] = {0.f, 0.f, 0.f, 0.f};
++    u32 firstPn = imm.currentPnMtx;
++    const u32 eyes = sc.stereo ? 2u : 1u;
++    for (u32 v = 0; v < readable; ++v) {
++      const u8* rec = s_vertexData + u64(v) * sc.vtxStride;
++      const u8* posSrc = nullptr;
++      bool posLe = false;
++      // Every indexed attribute: is the index inside its array?
++      for (u32 a = GX_VA_POS; a <= GX_VA_TEX7; ++a) {
++        const auto& m = sc.attrs[a];
++        if (m.attrType != GX_INDEX8 && m.attrType != GX_INDEX16) {
++          continue;
++        }
++        const auto& arr = state.arrays[a];
++        if (arr.data == nullptr) {
++          continue;
++        }
++        const u32 nIdx = (a == GX_VA_NRM && m.nbt3) ? 3u : 1u;
++        const u32 idxSize = m.attrType == GX_INDEX8 ? 1u : 2u;
++        for (u32 j = 0; j < nIdx; ++j) {
++          const u8* ip = rec + m.offset + j * idxSize;
++          const u32 idx = m.attrType == GX_INDEX8 ? ip[0] : u32((ip[0] << 8) | ip[1]); // stream is big-endian
++          const u64 end = u64(idx) * m.stride + attr_extent(a, m);
++          if (end > arr.size) {
++            report(K_INDEX_PAST_ARRAY, draw, "vertex {} {} index {} x stride {} + {} = {} > array size {}", v,
++                   attr_name(a), idx, m.stride, attr_extent(a, m), end, arr.size);
++          } else if (a == GX_VA_POS) {
++            posSrc = static_cast<const u8*>(arr.data) + u64(idx) * m.stride;
++            posLe = m.le;
++          }
++        }
++      }
++      if (pos.attrType == GX_DIRECT) {
++        posSrc = rec + pos.offset; // vertex stream: always big-endian
++        posLe = false;
++      }
++      u32 pnIdx = imm.currentPnMtx;
++      if (directPnMtx) {
++        pnIdx = rec[sc.attrs[GX_VA_PNMTXIDX].offset] / 3u;
++      }
++      if (posSrc == nullptr || pos.cnt < 2 || pos.cnt > 3) {
++        continue;
++      }
++      ++decodedVerts;
++      const u32 cs = comp_type_size(GX_VA_POS, static_cast<GXCompType>(pos.compType));
++      float p[3] = {0.f, 0.f, 0.f};
++      float alt[3] = {0.f, 0.f, 0.f};
++      for (u32 c = 0; c < pos.cnt; ++c) {
++        p[c] = read_comp(posSrc + c * cs, pos.compType, pos.frac, posLe);
++        alt[c] = read_comp(posSrc + c * cs, pos.compType, pos.frac, !posLe);
++      }
++      if (v == 0) {
++        std::memcpy(firstPos, p, sizeof(p));
++        firstPn = pnIdx;
++      }
++      if (p[0] == 0.f && p[1] == 0.f && p[2] == 0.f) {
++        ++zeroVerts;
++      }
++      if (any_junk(p, pos.cnt)) {
++        ++junkVerts;
++        if (pos.compType == GX_F32 && !any_junk(alt, pos.cnt)) {
++          report(K_POS_BYTE_ORDER, draw, "vertex {} declared le={} reads ({},{},{}) bytes [{}]; other order reads "
++                 "({},{},{})", v, posLe, p[0], p[1], p[2], hex_bytes(posSrc, pos.cnt * cs), alt[0], alt[1], alt[2]);
++        } else {
++          report(K_POS_JUNK, draw, "vertex {} le={} reads ({},{},{}) bytes [{}]", v, posLe, p[0], p[1], p[2],
++                 hex_bytes(posSrc, pos.cnt * cs));
++        }
++        continue;
++      }
++      if (pnIdx >= MaxPnMtx) {
++        check_pn_matrix(pnIdx, draw);
++        continue;
++      }
++      if (!pnChecked[pnIdx]) {
++        pnChecked[pnIdx] = true;
++        if (directPnMtx) {
++          check_pn_matrix(pnIdx, draw);
++        }
++      }
++      bool inside = false;
++      bool behind = true;
++      for (u32 eye = 0; eye < eyes; ++eye) {
++        float clip[4];
++        project(sc, state.pnMtx[pnIdx].pos, p, eye, clip);
++        if (v == 0 && eye == 0) {
++          std::memcpy(firstClip, clip, sizeof(clip));
++        }
++        inside = inside || clip_inside(clip);
++        behind = behind && !(clip[3] > 0.f);
++      }
++      insideVerts += inside ? 1u : 0u;
++      behindVerts += behind ? 1u : 0u;
++    }
++    st.frame.verts += decodedVerts;
++    st.frame.zeroVerts += zeroVerts;
++    st.frame.onScreenVerts += insideVerts;
++    if (decodedVerts != 0 && zeroVerts == decodedVerts) {
++      report(K_POS_ALL_ZERO, draw, "{} of {} positions are (0,0,0)", zeroVerts, decodedVerts);
++    }
++    const u32 sane = decodedVerts - junkVerts;
++    if (sane != 0 && behindVerts == sane) {
++      report(K_ALL_BEHIND_EYE, draw, "{} vertices, vertex 0 pos=({},{},{}) clip=({},{},{},{})", sane, firstPos[0],
++             firstPos[1], firstPos[2], firstClip[0], firstClip[1], firstClip[2], firstClip[3]);
++    } else if (sane != 0 && insideVerts == 0) {
++      report(K_ALL_OFF_SCREEN, draw, "{} vertices, vertex 0 pos=({},{},{}) pnmtx={} clip=({},{},{},{})", sane,
++             firstPos[0], firstPos[1], firstPos[2], firstPn, firstClip[0], firstClip[1], firstClip[2], firstClip[3]);
++    }
++    if (drawNo < kTraceDrawsPerDeepFrame || (stereo && st.frame.stereoDraws <= kTraceDrawsPerDeepFrame)) {
++      Log.info("[vtxdiag] trace {} | vertex 0 pos=({:.3f},{:.3f},{:.3f}) pnmtx={} clip=({:.3f},{:.3f},{:.3f},{:.3f}) | "
++               "decoded={} zero={} junk={} on-screen={} behind={} | vp=({:.0f},{:.0f} {:.0f}x{:.0f} z {:.3f}-{:.3f}) "
++               "{} | depth test={} func={} write={} | colorWrite={} alphaWrite={} blend mode={} src={} dst={} | "
++               "alphaTest {} {} {} {} {} | cull={} dstAlpha={}",
++               draw(), firstPos[0], firstPos[1], firstPos[2], firstPn, firstClip[0], firstClip[1], firstClip[2],
++               firstClip[3], decodedVerts, zeroVerts, junkVerts, insideVerts, behindVerts, vp.left, vp.top, vp.width,
++               vp.height, vp.znear, vp.zfar, perspective ? "persp" : "ortho", config.depthCompare,
++               static_cast<int>(config.depthFunc), config.depthUpdate, config.colorUpdate, config.alphaUpdate,
++               static_cast<int>(config.blendMode), static_cast<int>(config.blendFacSrc),
++               static_cast<int>(config.blendFacDst), static_cast<int>(sc.alphaCompare.comp0), sc.alphaCompare.ref0,
++               static_cast<int>(sc.alphaCompare.op), static_cast<int>(sc.alphaCompare.comp1), sc.alphaCompare.ref1,
++               static_cast<int>(config.cullMode), config.dstAlpha);
++    }
++  }
++
++  if (error_total() == errorsBefore) {
++    ++st.frame.cleanDraws;
++  }
++}
++} // namespace vtxdiag
++} // namespace
++
+ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
+                          u32 numIndices) noexcept {
+   auto& state = g_gxState;
+@@ -500,6 +1287,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+ 
+   state.dirty &= ~DirtyImmediates;
+ 
++  vtxdiag::check_draw(cache.config, prim, fmt, vtxCount, vertRange, numIndices, immediates, stereo,
++                      calc_vtx_size(fmt));
++
+   if (cache.freshOnlyDestCount != 0 && fresh_only_dests_stale(cache)) {
+     // Drop the draw. Leave the texture state dirty so the next draw can't
+     // merge into whatever was pushed before this one (draw_prim() only
+@@ -577,6 +1367,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+ 
+   // Try to merge with previous draw call
+   if (canMerge) {
++    vtxdiag::note_merged();
+     u32 numIndices = 0;
+     gfx::Range idxRange;
+     static ByteBuffer idxBuf;
+@@ -610,7 +1401,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+     return;
+   }
+ 
++  vtxdiag::s_vertexData = vertexData.data();
+   handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
++  vtxdiag::s_vertexData = nullptr;
+ }
+ 
+ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
+@@ -812,7 +1605,9 @@ void handle_aurora(ByteReader& reader) noexcept {
+     const auto vertexData = reader.take(totalVtxBytes);
+     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+     if (indexCount != 0) {
++      vtxdiag::s_vertexData = vertexData.data();
+       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
++      vtxdiag::s_vertexData = nullptr;
+     }
+   } else if (subCmd == GX_AURORA_SET_STEREO) {
+     auto& stereo = g_gxState.stereo;
+diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
+index f0e4207..1ae4fc7 100644
+--- a/lib/gx/pipeline.cpp
++++ b/lib/gx/pipeline.cpp
+@@ -10,6 +10,8 @@
+ 
+ #include <tracy/Tracy.hpp>
+ 
++#include <atomic>
++
+ namespace aurora::gx {
+ 
+ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
+@@ -20,10 +22,42 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+   return build_pipeline(config, layout, {}, shader, label.c_str());
+ }
+ 
++namespace {
++constexpr Module Log{"aurora::gx::pipeline"};
++
++// Quest 1 diagnostics ([vtxdiag-gpu]): a GX draw whose pipeline isn't ready
++// is dropped here without a word. Count drawn and dropped draws on the
++// render worker and report them, so dropped draws can't hide.
++std::atomic<uint64_t> s_encodedDraws{0};
++std::atomic<uint64_t> s_droppedDraws{0};
++std::atomic<uint64_t> s_droppedLogged{0};
++
++void report_encode_counts() {
++  const uint64_t total = s_encodedDraws.load(std::memory_order_relaxed) + s_droppedDraws.load(std::memory_order_relaxed);
++  if (total % 5000 == 0) {
++    Log.info("[vtxdiag-gpu] GX draws encoded={} dropped (pipeline not ready)={}",
++             s_encodedDraws.load(std::memory_order_relaxed), s_droppedDraws.load(std::memory_order_relaxed));
++  }
++}
++} // namespace
++
+ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+   if (!gfx::bind_pipeline(data.pipeline, pass)) {
++    s_droppedDraws.fetch_add(1, std::memory_order_relaxed);
++    if (s_droppedLogged.fetch_add(1, std::memory_order_relaxed) < 20) {
++      Log.warn("[vtxdiag-gpu] GX draw dropped: pipeline {} not ready (verts={} indices={} eye={})", data.pipeline,
++               data.vtxCount, data.indexCount, gfx::detail::current_stereo_eye());
++    }
++    report_encode_counts();
+     return;
+   }
++  s_encodedDraws.fetch_add(1, std::memory_order_relaxed);
++  report_encode_counts();
++  static std::atomic<uint32_t> s_emptyUniformLogged{0};
++  if (data.uniformRange.size == 0 && s_emptyUniformLogged.fetch_add(1, std::memory_order_relaxed) < 20) {
++    Log.error("[vtxdiag-gpu] GX draw with an empty uniform range: its matrices read whatever is at offset {}",
++              data.uniformRange.offset);
++  }
+ 
+   const auto& resources = gfx::detail::resources();
+   DrawImmediateData immediates = data.immediateData;
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index fc18fef..aa3ee52 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -10,6 +10,7 @@
+ #include <dolphin/gx/GXEnum.h>
+ 
+ #include <absl/container/flat_hash_set.h>
++#include <atomic>
+ #include <mutex>
+ #include <string_view>
+ #include <utility>
+@@ -1642,7 +1643,76 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+   } else if (!prevAlphaNormalized) {
+     fragmentFn += "\n    prev.a = tev_overflow_f32(prev.a);";
+   }
+-  if (config.alphaCompare) {
++  // Quest 1 diagnostics ([vtxdiag-gpu]): stereo draws are painted by what
++  // the real vertex shader saw, so a blank view shows where it went wrong:
++  //   red    = arrayLength() of vbuf or abuf reads 0 (every load returns 0)
++  //   green  = the position read or the vertex record lies past the end of
++  //            its buffer (load_word returns 0 there)
++  //   blue   = position read in range but it is (0,0,0)
++  //   yellow = position is NaN / infinity / > 1e30 (junk bytes)
++  //   cyan   = position read fine but it is behind the eye (w <= 0)
++  //   grey   = all of the above fine (brighter = nearer)
++  // The alpha test is skipped in painted draws so a failing test can't hide
++  // the colour. Needs one spare inter-stage location; a shader with none
++  // left is drawn normally and logged once.
++  bool vtxDiag = false;
++  if (stereo) {
++    static const uint32_t s_maxInterStage = [] {
++      wgpu::Limits limits{};
++      webgpu::g_device.GetLimits(&limits);
++      return limits.maxInterStageShaderVariables;
++    }();
++    if (vtxOutIdx + 1 < s_maxInterStage) {
++      vtxDiag = true;
++    } else {
++      static std::atomic<uint32_t> s_noRoomLogged{0};
++      if (s_noRoomLogged.fetch_add(1, std::memory_order_relaxed) < 10) {
++        Log.warn("[vtxdiag-gpu] shader {:x}: no spare inter-stage location ({} used, limit {}), not painted", hash,
++                 vtxOutIdx, s_maxInterStage);
++      }
++    }
++  }
++  if (vtxDiag) {
++    vtxOutAttrs += fmt::format("\n    @location({}) @interpolate(flat, either) diag: u32,", vtxOutIdx++);
++    const auto& posMapping = config.attrs[GX_VA_POS];
++    const auto [posOffs, posBuf, posLe] = attr_address(posMapping, GX_VA_POS, vidxAttr, config.vtxStride, 0u, 0u);
++    (void)posLe;
++    const u32 posBytes = posMapping.cnt * comp_type_size(GX_VA_POS, static_cast<GXCompType>(posMapping.compType));
++    vtxXfrAttrs += fmt::format(
++        "\n    // [vtxdiag-gpu]"
++        "\n    let diag_vlen = arrayLength(&vbuf);"
++        "\n    let diag_alen = arrayLength(&abuf);"
++        "\n    let diag_pos_end = ({0}) + {1}u;"
++        "\n    let diag_rec_end = imm.vtx_start + ({2} + 1u) * {3}u;"
++        "\n    let diag_pos_len = select(diag_alen, diag_vlen, {4});"
++        "\n    var diag = 6u;"
++        "\n    if (diag_vlen == 0u || diag_alen == 0u) {{"
++        "\n        diag = 1u;"
++        "\n    }} else if (diag_rec_end > diag_vlen * 4u || diag_pos_end > diag_pos_len * 4u) {{"
++        "\n        diag = 2u;"
++        "\n    }} else if (all(in_pos == vec3f(0.0))) {{"
++        "\n        diag = 3u;"
++        "\n    }} else if (any(in_pos != in_pos) || any(abs(in_pos) > vec3f(1e30))) {{"
++        "\n        diag = 4u;"
++        "\n    }} else if (!(out.pos.w > 0.0)) {{"
++        "\n        diag = 5u;"
++        "\n    }}"
++        "\n    out.diag = diag;",
++        posOffs, posBytes, vidxAttr, config.vtxStride, posBuf == "vbuf"sv ? "true" : "false");
++    uniformPre +=
++        "\n"
++        "fn vtxdiag_color(code: u32, depth: f32) -> vec4f {\n"
++        "    switch code {\n"
++        "        case 1u: { return vec4f(1.0, 0.0, 0.0, 1.0); }\n"
++        "        case 2u: { return vec4f(0.0, 1.0, 0.0, 1.0); }\n"
++        "        case 3u: { return vec4f(0.0, 0.0, 1.0, 1.0); }\n"
++        "        case 4u: { return vec4f(1.0, 1.0, 0.0, 1.0); }\n"
++        "        case 5u: { return vec4f(0.0, 1.0, 1.0, 1.0); }\n"
++        "        default: { return vec4f(vec3f(0.3 + 0.7 * clamp(depth, 0.0, 1.0)), 1.0); }\n"
++        "    }\n"
++        "}";
++  }
++  if (config.alphaCompare && !vtxDiag) {
+     const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
+     const auto comp1 = alpha_compare(config.alphaCompare.comp1, config.alphaCompare.ref1);
+     AlphaCompareExpr pass;
+@@ -1698,6 +1768,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+     fragmentReturn += "\n    return out;";
+   }
+ 
++  if (vtxDiag) {
++    fragmentReturn = "\n    prev = vtxdiag_color(in.diag, in.pos.z);" + fragmentReturn;
++  }
+   const auto shaderSource =
+       fmt::format(R"""(
+ fn bswap32(v: u32, le: bool) -> u32 {{
