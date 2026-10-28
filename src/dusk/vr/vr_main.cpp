@@ -39,6 +39,7 @@
 #if defined(__ANDROID__)
 #include <unistd.h>                             // gettid()
 #endif
+#include <aurora/gfx.h>                         // aurora_get_stats -- pipelines built, [dusk::vr::perf]
 #include <aurora/lib/logging.hpp>               // aurora::Module, see VrLog below -- dusk/logging.h's
                                                  // own DuskLog moved to borealis::Log in 2.0 and no
                                                  // longer pulls this in transitively the way it used to
@@ -1156,6 +1157,9 @@ bool startup() {
                         aurora::webgpu::g_vulkanSharedImageExportSupported,
                         gfx.supportsExternalMemoryFd, sharedImageSupported ? "ENABLED" : "disabled (falling back to CPU readback)");
             duskVrLog(msg);
+            VrLog.info("shared-image GPU-direct swapchain path: dawnSupported={} xrDeviceSupported={} -> {}",
+                       aurora::webgpu::g_vulkanSharedImageExportSupported, gfx.supportsExternalMemoryFd,
+                       sharedImageSupported ? "ENABLED" : "disabled (falling back to CPU readback)");
         }
         // Async semaphore-gated handoff for the shared-image path above
         // (see Session::finishSharedImageGpuCopy()'s own comment) -- independent
@@ -1416,7 +1420,7 @@ struct TickReentrancyGuard {
 // TEMP DIAGNOSTIC (Quest perf, 2026-09-20 -- remove once the dips are
 // understood): per-frame phase timing, logged only on a slow frame (total
 // > kPerfDipThresholdMs, i.e. a real dip at 72Hz) plus one baseline line
-// every kPerfBaselineInterval frames so "normal" is on record too. Phases:
+// every second as a summary (see submitFrame) so "normal" is on record too. Phases:
 //   setup       = tick() entry -> swapchain image acquired (includes
 //                 xrWaitFrame's pacing wait -- big here = runtime pacing us)
 //   renderEnc   = both eyes' scene traversal + GX/Dawn command recording
@@ -1450,7 +1454,6 @@ inline void perfLap(int i) {
     g_perfMidMark = now;
 }
 constexpr double kPerfDipThresholdMs = 22.0;
-constexpr int kPerfBaselineInterval = 600;
 inline double perfMs(PerfClock::time_point a, PerfClock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
@@ -4065,24 +4068,88 @@ void submitFrame() {
         const unsigned int cullRejected = g_duskVRCullRejected;
         g_duskVRCullTested = 0;
         g_duskVRCullRejected = 0;
-        static int s_perfFrame = 0;
-        ++s_perfFrame;
-        const bool dip = totalMs > kPerfDipThresholdMs;
-        if (dip || (s_perfFrame % kPerfBaselineInterval) == 0) {
-            const aurora::gfx::WorkerFrameStats ws = aurora::gfx::worker_frame_stats();
-            char msg[500];
+        const aurora::gfx::WorkerFrameStats ws = aurora::gfx::worker_frame_stats();
+        // The full breakdown of one frame, in the format the dip lines used.
+        char frameMsg[500];
+        duskVrSnprintf(frameMsg, sizeof(frameMsg),
+            "total=%.1f setup=%.1f(waitFrame=%.1f swapWait=%.1f "
+            "beginFrame=%.1f syncActions=%.1f hmd=%.1f ctrl=%.1f mid=%.1f/%.1f/%.1f) "
+            "renderEnc=%.1f(preLoop=%.1f begin=%.1f iter=%.1f painter=%.1f end=%.1f) "
+            "gap=%.1f sync=%.1f submit=%.1f sim=%d cull=%u/%u "
+            "worker(enc=%.1f finish=%.1f submit=%.1f wall=%.1f draws=%u merged=%u passes=%u maxPassDraws=%u)",
+            totalMs, setupMs, g_perfWaitFrameMs, g_perfSwapWaitMs,
+            g_perfMid[5], g_perfMid[1], g_perfMid[6], g_perfMid[0], g_perfMid[2], g_perfMid[3], g_perfMid[4],
+            renderEncMs, g_perfPreLoopMs, g_perfEyeBeginMs, g_perfEyeIterMs, g_perfEyePainterMs,
+            g_perfEyeEndMs, gapMs, syncMs, submitMs, g_perfNumSimTicks, cullRejected, cullTested,
+            ws.encodeMs, ws.finishMs, ws.submitMs, ws.wallMs, ws.drawCalls, ws.mergedDrawCalls, ws.renderPasses, ws.maxPassDraws);
+
+        // One summary a second instead of a line per slow frame: on the
+        // Quest 1 nearly every frame is over kPerfDipThresholdMs, and a line
+        // per frame pushed everything else out of logcat. Written to the
+        // dusklight log file too (VrLog), which keeps the whole session.
+        struct PerfWindow {
+            PerfClock::time_point start;
+            int frames = 0, dips = 0, simTicks = 0;
+            double total = 0, setup = 0, waitFrame = 0, renderEnc = 0, gap = 0, sync = 0, submit = 0;
+            double workerEnc = 0, workerFinish = 0, workerSubmit = 0, workerWall = 0;
+            double draws = 0, passes = 0;
+            double worstMs = -1;
+            char worst[500] = {};
+            uint32_t pipelinesCreated = 0;
+        };
+        static PerfWindow s_win;
+        static bool s_winStarted = false;
+        const AuroraStats* auroraStats = aurora_get_stats();
+        if (!s_winStarted) {
+            s_win = PerfWindow{};
+            s_win.start = perfEnd;
+            s_win.pipelinesCreated = auroraStats->createdPipelines;
+            s_winStarted = true;
+        }
+        PerfWindow& w = s_win;
+        ++w.frames;
+        w.dips += totalMs > kPerfDipThresholdMs ? 1 : 0;
+        w.simTicks += g_perfNumSimTicks;
+        w.total += totalMs;
+        w.setup += setupMs;
+        w.waitFrame += g_perfWaitFrameMs;
+        w.renderEnc += renderEncMs;
+        w.gap += gapMs;
+        w.sync += syncMs;
+        w.submit += submitMs;
+        w.workerEnc += ws.encodeMs;
+        w.workerFinish += ws.finishMs;
+        w.workerSubmit += ws.submitMs;
+        w.workerWall += ws.wallMs;
+        w.draws += ws.drawCalls;
+        w.passes += ws.renderPasses;
+        if (totalMs > w.worstMs) {
+            w.worstMs = totalMs;
+            std::memcpy(w.worst, frameMsg, sizeof(w.worst));
+        }
+        const double windowMs = perfMs(w.start, perfEnd);
+        if (windowMs >= 1000.0) {
+            const double n = w.frames;
+            char msg[700];
             duskVrSnprintf(msg, sizeof(msg),
-                "[dusk::vr::perf] %s total=%.1f setup=%.1f(waitFrame=%.1f swapWait=%.1f "
-                "beginFrame=%.1f syncActions=%.1f hmd=%.1f ctrl=%.1f mid=%.1f/%.1f/%.1f) "
-                "renderEnc=%.1f(preLoop=%.1f begin=%.1f iter=%.1f painter=%.1f end=%.1f) "
-                "gap=%.1f sync=%.1f submit=%.1f sim=%d cull=%u/%u "
-                "worker(enc=%.1f finish=%.1f submit=%.1f wall=%.1f draws=%u merged=%u passes=%u maxPassDraws=%u)\n",
-                dip ? "DIP" : "base", totalMs, setupMs, g_perfWaitFrameMs, g_perfSwapWaitMs,
-                g_perfMid[5], g_perfMid[1], g_perfMid[6], g_perfMid[0], g_perfMid[2], g_perfMid[3], g_perfMid[4],
-                renderEncMs, g_perfPreLoopMs, g_perfEyeBeginMs, g_perfEyeIterMs, g_perfEyePainterMs,
-                g_perfEyeEndMs, gapMs, syncMs, submitMs, g_perfNumSimTicks, cullRejected, cullTested,
-                ws.encodeMs, ws.finishMs, ws.submitMs, ws.wallMs, ws.drawCalls, ws.mergedDrawCalls, ws.renderPasses, ws.maxPassDraws);
+                "[dusk::vr::perf] %.2fs: %d frames (%.1f fps), %d over %.0f ms | avg ms: total=%.1f "
+                "setup=%.1f(waitFrame=%.1f) renderEnc=%.1f gap=%.1f sync=%.1f submit=%.1f | "
+                "render worker avg ms: enc=%.1f finish=%.1f submit=%.1f wall=%.1f, draws=%.0f passes=%.1f | "
+                "game sim ticks=%d (%.2f/frame) | pipelines built=%u, waiting=%u\n",
+                windowMs / 1000.0, w.frames, n * 1000.0 / windowMs, w.dips, kPerfDipThresholdMs, w.total / n,
+                w.setup / n, w.waitFrame / n, w.renderEnc / n, w.gap / n, w.sync / n, w.submit / n,
+                w.workerEnc / n, w.workerFinish / n, w.workerSubmit / n, w.workerWall / n, w.draws / n, w.passes / n,
+                w.simTicks, w.simTicks / n, auroraStats->createdPipelines - w.pipelinesCreated,
+                auroraStats->queuedPipelines);
             duskVrLog(msg);
+            msg[std::strlen(msg) - 1] = '\0';
+            VrLog.info("{}", msg);
+            duskVrSnprintf(msg, sizeof(msg), "[dusk::vr::perf] worst frame: %s", w.worst);
+            duskVrLog(msg);
+            VrLog.info("{}", msg);
+            s_win = PerfWindow{};
+            s_win.start = perfEnd;
+            s_win.pipelinesCreated = auroraStats->createdPipelines;
         }
     }
 }
