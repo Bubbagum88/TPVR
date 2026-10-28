@@ -64,6 +64,22 @@ if (dusklightPropertiesFile.isFile()) {
     }
 }
 
+// Quest 1 confirmation builds: Khronos' Vulkan validation layer
+// (libVkLayer_khronos_validation.so), staged by CI into the directory named
+// by DUSK_ANDROID_VALIDATION_LAYER_DIR (<dir>/arm64-v8a/...). Android only
+// loads layers from an app's extracted native library directory, and only
+// for a debuggable app (enabled with adb's enable_gpu_debug_layers /
+// gpu_debug_app / gpu_debug_layers settings), so this build is debuggable and
+// extracts its libraries. Without the variable nothing changes.
+def validationLayerDir = findProperty('DUSK_ANDROID_VALIDATION_LAYER_DIR') ?: System.getenv('DUSK_ANDROID_VALIDATION_LAYER_DIR')
+if (validationLayerDir) {
+    android {
+        sourceSets.main.jniLibs.srcDirs += [file(validationLayerDir)]
+        packaging.jniLibs.useLegacyPackaging = true
+        buildTypes.release.debuggable = true
+    }
+}
+
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
 }
