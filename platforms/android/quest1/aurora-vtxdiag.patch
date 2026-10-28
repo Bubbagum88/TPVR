@@ -1166,7 +1166,7 @@ index 71213a3..8205ad4 100644
  GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
  
 diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
-index f0e4207..f73928b 100644
+index f0e4207..68244b5 100644
 --- a/lib/gx/pipeline.cpp
 +++ b/lib/gx/pipeline.cpp
 @@ -6,10 +6,17 @@
@@ -1187,7 +1187,7 @@ index f0e4207..f73928b 100644
  namespace aurora::gx {
  
  wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
-@@ -20,10 +27,454 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+@@ -20,10 +27,577 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
    return build_pipeline(config, layout, {}, shader, label.c_str());
  }
  
@@ -1235,39 +1235,106 @@ index f0e4207..f73928b 100644
 +  uint32_t variant = 0;
 +};
 +
-+// Each probed draw is re-run once per declaration of the two GX storage
-+// buffers (group 0: binding 0 vbuf, binding 1 abuf), to see which one gives
-+// the vertex shader abuf's real length.
++// Each probed draw is re-run once per variant of group 0 (binding 0 and
++// binding 1), to find what makes the GPU read binding 1's length as 0:
++// abuf's usage (no Vertex flag), its size (exactly 8 MiB), its stage
++// visibility, the buffer object itself, or the binding slot.
++enum class ProbeBuf : uint8_t { Vbuf, Abuf, TestSame, TestVertex, TestPlus4 };
 +struct ProbeVariant {
 +  const char* name;
-+  wgpu::ShaderStage vbufStages;
-+  wgpu::ShaderStage abufStages;
++  ProbeBuf slot0;
++  ProbeBuf slot1;
++  wgpu::ShaderStage slot1Stages;
 +};
-+constexpr std::array<ProbeVariant, 3> kProbeVariants{{
-+    {"vbuf vertex-only, abuf vertex+pixel (as before the fix)", wgpu::ShaderStage::Vertex,
-+     wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment},
-+    {"both vertex+pixel (the fix)", wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-+     wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment},
-+    {"both vertex-only", wgpu::ShaderStage::Vertex, wgpu::ShaderStage::Vertex},
++constexpr auto kBothStages = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
++constexpr std::array<ProbeVariant, 6> kProbeVariants{{
++    {"A: vbuf | abuf, as the game binds them", ProbeBuf::Vbuf, ProbeBuf::Abuf, kBothStages},
++    {"B: vbuf | new buffer, same usage and size as abuf (Storage|CopyDst, 8 MiB)", ProbeBuf::Vbuf,
++     ProbeBuf::TestSame, kBothStages},
++    {"C: vbuf | new buffer, abuf's size plus the Vertex flag (Storage|Vertex|CopyDst, 8 MiB)", ProbeBuf::Vbuf,
++     ProbeBuf::TestVertex, kBothStages},
++    {"D: vbuf | new buffer, abuf's usage, 8 MiB + 4 bytes (Storage|CopyDst)", ProbeBuf::Vbuf, ProbeBuf::TestPlus4,
++     kBothStages},
++    {"E: vbuf | abuf, binding 1 vertex-only", ProbeBuf::Vbuf, ProbeBuf::Abuf, wgpu::ShaderStage::Vertex},
++    {"F: abuf | vbuf, the two swapped between bindings 0 and 1", ProbeBuf::Abuf, ProbeBuf::Vbuf, kBothStages},
 +}};
 +std::array<wgpu::BindGroupLayout, kProbeVariants.size()> s_probeLayouts;
 +std::array<wgpu::BindGroup, kProbeVariants.size()> s_probeBindGroups;
++// Words binding 1 is read at directly (no length check in our code), and
++// the pattern the new test buffers are filled with, so a read can be told
++// apart from a 0 or a read of the wrong memory.
++constexpr std::array<uint32_t, 3> kProbeRawWords{0u, 1048576u, 2097151u};
++constexpr uint32_t probe_pattern(uint32_t word) { return (word * 2654435761u) ^ 0xA5A5A5A5u; }
++std::array<wgpu::Buffer, 3> s_probeTestBuffers; // TestSame, TestVertex, TestPlus4
++
++const wgpu::Buffer& probe_buffer(ProbeBuf which) {
++  const auto& resources = gfx::detail::resources();
++  switch (which) {
++  case ProbeBuf::Vbuf:
++    return resources.vertexBuffer;
++  case ProbeBuf::Abuf:
++    return resources.storageBuffer;
++  case ProbeBuf::TestSame:
++    return s_probeTestBuffers[0];
++  case ProbeBuf::TestVertex:
++    return s_probeTestBuffers[1];
++  case ProbeBuf::TestPlus4:
++  default:
++    return s_probeTestBuffers[2];
++  }
++}
++
++bool probe_is_test(ProbeBuf which) { return which != ProbeBuf::Vbuf && which != ProbeBuf::Abuf; }
++
++const char* probe_buffer_name(ProbeBuf which) {
++  switch (which) {
++  case ProbeBuf::Vbuf:
++    return "vbuf";
++  case ProbeBuf::Abuf:
++    return "abuf";
++  default:
++    return "new test buffer";
++  }
++}
 +
 +void probe_make_variants() {
 +  if (s_probeLayouts[0]) {
 +    return;
 +  }
-+  const auto& resources = gfx::detail::resources();
++  struct TestDesc {
++    const char* label;
++    wgpu::BufferUsage usage;
++    uint64_t size;
++  };
++  const std::array<TestDesc, 3> tests{{
++      {"vtxprobe test: abuf's usage and size", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
++       gfx::StorageBufferSize},
++      {"vtxprobe test: abuf's size + Vertex",
++       wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, gfx::StorageBufferSize},
++      {"vtxprobe test: abuf's usage, 8 MiB + 4", wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
++       gfx::StorageBufferSize + 4u},
++  }};
++  for (size_t i = 0; i < tests.size(); ++i) {
++    const wgpu::BufferDescriptor desc{.label = tests[i].label, .usage = tests[i].usage, .size = tests[i].size};
++    s_probeTestBuffers[i] = webgpu::g_device.CreateBuffer(&desc);
++    std::vector<uint32_t> words(tests[i].size / 4u);
++    for (uint32_t w = 0; w < words.size(); ++w) {
++      words[w] = probe_pattern(w);
++    }
++    webgpu::g_queue.WriteBuffer(s_probeTestBuffers[i], 0, words.data(), tests[i].size);
++    Log.info("[vtxprobe] test buffer {}: {} bytes, usage 0x{:x}, filled with the probe pattern", tests[i].label,
++             tests[i].size, static_cast<uint64_t>(tests[i].usage));
++  }
 +  for (size_t i = 0; i < kProbeVariants.size(); ++i) {
 +    const std::array entries{
 +        wgpu::BindGroupLayoutEntry{
 +            .binding = 0,
-+            .visibility = kProbeVariants[i].vbufStages,
++            .visibility = wgpu::ShaderStage::Vertex,
 +            .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
 +        },
 +        wgpu::BindGroupLayoutEntry{
 +            .binding = 1,
-+            .visibility = kProbeVariants[i].abufStages,
++            .visibility = kProbeVariants[i].slot1Stages,
 +            .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
 +        },
 +    };
@@ -1278,8 +1345,8 @@ index f0e4207..f73928b 100644
 +    };
 +    s_probeLayouts[i] = webgpu::g_device.CreateBindGroupLayout(&layoutDesc);
 +    const std::array groupEntries{
-+        wgpu::BindGroupEntry{.binding = 0, .buffer = resources.vertexBuffer},
-+        wgpu::BindGroupEntry{.binding = 1, .buffer = resources.storageBuffer},
++        wgpu::BindGroupEntry{.binding = 0, .buffer = probe_buffer(kProbeVariants[i].slot0)},
++        wgpu::BindGroupEntry{.binding = 1, .buffer = probe_buffer(kProbeVariants[i].slot1)},
 +    };
 +    const wgpu::BindGroupDescriptor groupDesc{
 +        .label = "vtxprobe static bind group",
@@ -1315,18 +1382,44 @@ index f0e4207..f73928b 100644
 +  s_probeCaptured.push_back({std::move(request), data});
 +}
 +
-+std::string probe_lengths(uint32_t packed) {
-+  const auto one = [](uint32_t zeroBit, uint32_t units, uint32_t expected) {
-+    if (zeroBit != 0) {
-+      return fmt::format("0 (ERROR: every read returns 0; expected {})", expected);
++uint64_t probe_buffer_bytes(ProbeBuf which) {
++  switch (which) {
++  case ProbeBuf::Vbuf:
++    return gfx::VertexBufferSize;
++  case ProbeBuf::TestPlus4:
++    return gfx::StorageBufferSize + 4u;
++  default:
++    return gfx::StorageBufferSize;
++  }
++}
++
++// What one binding's arrayLength() should be: the bound size in u32 words.
++std::string probe_length(uint32_t binding, ProbeBuf which, uint32_t gpu, bool& ok) {
++  const uint64_t expected = probe_buffer_bytes(which) / 4u;
++  ok = gpu == expected;
++  return fmt::format("binding {} ({}): {} words, expected {}{}", binding, probe_buffer_name(which), gpu, expected,
++                     ok ? " OK" : gpu == 0 ? " ERROR: 0, every read returns 0" : " ERROR: wrong length");
++}
++
++// Binding 1 read directly at kProbeRawWords. The new test buffers hold
++// probe_pattern() everywhere; the real abuf gets it in its last word, which
++// the game's data never reaches (written before every round, see
++// vtxprobe_after_pass). vbuf (variant F) holds game data, so its words are
++// only shown.
++std::string probe_raw(ProbeBuf which, const std::array<uint32_t, 3>& got, uint32_t& checked, uint32_t& good) {
++  std::string out;
++  for (size_t i = 0; i < kProbeRawWords.size(); ++i) {
++    const uint32_t word = kProbeRawWords[i];
++    const bool known = probe_is_test(which) || (which == ProbeBuf::Abuf && word == kProbeRawWords.back());
++    out += fmt::format(" [{}]={:08x}", word, got[i]);
++    if (known) {
++      const bool same = got[i] == probe_pattern(word);
++      ++checked;
++      good += same ? 1u : 0u;
++      out += same ? " (written value, OK)" : fmt::format(" (ERROR: written {:08x})", probe_pattern(word));
 +    }
-+    const uint32_t lo = units << 8;
-+    const bool ok = expected >= lo && expected < lo + 256u;
-+    return fmt::format("{}..{} words{}", lo, lo + 255u,
-+                       ok ? "" : fmt::format(" (ERROR: expected {})", expected));
-+  };
-+  return fmt::format("vbuf {} | abuf {}", one(packed >> 31, (packed >> 16) & 0x7fffu, gfx::VertexBufferSize / 4u),
-+                     one((packed >> 15) & 1u, packed & 0x7fffu, gfx::StorageBufferSize / 4u));
++  }
++  return out;
 +}
 +
 +bool probe_close(float cpu, float gpu) {
@@ -1336,6 +1429,11 @@ index f0e4207..f73928b 100644
 +  return std::fabs(cpu - gpu) <= 1e-3f * std::max(1.f, std::fabs(cpu));
 +}
 +
++struct ProbeVariantTally {
++  uint32_t rows = 0, len0Ok = 0, len1Ok = 0, rawChecked = 0, rawGood = 0;
++  uint32_t len0 = 0, len1 = 0;
++};
++
 +void probe_report() {
 +  const auto* bytes = static_cast<const uint8_t*>(s_probeReadback.GetConstMappedRange(0, s_probeReadback.GetSize()));
 +  if (bytes == nullptr) {
@@ -1344,19 +1442,24 @@ index f0e4207..f73928b 100644
 +  }
 +  const size_t planeBytes = size_t(kProbeRowBytes) * s_probeRows;
 +  Log.info("[vtxprobe] round {}: {} draws re-run through their own shader with probe outputs (left eye), once per "
-+           "buffer declaration",
++           "variant of bindings 0 and 1",
 +           s_probeRound, s_probeInFlight.size() / kProbeVariants.size());
 +  for (const auto& note : s_probeSkipped) {
 +    Log.warn("[vtxprobe]   skipped: {}", note);
 +  }
++  std::array<ProbeVariantTally, kProbeVariants.size()> tally{};
 +  for (uint32_t row = 0; row < s_probeInFlight.size(); ++row) {
 +    const auto& req = s_probeInFlight[row].request;
 +    const uint32_t variant = s_probeInFlight[row].variant;
++    const auto& pv = kProbeVariants[variant];
++    // Positions are compared only where binding 0 is vbuf and binding 1 is
++    // the real abuf, i.e. where the shader reads the game's data.
++    const bool comparePos = pv.slot0 == ProbeBuf::Vbuf && pv.slot1 == ProbeBuf::Abuf;
 +    if (variant == 0) {
 +      Log.info("[vtxprobe] draw {}: {}", row / kProbeVariants.size(), req.label);
 +    }
-+    Log.info("[vtxprobe]  buffers declared: {}", kProbeVariants[variant].name);
-+    uint32_t written = 0, notWritten = 0, posOk = 0, posBad = 0, clipOk = 0, clipBad = 0, lines = 0;
++    Log.info("[vtxprobe]  variant {}", pv.name);
++    uint32_t written = 0, notWritten = 0, posOk = 0, posBad = 0, lines = 0;
 +    bool lensLogged = false;
 +    for (const auto& v : req.verts) {
 +      if (v.vidx >= VtxProbeWidth) {
@@ -1377,41 +1480,53 @@ index f0e4207..f73928b 100644
 +      ++written;
 +      if (!lensLogged) {
 +        lensLogged = true;
-+        Log.info("[vtxprobe]   arrayLength on the GPU: {}", probe_lengths(a[3]));
++        bool ok0 = false, ok1 = false;
++        Log.info("[vtxprobe]   arrayLength on the GPU: {}", probe_length(0, pv.slot0, a[3], ok0));
++        Log.info("[vtxprobe]   arrayLength on the GPU: {}", probe_length(1, pv.slot1, b[0], ok1));
++        auto& t = tally[variant];
++        ++t.rows;
++        t.len0Ok += ok0 ? 1u : 0u;
++        t.len1Ok += ok1 ? 1u : 0u;
++        t.len0 = a[3];
++        t.len1 = b[0];
++        Log.info("[vtxprobe]   binding 1 read directly:{}",
++                 probe_raw(pv.slot1, {b[1], b[2], b[3]}, t.rawChecked, t.rawGood));
++      }
++      if (!comparePos) {
++        continue;
 +      }
 +      std::array<float, 3> gpuPos{};
-+      std::array<float, 4> gpuClip{};
 +      std::memcpy(gpuPos.data(), a.data(), 12);
-+      std::memcpy(gpuClip.data(), b.data(), 16);
 +      if (!v.decoded) {
-+        if (lines < kProbeLinesPerDraw) {
-+          ++lines;
-+          Log.info("[vtxprobe]   vertex {}: GPU pos=({},{},{}) clip=({},{},{},{}) (no CPU value for this vertex)",
-+                   v.vidx, gpuPos[0], gpuPos[1], gpuPos[2], gpuClip[0], gpuClip[1], gpuClip[2], gpuClip[3]);
-+        }
 +        continue;
 +      }
 +      const bool pOk = probe_close(v.pos[0], gpuPos[0]) && probe_close(v.pos[1], gpuPos[1]) &&
 +                       probe_close(v.pos[2], gpuPos[2]);
-+      const bool cOk = probe_close(v.clip[0], gpuClip[0]) && probe_close(v.clip[1], gpuClip[1]) &&
-+                       probe_close(v.clip[2], gpuClip[2]) && probe_close(v.clip[3], gpuClip[3]);
 +      posOk += pOk ? 1u : 0u;
 +      posBad += pOk ? 0u : 1u;
-+      clipOk += cOk ? 1u : 0u;
-+      clipBad += cOk ? 0u : 1u;
-+      if (lines < kProbeLinesPerDraw && (!pOk || !cOk || (lines < 2 && variant == 0))) {
++      if (lines < kProbeLinesPerDraw && (!pOk || lines < 2)) {
 +        ++lines;
-+        Log.info("[vtxprobe]   vertex {}: pos CPU ({},{},{}) GPU ({},{},{}) bits [{:08x} {:08x} {:08x}] {} | clip CPU "
-+                 "({},{},{},{}) GPU ({},{},{},{}) {}",
-+                 v.vidx, v.pos[0], v.pos[1], v.pos[2], gpuPos[0], gpuPos[1], gpuPos[2], a[0], a[1], a[2],
-+                 pOk ? "same" : "DIFFERENT", v.clip[0], v.clip[1], v.clip[2], v.clip[3], gpuClip[0], gpuClip[1],
-+                 gpuClip[2], gpuClip[3], cOk ? "same" : "DIFFERENT");
++        Log.info("[vtxprobe]   vertex {}: pos CPU ({},{},{}) GPU ({},{},{}) bits [{:08x} {:08x} {:08x}] {}", v.vidx,
++                 v.pos[0], v.pos[1], v.pos[2], gpuPos[0], gpuPos[1], gpuPos[2], a[0], a[1], a[2],
++                 pOk ? "same" : "DIFFERENT");
 +      }
 +    }
-+    const bool bad = notWritten != 0 || posBad != 0 || clipBad != 0 || written == 0;
-+    Log.info("[vtxprobe]   summary: {} vertices written, {} not written | position same {} different {} | "
-+             "clip position same {} different {}{}",
-+             written, notWritten, posOk, posBad, clipOk, clipBad, bad ? "  ERROR" : "  (GPU matches CPU)");
++    if (comparePos) {
++      Log.info("[vtxprobe]   summary: {} vertices written, {} not written | position same {} different {}{}", written,
++               notWritten, posOk, posBad, notWritten != 0 || posBad != 0 || written == 0 ? "  ERROR" : "  (GPU matches CPU)");
++    } else {
++      Log.info("[vtxprobe]   summary: {} vertices written, {} not written (positions not compared: the bindings "
++               "don't hold the game's data as it expects)",
++               written, notWritten);
++    }
++  }
++  Log.info("[vtxprobe] round {} by variant (draws: length right at binding 0 / binding 1, direct reads right):",
++           s_probeRound);
++  for (size_t i = 0; i < kProbeVariants.size(); ++i) {
++    const auto& t = tally[i];
++    Log.info("[vtxprobe]   {} -> binding 0 {} of {} right (last {}), binding 1 {} of {} right (last {}), direct "
++             "reads {} of {} right",
++             kProbeVariants[i].name, t.len0Ok, t.rows, t.len0, t.len1Ok, t.rows, t.len1, t.rawGood, t.rawChecked);
 +  }
 +}
 +
@@ -1477,6 +1592,14 @@ index f0e4207..f73928b 100644
 +  // One shader per draw, from the draw's own config with the probe outputs,
 +  // and one pipeline per buffer declaration.
 +  probe_make_variants();
++  // The real abuf's last word, which the game's data never reaches, gets the
++  // probe pattern, so a direct read of it shows whether the shader reads the
++  // memory the copies write. Queue writes land before the next submit.
++  {
++    const uint32_t last = kProbeRawWords.back();
++    const uint32_t marker = probe_pattern(last);
++    webgpu::g_queue.WriteBuffer(gfx::detail::resources().storageBuffer, uint64_t(last) * 4u, &marker, 4);
++  }
 +  std::vector<wgpu::RenderPipeline> pipelines;
 +  std::vector<ProbeCaptured> rows;
 +  uint32_t draws = 0;
@@ -1696,7 +1819,7 @@ index b679362..54f5f76 100644
 +void vtxprobe_poll() noexcept;
  } // namespace aurora::gx
 diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
-index fc18fef..b6db92c 100644
+index fc18fef..937698d 100644
 --- a/lib/gx/shader.cpp
 +++ b/lib/gx/shader.cpp
 @@ -10,6 +10,7 @@
@@ -1716,7 +1839,7 @@ index fc18fef..b6db92c 100644
  std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment) noexcept {
    ZoneScoped;
    const auto hash = xxh3_hash(normalAttachment, xxh3_hash(config));
-@@ -1642,7 +1645,140 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+@@ -1642,7 +1645,138 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
    } else if (!prevAlphaNormalized) {
      fragmentFn += "\n    prev.a = tev_overflow_f32(prev.a);";
    }
@@ -1804,8 +1927,8 @@ index fc18fef..b6db92c 100644
 +        "}";
 +  }
 +  // [vtxprobe] A copy of this shader that hands back what its vertex stage
-+  // computed: the decoded position, the clip position, and the GPU's
-+  // arrayLength() of both buffers. Only the probe asks for it (see
++  // computed: the decoded position, the GPU's arrayLength() of both
++  // buffers, and three words of binding 1 read directly. Only the probe asks for it (see
 +  // pipeline.cpp); everything above runs unchanged, the probe only adds
 +  // outputs, then puts each vertex on its own pixel (x = vertex index) so
 +  // fs_probe can write those values to an integer texture.
@@ -1822,16 +1945,14 @@ index fc18fef..b6db92c 100644
 +    } else {
 +      vtxOutAttrs += fmt::format("\n    @location({}) @interpolate(flat, either) probe0: vec4u,", vtxOutIdx++);
 +      vtxOutAttrs += fmt::format("\n    @location({}) @interpolate(flat, either) probe1: vec4u,", vtxOutIdx++);
-+      // Captured before the arrayLength() line in vs_main can zero out.pos.
-+      vtxXfrAttrs += "\n    let probe_pos = out.pos;";
 +      vtxDiagTail += fmt::format(
 +          "\n    // [vtxprobe]"
 +          "\n    let probe_vlen = arrayLength(&vbuf);"
 +          "\n    let probe_alen = arrayLength(&abuf);"
-+          "\n    let probe_lens = (select(0u, 1u, probe_vlen == 0u) << 31u) | (min(probe_vlen >> 8u, 0x7fffu) << 16u) |"
-+          "\n                     (select(0u, 1u, probe_alen == 0u) << 15u) | min(probe_alen >> 8u, 0x7fffu);"
-+          "\n    out.probe0 = vec4u(bitcast<vec3u>(in_pos), probe_lens);"
-+          "\n    out.probe1 = bitcast<vec4u>(probe_pos);"
++          // Binding 1 read directly at three words (start, middle, last word
++          // of 8 MiB), past our own load_word length check.
++          "\n    out.probe0 = vec4u(bitcast<vec3u>(in_pos), probe_vlen);"
++          "\n    out.probe1 = vec4u(probe_alen, abuf[0u], abuf[1048576u], abuf[2097151u]);"
 +          "\n    if (vidx < {0}u) {{"
 +          "\n        out.pos = vec4f((f32(vidx) + 0.5) / {1:.1f} - 1.0, 0.0, 0.5, 1.0);"
 +          "\n    }} else {{"
@@ -1858,7 +1979,7 @@ index fc18fef..b6db92c 100644
      const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
      const auto comp1 = alpha_compare(config.alphaCompare.comp1, config.alphaCompare.ref1);
      AlphaCompareExpr pass;
-@@ -1698,6 +1834,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+@@ -1698,6 +1832,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
      fragmentReturn += "\n    return out;";
    }
  
@@ -1868,7 +1989,7 @@ index fc18fef..b6db92c 100644
    const auto shaderSource =
        fmt::format(R"""(
  fn bswap32(v: u32, le: bool) -> u32 {{
-@@ -2068,7 +2207,7 @@ fn vs_main(
+@@ -2068,7 +2205,7 @@ fn vs_main(
      // Query both bound buffers so the table covers bindings 0 and 1.
      if (arrayLength(&vbuf) == 0u || arrayLength(&abuf) == 0u) {{
          out.pos = vec4f(0.0);
@@ -1877,7 +1998,7 @@ index fc18fef..b6db92c 100644
      return out;
  }}
  
-@@ -2076,9 +2215,13 @@ fn vs_main(
+@@ -2076,9 +2213,13 @@ fn vs_main(
  @fragment
  fn fs_main(in: FragmentInput) -> {10} {{{6}{5}{11}
  }}

@@ -546,7 +546,64 @@ public:
           xrPhysicalDevice_(xrGfx.physicalDevice),
           xrDevice_(xrGfx.device),
           xrQueue_(xrGfx.commandQueue),
-          xrQueueFamilyIndex_(xrGfx.queueFamilyIndex) {}
+          xrQueueFamilyIndex_(xrGfx.queueFamilyIndex) {
+        logGxBufferMemoryRequirements();
+    }
+
+    // Quest 1 diagnostics ([bufreq]): what the driver says about buffers made
+    // the way Dawn makes Aurora's two GX storage buffers. Dawn keeps its own
+    // VkDevice to itself, so this asks the same driver on the XR device with
+    // the same VkBufferCreateInfo: vbuf is 10 MiB + 1 byte (Dawn adds one for
+    // Vertex usage) aligned to 4, abuf exactly 8 MiB; Dawn always adds
+    // TRANSFER_DST and may add TRANSFER_SRC (toggles), so both are asked.
+    void logGxBufferMemoryRequirements() {
+        struct Case {
+            const char* name;
+            VkDeviceSize size;
+            VkBufferUsageFlags usage;
+        };
+        constexpr VkBufferUsageFlags S = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        constexpr VkBufferUsageFlags V = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        constexpr VkBufferUsageFlags D = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        constexpr VkBufferUsageFlags R = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        const Case cases[] = {
+            {"vbuf as Dawn makes it", 10485764, S | V | D},
+            {"vbuf + TRANSFER_SRC", 10485764, S | V | D | R},
+            {"abuf as Dawn makes it", 8388608, S | D},
+            {"abuf + TRANSFER_SRC", 8388608, S | D | R},
+            {"abuf size + Vertex (Dawn adds 4 bytes)", 8388612, S | V | D},
+            {"abuf usage, 8 MiB + 4", 8388612, S | D},
+            {"abuf usage, vbuf's size", 10485764, S | D},
+            {"vbuf usage, exactly 8 MiB", 8388608, S | V | D},
+        };
+        char buf[320];
+        for (const Case& c : cases) {
+            VkBufferCreateInfo bufCI{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bufCI.size = c.size;
+            bufCI.usage = c.usage;
+            bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            const VkResult res = vkCreateBuffer(xrDevice_, &bufCI, nullptr, &buffer);
+            if (res != VK_SUCCESS) {
+                duskVrSnprintf(buf, sizeof(buf),
+                               "[bufreq] %s: size %llu usage 0x%x: ERROR vkCreateBuffer returned %d\n", c.name,
+                               static_cast<unsigned long long>(c.size), static_cast<unsigned>(c.usage),
+                               static_cast<int>(res));
+                duskVrLog(buf);
+                continue;
+            }
+            VkMemoryRequirements req{};
+            vkGetBufferMemoryRequirements(xrDevice_, buffer, &req);
+            const bool ok = req.size >= c.size && req.size != 0;
+            duskVrSnprintf(buf, sizeof(buf),
+                           "[bufreq] %s: size %llu usage 0x%x -> memory size %llu alignment %llu typeBits 0x%x%s\n",
+                           c.name, static_cast<unsigned long long>(c.size), static_cast<unsigned>(c.usage),
+                           static_cast<unsigned long long>(req.size), static_cast<unsigned long long>(req.alignment),
+                           req.memoryTypeBits, ok ? "" : "  ERROR: memory size smaller than the buffer");
+            duskVrLog(buf);
+            vkDestroyBuffer(xrDevice_, buffer, nullptr);
+        }
+    }
 #else
     // xrDevice/xrQueue are the XR-side ID3D12Device/ID3D12CommandQueue
     // (from vr_xr::createXrGraphicsDevice) -- needed here to create and
