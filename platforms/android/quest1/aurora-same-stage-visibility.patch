@@ -1,0 +1,21 @@
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index ddad4ea..6eb822a 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -441,10 +441,14 @@ void initialize() {
+ 
+   {
+     constexpr std::array layoutEntries{
+-        // Vertex data buffer
++        // Vertex data buffer. Quest 1 (Adreno 540): declared for the same
++        // stages as the storage buffer below. With vertex-only here, the
++        // driver reports arrayLength() of the second buffer as 0 in the GX
++        // vertex shader (measured on the headset), so every abuf read
++        // returns 0.
+         wgpu::BindGroupLayoutEntry{
+             .binding = 0,
+-            .visibility = wgpu::ShaderStage::Vertex,
++            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+             .buffer =
+                 wgpu::BufferBindingLayout{
+                     .type = wgpu::BufferBindingType::ReadOnlyStorage,

@@ -1096,14 +1096,27 @@ index d51516f..9873cdb 100644
    } else if (subCmd == GX_AURORA_SET_STEREO) {
      auto& stereo = g_gxState.stereo;
 diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
-index 27f7145..4d793fb 100644
+index 27f7145..1f174d3 100644
 --- a/lib/gx/gx.cpp
 +++ b/lib/gx/gx.cpp
-@@ -409,6 +409,31 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
+@@ -409,6 +409,44 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
    return g_device.CreateRenderPipeline(&descriptor);
  }
  
-+wgpu::RenderPipeline build_vtxprobe_pipeline(const wgpu::ShaderModule& shader, const char* label) noexcept {
++wgpu::RenderPipeline build_vtxprobe_pipeline(const wgpu::ShaderModule& shader, const char* label,
++                                             const wgpu::BindGroupLayout& staticLayout) noexcept {
++  const std::array layouts{
++      staticLayout,
++      gfx::detail::resources().uniformBindGroupLayout,
++      sTextureBindGroupLayout,
++  };
++  const wgpu::PipelineLayoutDescriptor layoutDesc{
++      .label = "vtxprobe pipeline layout",
++      .bindGroupLayoutCount = layouts.size(),
++      .bindGroupLayouts = layouts.data(),
++      .immediateSize = sizeof(DrawImmediateData),
++  };
++  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDesc);
 +  const std::array<wgpu::ColorTargetState, 2> targets{
 +      wgpu::ColorTargetState{.format = wgpu::TextureFormat::RGBA32Uint},
 +      wgpu::ColorTargetState{.format = wgpu::TextureFormat::RGBA32Uint},
@@ -1116,7 +1129,7 @@ index 27f7145..4d793fb 100644
 +  };
 +  const wgpu::RenderPipelineDescriptor descriptor{
 +      .label = label,
-+      .layout = sPipelineLayout,
++      .layout = pipelineLayout,
 +      .vertex =
 +          {
 +              .module = shader,
@@ -1132,10 +1145,10 @@ index 27f7145..4d793fb 100644
    ZoneScoped;
  
 diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
-index 71213a3..9948408 100644
+index 71213a3..8205ad4 100644
 --- a/lib/gx/gx.hpp
 +++ b/lib/gx/gx.hpp
-@@ -582,6 +582,14 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
+@@ -582,6 +582,16 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
                                      ArrayRef<wgpu::VertexBufferLayout> vtxBuffers, wgpu::ShaderModule shader,
                                      const char* label) noexcept;
  std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment = UINT32_MAX) noexcept;
@@ -1145,13 +1158,15 @@ index 71213a3..9948408 100644
 +constexpr u32 VtxProbeWidth = 64;
 +extern thread_local bool g_buildVtxProbe;
 +// A point-list pipeline for fs_probe: two RGBA32Uint targets, no depth, no
-+// blending, the GX pipeline layout.
-+wgpu::RenderPipeline build_vtxprobe_pipeline(const wgpu::ShaderModule& shader, const char* label) noexcept;
++// blending, the GX pipeline layout with group 0 replaced by staticLayout (the
++// probe compares declarations of the two GX storage buffers).
++wgpu::RenderPipeline build_vtxprobe_pipeline(const wgpu::ShaderModule& shader, const char* label,
++                                             const wgpu::BindGroupLayout& staticLayout) noexcept;
  wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout) noexcept;
  GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
  
 diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
-index f0e4207..60b75f5 100644
+index f0e4207..f73928b 100644
 --- a/lib/gx/pipeline.cpp
 +++ b/lib/gx/pipeline.cpp
 @@ -6,10 +6,17 @@
@@ -1172,7 +1187,7 @@ index f0e4207..60b75f5 100644
  namespace aurora::gx {
  
  wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
-@@ -20,10 +27,382 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+@@ -20,10 +27,454 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
    return build_pipeline(config, layout, {}, shader, label.c_str());
  }
  
@@ -1217,7 +1232,64 @@ index f0e4207..60b75f5 100644
 +struct ProbeCaptured {
 +  VtxProbeRequest request;
 +  DrawData data;
++  uint32_t variant = 0;
 +};
++
++// Each probed draw is re-run once per declaration of the two GX storage
++// buffers (group 0: binding 0 vbuf, binding 1 abuf), to see which one gives
++// the vertex shader abuf's real length.
++struct ProbeVariant {
++  const char* name;
++  wgpu::ShaderStage vbufStages;
++  wgpu::ShaderStage abufStages;
++};
++constexpr std::array<ProbeVariant, 3> kProbeVariants{{
++    {"vbuf vertex-only, abuf vertex+pixel (as before the fix)", wgpu::ShaderStage::Vertex,
++     wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment},
++    {"both vertex+pixel (the fix)", wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
++     wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment},
++    {"both vertex-only", wgpu::ShaderStage::Vertex, wgpu::ShaderStage::Vertex},
++}};
++std::array<wgpu::BindGroupLayout, kProbeVariants.size()> s_probeLayouts;
++std::array<wgpu::BindGroup, kProbeVariants.size()> s_probeBindGroups;
++
++void probe_make_variants() {
++  if (s_probeLayouts[0]) {
++    return;
++  }
++  const auto& resources = gfx::detail::resources();
++  for (size_t i = 0; i < kProbeVariants.size(); ++i) {
++    const std::array entries{
++        wgpu::BindGroupLayoutEntry{
++            .binding = 0,
++            .visibility = kProbeVariants[i].vbufStages,
++            .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
++        },
++        wgpu::BindGroupLayoutEntry{
++            .binding = 1,
++            .visibility = kProbeVariants[i].abufStages,
++            .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
++        },
++    };
++    const wgpu::BindGroupLayoutDescriptor layoutDesc{
++        .label = "vtxprobe static layout",
++        .entryCount = entries.size(),
++        .entries = entries.data(),
++    };
++    s_probeLayouts[i] = webgpu::g_device.CreateBindGroupLayout(&layoutDesc);
++    const std::array groupEntries{
++        wgpu::BindGroupEntry{.binding = 0, .buffer = resources.vertexBuffer},
++        wgpu::BindGroupEntry{.binding = 1, .buffer = resources.storageBuffer},
++    };
++    const wgpu::BindGroupDescriptor groupDesc{
++        .label = "vtxprobe static bind group",
++        .layout = s_probeLayouts[i],
++        .entryCount = groupEntries.size(),
++        .entries = groupEntries.data(),
++    };
++    s_probeBindGroups[i] = webgpu::g_device.CreateBindGroup(&groupDesc);
++  }
++}
 +std::vector<ProbeCaptured> s_probeCaptured; // draws of the pass being encoded
 +std::vector<ProbeCaptured> s_probeInFlight; // draws in the copy being read back
 +std::vector<std::string> s_probeSkipped;
@@ -1271,14 +1343,19 @@ index f0e4207..60b75f5 100644
 +    return;
 +  }
 +  const size_t planeBytes = size_t(kProbeRowBytes) * s_probeRows;
-+  Log.info("[vtxprobe] round {}: {} draws re-run through their own shader with probe outputs (left eye)", s_probeRound,
-+           s_probeInFlight.size());
++  Log.info("[vtxprobe] round {}: {} draws re-run through their own shader with probe outputs (left eye), once per "
++           "buffer declaration",
++           s_probeRound, s_probeInFlight.size() / kProbeVariants.size());
 +  for (const auto& note : s_probeSkipped) {
 +    Log.warn("[vtxprobe]   skipped: {}", note);
 +  }
 +  for (uint32_t row = 0; row < s_probeInFlight.size(); ++row) {
 +    const auto& req = s_probeInFlight[row].request;
-+    Log.info("[vtxprobe] draw {}: {}", row, req.label);
++    const uint32_t variant = s_probeInFlight[row].variant;
++    if (variant == 0) {
++      Log.info("[vtxprobe] draw {}: {}", row / kProbeVariants.size(), req.label);
++    }
++    Log.info("[vtxprobe]  buffers declared: {}", kProbeVariants[variant].name);
 +    uint32_t written = 0, notWritten = 0, posOk = 0, posBad = 0, clipOk = 0, clipBad = 0, lines = 0;
 +    bool lensLogged = false;
 +    for (const auto& v : req.verts) {
@@ -1322,7 +1399,7 @@ index f0e4207..60b75f5 100644
 +      posBad += pOk ? 0u : 1u;
 +      clipOk += cOk ? 1u : 0u;
 +      clipBad += cOk ? 0u : 1u;
-+      if (lines < kProbeLinesPerDraw && (!pOk || !cOk || lines < 2)) {
++      if (lines < kProbeLinesPerDraw && (!pOk || !cOk || (lines < 2 && variant == 0))) {
 +        ++lines;
 +        Log.info("[vtxprobe]   vertex {}: pos CPU ({},{},{}) GPU ({},{},{}) bits [{:08x} {:08x} {:08x}] {} | clip CPU "
 +                 "({},{},{},{}) GPU ({},{},{},{}) {}",
@@ -1332,9 +1409,9 @@ index f0e4207..60b75f5 100644
 +      }
 +    }
 +    const bool bad = notWritten != 0 || posBad != 0 || clipBad != 0 || written == 0;
-+    Log.info("[vtxprobe]   draw {} summary: {} vertices written, {} not written | position same {} different {} | "
++    Log.info("[vtxprobe]   summary: {} vertices written, {} not written | position same {} different {} | "
 +             "clip position same {} different {}{}",
-+             row, written, notWritten, posOk, posBad, clipOk, clipBad, bad ? "  ERROR" : "  (GPU matches CPU)");
++             written, notWritten, posOk, posBad, clipOk, clipBad, bad ? "  ERROR" : "  (GPU matches CPU)");
 +  }
 +}
 +
@@ -1397,11 +1474,14 @@ index f0e4207..60b75f5 100644
 +    return;
 +  }
 +
-+  // One pipeline per draw, from the draw's own config with the probe outputs.
++  // One shader per draw, from the draw's own config with the probe outputs,
++  // and one pipeline per buffer declaration.
++  probe_make_variants();
 +  std::vector<wgpu::RenderPipeline> pipelines;
 +  std::vector<ProbeCaptured> rows;
++  uint32_t draws = 0;
 +  for (auto& c : captured) {
-+    if (rows.size() >= kProbeMaxDraws) {
++    if (draws >= kProbeMaxDraws) {
 +      break;
 +    }
 +    if (c.data.instanceCount != 1) {
@@ -1420,14 +1500,17 @@ index f0e4207..60b75f5 100644
 +    const auto label = fmt::format("vtxprobe {}", c.request.id);
 +    const wgpu::ShaderModuleDescriptor moduleDesc{.nextInChain = &wgsl, .label = label.c_str()};
 +    // Any device error is fatal in Aurora, so the probe's own shader and
-+    // pipeline are made inside error scopes: a probe that the driver refuses
-+    // is reported and skipped, never used and never fatal.
++    // pipelines are made inside error scopes: a probe that the driver
++    // refuses is reported and skipped, never used and never fatal.
 +    auto& device = webgpu::g_device;
 +    device.PushErrorScope(wgpu::ErrorFilter::OutOfMemory);
 +    device.PushErrorScope(wgpu::ErrorFilter::Internal);
 +    device.PushErrorScope(wgpu::ErrorFilter::Validation);
 +    const auto module = device.CreateShaderModule(&moduleDesc);
-+    auto probePipeline = build_vtxprobe_pipeline(module, label.c_str());
++    std::array<wgpu::RenderPipeline, kProbeVariants.size()> variantPipelines;
++    for (size_t v = 0; v < kProbeVariants.size(); ++v) {
++      variantPipelines[v] = build_vtxprobe_pipeline(module, label.c_str(), s_probeLayouts[v]);
++    }
 +    std::string errors;
 +    bool allPopped = true;
 +    for (const char* filter : {"validation", "internal", "out of memory"}) {
@@ -1445,12 +1528,15 @@ index f0e4207..60b75f5 100644
 +      }
 +    }
 +    if (!allPopped || !errors.empty()) {
-+      s_probeSkipped.push_back(fmt::format("{}: the probe's shader/pipeline was refused{}{}", c.request.label,
++      s_probeSkipped.push_back(fmt::format("{}: the probe's shader/pipelines were refused{}{}", c.request.label,
 +                                           allPopped ? "" : " [error scope result never arrived]", errors));
 +      continue;
 +    }
-+    pipelines.push_back(std::move(probePipeline));
-+    rows.push_back(std::move(c));
++    ++draws;
++    for (uint32_t v = 0; v < kProbeVariants.size(); ++v) {
++      pipelines.push_back(variantPipelines[v]);
++      rows.push_back({c.request, c.data, v});
++    }
 +  }
 +  if (rows.empty()) {
 +    Log.warn("[vtxprobe] round {}: none of {} picked draws could be probed", s_probeRound, captured.size());
@@ -1489,10 +1575,10 @@ index f0e4207..60b75f5 100644
 +  };
 +  const auto& resources = gfx::detail::resources();
 +  auto pass = cmd.BeginRenderPass(&passDesc);
-+  pass.SetBindGroup(0, resources.staticBindGroup);
 +  for (uint32_t row = 0; row < s_probeRows; ++row) {
 +    const auto& data = rows[row].data;
 +    pass.SetPipeline(pipelines[row]);
++    pass.SetBindGroup(0, s_probeBindGroups[rows[row].variant]);
 +    pass.SetViewport(0.f, static_cast<float>(row), static_cast<float>(VtxProbeWidth), 1.f, 0.f, 1.f);
 +    DrawImmediateData immediates = data.immediateData;
 +    immediates.stereoEye = 0;
@@ -1529,7 +1615,8 @@ index f0e4207..60b75f5 100644
 +  s_probeInFlight = std::move(rows);
 +  s_probePasses = 0;
 +  s_probeState.store(PS_COPIED, std::memory_order_release);
-+  Log.info("[vtxprobe] round {}: {} draws encoded for readback", s_probeRound, s_probeInFlight.size());
++  Log.info("[vtxprobe] round {}: {} draws x {} buffer declarations encoded for readback", s_probeRound,
++           s_probeInFlight.size() / kProbeVariants.size(), kProbeVariants.size());
 +}
 +
  void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
