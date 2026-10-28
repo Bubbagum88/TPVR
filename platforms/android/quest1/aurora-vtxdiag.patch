@@ -1183,7 +1183,7 @@ index 71213a3..ecb3299 100644
  GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
  
 diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
-index f0e4207..1588cd0 100644
+index f0e4207..b0311a4 100644
 --- a/lib/gx/pipeline.cpp
 +++ b/lib/gx/pipeline.cpp
 @@ -6,10 +6,17 @@
@@ -1204,7 +1204,7 @@ index f0e4207..1588cd0 100644
  namespace aurora::gx {
  
  wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
-@@ -20,10 +27,506 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+@@ -20,10 +27,508 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
    return build_pipeline(config, layout, {}, shader, label.c_str());
  }
  
@@ -1240,7 +1240,9 @@ index f0e4207..1588cd0 100644
 +constexpr uint32_t kProbeRowBytes = VtxProbeWidth * 16; // RGBA32Uint, a multiple of 256
 +
 +enum ProbeState : int { PS_ACCEPTING, PS_COPIED, PS_MAPPING, PS_MAPPED, PS_FAILED, PS_DONE };
-+std::atomic<int> s_probeState{PS_ACCEPTING};
++// Off: the probe re-runs draws through extra shaders and pipelines.
++constexpr bool kVtxProbeEnabled = false;
++std::atomic<int> s_probeState{kVtxProbeEnabled ? PS_ACCEPTING : PS_DONE};
 +std::atomic<uint32_t> s_probeNextId{1};
 +std::mutex s_probeMutex;
 +std::unordered_map<uint32_t, VtxProbeRequest> s_probePending; // command processor -> render worker
@@ -1765,7 +1767,7 @@ index b679362..54f5f76 100644
 +void vtxprobe_poll() noexcept;
  } // namespace aurora::gx
 diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
-index b424ab6..4a4740b 100644
+index b424ab6..34e9632 100644
 --- a/lib/gx/shader.cpp
 +++ b/lib/gx/shader.cpp
 @@ -10,6 +10,7 @@
@@ -1786,7 +1788,7 @@ index b424ab6..4a4740b 100644
  std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment) noexcept {
    ZoneScoped;
    const auto hash = xxh3_hash(normalAttachment, xxh3_hash(config));
-@@ -1645,7 +1649,140 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+@@ -1645,7 +1649,142 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
    } else if (!prevAlphaNormalized) {
      fragmentFn += "\n    prev.a = tev_overflow_f32(prev.a);";
    }
@@ -1803,9 +1805,11 @@ index b424ab6..4a4740b 100644
 +  // The alpha test is skipped in painted draws so a failing test can't hide
 +  // the colour. Needs one spare inter-stage location; a shader with none
 +  // left is drawn normally and logged once.
++  // Off: the paint replaces the game's colours and skips the alpha test.
++  constexpr bool kVtxDiagPaint = false;
 +  bool vtxDiag = false;
 +  std::string vtxDiagTail;
-+  if (stereo) {
++  if (kVtxDiagPaint && stereo) {
 +    static const uint32_t s_maxInterStage = [] {
 +      wgpu::Limits limits{};
 +      webgpu::g_device.GetLimits(&limits);
@@ -1928,7 +1932,7 @@ index b424ab6..4a4740b 100644
      const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
      const auto comp1 = alpha_compare(config.alphaCompare.comp1, config.alphaCompare.ref1);
      AlphaCompareExpr pass;
-@@ -1701,6 +1838,30 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+@@ -1701,6 +1840,30 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
      fragmentReturn += "\n    return out;";
    }
  
@@ -1959,7 +1963,7 @@ index b424ab6..4a4740b 100644
    const auto shaderSource =
        fmt::format(R"""(
  fn bswap32(v: u32, le: bool) -> u32 {{
-@@ -2049,10 +2210,7 @@ struct Uniform {{
+@@ -2049,10 +2212,7 @@ struct Uniform {{
      render_viewport_size: vec2f,
      logical_viewport_size: vec2f,{0}
  }};
@@ -1971,7 +1975,7 @@ index b424ab6..4a4740b 100644
  // Sizes of vbuf and abuf in 32-bit words, set from the buffers themselves
  // when each pipeline is made (build_pipeline in gx.cpp).
  override vbuf_words: u32;
-@@ -2081,7 +2239,7 @@ fn vs_main(
+@@ -2081,7 +2241,7 @@ fn vs_main(
      // a length above them would mean the wrong buffer is bound.
      if (arrayLength(&vbuf) > vbuf_words || arrayLength(&abuf) > abuf_words) {{
          out.pos = vec4f(0.0);
@@ -1980,7 +1984,7 @@ index b424ab6..4a4740b 100644
      return out;
  }}
  
-@@ -2089,9 +2247,14 @@ fn vs_main(
+@@ -2089,9 +2249,14 @@ fn vs_main(
  @fragment
  fn fs_main(in: FragmentInput) -> {10} {{{6}{5}{11}
  }}
