@@ -87,7 +87,6 @@ jobs:
           DUSK_ANDROID_KEYSTORE: ${{ github.workspace }}/platforms/android/ci-debug.keystore
           DUSK_ANDROID_KEYSTORE_PASSWORD: android
           DUSK_ANDROID_KEY_ALIAS: androiddebugkey
-          ANDROID_STAGE_STRIP: "0"
         run: ./gradlew :app:assembleRelease --rerun-tasks
 
       - name: Upload APK
@@ -95,3 +94,12 @@ jobs:
         with:
           name: tpvr-quest1-apk
           path: platforms/android/app/build/outputs/apk/release/app-arm64-v8a-release*.apk
+
+      # The APK's libmain.so is stripped (about 90 MB smaller). This is the same
+      # library with its symbols, for turning crash addresses into names.
+      - name: Upload libmain.so symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: tpvr-quest1-symbols
+          path: platforms/android/app/build/generated/jniLibs/borealis/arm64-v8a/libmain.so
+          if-no-files-found: error
