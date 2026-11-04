@@ -51,6 +51,7 @@
 #include "dusk/dusk.h"
 #include "dusk/game_clock.h"
 #include "dusk/vr/vr_main.hpp"
+#include "dusk/disc_probe.hpp"
 
 #if defined(TARGET_PC) && defined(_WIN32)
 // TEMP DIAGNOSTIC (VR water-black investigation): manual RenderDoc capture
@@ -118,6 +119,7 @@ static RENDERDOC_API_1_1_2* getRenderDocApi() {
 #include "SSystem/SComponent/c_API_graphic.h"
 
 #include <aurora/aurora.h>
+#include <aurora/gfx.hpp>
 #include <aurora/dvd.h>
 #include <aurora/event.h>
 #include <borealis/aurora_log.h>
@@ -918,6 +920,21 @@ int game_main(int argc, char* argv[]) {
         auroraInfo = aurora_initialize(argc, argv, &config);
     }
 
+#if TARGET_ANDROID
+    // A standalone headset never shows this Activity's window (the system
+    // shows its own splash until the XR session runs), yet the setup wizard
+    // and prelaunch screens kept presenting to it. On a Quest 1 its buffers
+    // were swapped out when the disc picker opened ("dequeueBuffer returned
+    // unrecognized buffer"), the surface was lost, and recreating it crashed
+    // (2026-11-04). The VR session already suppresses it while it runs
+    // (vr_main.cpp startup()); do it from here on a headset. RmlUi still
+    // records every frame for the in-headset menu.
+    if (auroraInfo.backend != BACKEND_NULL && dusk::vr::isStandaloneHeadset()) {
+        aurora::gfx::set_surface_present_suppressed(true);
+        DuskLog.info("Standalone headset: not presenting to the Activity window (never shown)");
+    }
+#endif
+
     dusk::presentation::update_frame_rate_preference();
 
 #if BOREALIS_HAS_DISCORD
@@ -1128,6 +1145,7 @@ int game_main(int argc, char* argv[]) {
             DuskLog.fatal("DVD image failed validation: {}", dvdPath);
         }
         DuskLog.info("Loading DVD image: {}", dvdPath);
+        dusk::disc_probe::log_content_uri(dvdPath, "loading");
         if (!aurora_dvd_open(dvdPath.c_str())) {
             DuskLog.fatal("Failed to open DVD image: {}", dvdPath);
         }

@@ -22,6 +22,14 @@ namespace dusk::vr {
 // XR/D3D12 setup failure -- caller should proceed without VR, not crash.
 bool startup();
 
+// True on an Android device that reports the platform's VR head-tracking
+// feature (PackageManager.hasSystemFeature("android.hardware.vr.headtracking"):
+// Quest, Pico, other standalone headsets). Their Activity window is never
+// shown -- the system shows its own splash until the XR session runs -- so
+// nothing should be presented to it. False on every other platform, and on
+// Android phones. Cached after the first call.
+bool isStandaloneHeadset();
+
 // True once startup() has succeeded and a session exists. This does NOT
 // mean tick() is currently drawing anything -- a session can be active with
 // no gameplay view yet (title/loading screens), in which case tick() pumps

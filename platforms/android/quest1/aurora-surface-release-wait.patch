@@ -1,0 +1,88 @@
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index 0da5cab..f96e503 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -62,6 +62,8 @@ static AuroraSampler g_Resampler = SAMPLER_BILINEAR;
+ static wgpu::BindGroupLayout g_ResampleBindGroupLayout;
+ static wgpu::RenderPipeline g_ResamplePipeline;
+ static wgpu::Buffer g_ResampleUniformBuffer;
++static wgpu::Buffer g_surfaceReleaseFlushBuffer; // see wait_for_released_surface()
++static bool g_surfaceReleasePending = false;
+ static TextureWithSampler g_resampledFrameBuffer;
+ 
+ static wgpu::Adapter g_adapter;
+@@ -802,7 +804,50 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
+   }
+ }
+ 
+-static void release_surface_locked() noexcept { g_surface = {}; }
++static void release_surface_locked() noexcept {
++  if (g_surface) {
++    g_surfaceReleasePending = true;
++  }
++  g_surface = {};
++}
++
++// Dawn does not destroy a released surface's VkSwapchainKHR and VkSurfaceKHR
++// at once: SwapChainVk.cpp DetachFromSurfaceImpl() hands both to the fenced
++// deleter, tagged with the queue's pending serial, and they are destroyed only
++// after a submission carrying that serial completes and the device ticks.
++// Until then the swapchain stays connected to the window, so a new
++// vkCreateAndroidSurfaceKHR on it fails with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR,
++// which Dawn turns into device loss (seen on a Quest 1 after "Surface texture
++// is Lost", 2026-11-04). This submits a small write so the pending serial is
++// submitted, waits for it, and ticks the device so the deleter runs.
++static void wait_for_released_surface() noexcept {
++  if (!g_surfaceReleasePending || !g_device || !g_queue) {
++    return;
++  }
++  g_surfaceReleasePending = false;
++  if (!g_surfaceReleaseFlushBuffer) {
++    const wgpu::BufferDescriptor descriptor{
++        .label = "Surface release flush buffer",
++        .usage = wgpu::BufferUsage::CopyDst,
++        .size = 4,
++    };
++    g_surfaceReleaseFlushBuffer = g_device.CreateBuffer(&descriptor);
++  }
++  const uint32_t zero = 0;
++  g_queue.WriteBuffer(g_surfaceReleaseFlushBuffer, 0, &zero, sizeof(zero));
++  wgpu::QueueWorkDoneStatus workStatus = wgpu::QueueWorkDoneStatus::CallbackCancelled;
++  const auto future = g_queue.OnSubmittedWorkDone(
++      wgpu::CallbackMode::WaitAnyOnly,
++      [&](wgpu::QueueWorkDoneStatus status, wgpu::StringView) { workStatus = status; });
++  const auto waitStatus = g_instance.WaitAny(future, 5000000000);
++  g_device.Tick();
++  if (waitStatus != wgpu::WaitStatus::Success || workStatus != wgpu::QueueWorkDoneStatus::Success) {
++    Log.warn("Waiting for the released surface: wait status {}, work status {}",
++             magic_enum::enum_name(waitStatus), magic_enum::enum_name(workStatus));
++  } else {
++    Log.info("Released surface's swapchain freed before creating a new surface");
++  }
++}
+ 
+ static bool create_surface() {
+   SDL_Window* window = window::get_sdl_window();
+@@ -810,8 +855,12 @@ static bool create_surface() {
+     Log.error("Failed to create surface: no window");
+     return false;
+   }
++  {
++    window::SurfaceLock surfaceLock;
++    release_surface_locked();
++  }
++  wait_for_released_surface();
+   window::SurfaceLock surfaceLock;
+-  release_surface_locked();
+   g_surface = create_window_surface(g_instance, window, "Surface");
+   if (!g_surface) {
+     Log.error("Failed to create surface");
+@@ -1214,6 +1263,8 @@ void shutdown() {
+   g_ResampleBindGroupLayout = {};
+   g_ResamplePipeline = {};
+   g_ResampleUniformBuffer = {};
++  g_surfaceReleaseFlushBuffer = {};
++  g_surfaceReleasePending = false;
+   g_resampledFrameBuffer = {};
+   g_frameBuffer = {};
+   g_frameBufferResolved = {};

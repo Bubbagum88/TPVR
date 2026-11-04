@@ -3,6 +3,7 @@
 #include "dusk/app_info.hpp"
 #include "dusk/config.hpp"
 #include "dusk/data.hpp"
+#include "dusk/disc_probe.hpp"
 #include "dusk/game_mode.hpp"
 #include "dusk/iso_validate.hpp"
 #include "dusk/language.hpp"
@@ -472,6 +473,7 @@ void file_dialog_callback(borealis::file_select::Result result) {
         return;
     }
 
+    disc_probe::log_content_uri(result.locations.front(), "picked");
     begin_disc_verification(result.locations.front());
 }
 
