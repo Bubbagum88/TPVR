@@ -1471,7 +1471,6 @@ set(DUSK_FILES
         src/dusk/interp/particle.cpp
         src/dusk/interp/samples.cpp
         src/dusk/interp/vertex.cpp
-        src/dusk/disc_probe.cpp
         src/dusk/io.cpp
         src/dusk/iso_validate.cpp
         src/dusk/language.cpp

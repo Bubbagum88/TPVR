@@ -478,50 +478,6 @@ bool isActive() {
     return g_session != nullptr;
 }
 
-bool isStandaloneHeadset() {
-#if DUSK_VR_PLATFORM_ANDROID
-    static const bool standalone = [] {
-        JNIEnv* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
-        jobject activity = static_cast<jobject>(SDL_GetAndroidActivity());
-        if (env == nullptr || activity == nullptr) {
-            VrLog.warn("isStandaloneHeadset: no JNI env or activity, assuming not a headset");
-            return false;
-        }
-        bool result = false;
-        jclass activityClass = env->GetObjectClass(activity);
-        jmethodID getPackageManager =
-            env->GetMethodID(activityClass, "getPackageManager", "()Landroid/content/pm/PackageManager;");
-        jobject packageManager = getPackageManager ? env->CallObjectMethod(activity, getPackageManager) : nullptr;
-        if (packageManager != nullptr && !env->ExceptionCheck()) {
-            jclass pmClass = env->GetObjectClass(packageManager);
-            jmethodID hasSystemFeature = env->GetMethodID(pmClass, "hasSystemFeature", "(Ljava/lang/String;)Z");
-            jstring feature = env->NewStringUTF("android.hardware.vr.headtracking");
-            if (hasSystemFeature != nullptr && feature != nullptr) {
-                result = env->CallBooleanMethod(packageManager, hasSystemFeature, feature) == JNI_TRUE;
-            }
-            if (feature != nullptr) {
-                env->DeleteLocalRef(feature);
-            }
-            env->DeleteLocalRef(pmClass);
-            env->DeleteLocalRef(packageManager);
-        }
-        if (env->ExceptionCheck()) {
-            env->ExceptionDescribe();
-            env->ExceptionClear();
-            VrLog.warn("isStandaloneHeadset: Java exception while asking PackageManager, assuming not a headset");
-            result = false;
-        }
-        env->DeleteLocalRef(activityClass);
-        env->DeleteLocalRef(activity);
-        VrLog.info("isStandaloneHeadset: android.hardware.vr.headtracking = {}", result);
-        return result;
-    }();
-    return standalone;
-#else
-    return false;
-#endif
-}
-
 bool isRenderingToHeadset() {
     return g_renderedToHeadsetThisFrame;
 }
@@ -1953,12 +1909,8 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
                 // detachVrMenuGamepad() comment).
                 detachVrMenuGamepad();
                 // Let the (now possibly visible again) window present
-                // normally -- see startup()'s matching suppression. Not on a
-                // standalone headset, where the window is never shown (see
-                // isStandaloneHeadset() and m_Do_main.cpp).
-                if (!isStandaloneHeadset()) {
-                    aurora::gfx::set_surface_present_suppressed(false);
-                }
+                // normally -- see startup()'s matching suppression.
+                aurora::gfx::set_surface_present_suppressed(false);
                 g_session = nullptr;
                 g_sessionRunning = false;
                 g_duskVRSessionActive = false;
