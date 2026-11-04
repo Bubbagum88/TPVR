@@ -44,6 +44,7 @@ jobs:
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-buffer-sizes.patch
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-rmlui-render-scale.patch
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-copy-dynamic-offset.patch
+          git -C extern/aurora apply ../../platforms/android/quest1/aurora-fragment-both-lengths.patch
 
       - name: Install dependencies
         run: |

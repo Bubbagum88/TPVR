@@ -1,0 +1,22 @@
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index b424ab6..7eebd5d 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -2087,7 +2087,16 @@ fn vs_main(
+ 
+ {9}
+ @fragment
+-fn fs_main(in: FragmentInput) -> {10} {{{6}{5}{11}
++fn fs_main(in: FragmentInput) -> {10} {{{6}{5}
++    // Quest 1 (Adreno 540): the driver keeps the buffer-length table of the
++    // last stage only. In the PrimedGun 2.0 port of this renderer, a fragment
++    // stage that read one buffer (range fog reads abuf) left a table covering
++    // that one, and the draw wrote past it for the other (the
++    // vulkan.msm8998.so +0xd1bf4 crash). So fs_main asks both lengths, as
++    // vs_main does, whatever it reads.
++    if (arrayLength(&vbuf) > vbuf_words || arrayLength(&abuf) > abuf_words) {{
++        prev = vec4f(0.0);
++    }}{11}
+ }}
+ )""",
+                   uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn, fragmentFnPre,
