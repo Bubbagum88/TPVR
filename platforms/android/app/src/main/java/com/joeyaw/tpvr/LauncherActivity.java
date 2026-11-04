@@ -2,9 +2,11 @@ package com.joeyaw.tpvr;
 
 import android.app.Activity;
 import android.app.ActivityOptions;
+import android.Manifest;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -25,12 +27,13 @@ import java.io.File;
 // app, DuskActivity's window is never shown, so that screen is invisible, and
 // the system disc picker breaks the hidden window (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR,
 // 2026-11-04). Started from a 2D launcher it worked, so setup lives here: choose
-// the disc image, grant all-files access, then start the game in VR.
+// the disc image, grant file access, then start the game in VR.
 public class LauncherActivity extends Activity {
     private static final String TAG = "TPVRLauncher";
     private static final String PREFS_NAME = "launcher";
     private static final String PREF_DISC_PATH = "discPath";
     private static final int PICK_DISC_REQUEST_CODE = 0x5450;
+    private static final int STORAGE_PERMISSION_REQUEST_CODE = 0x5451;
 
     private TextView discLabel;
     private TextView messageLabel;
@@ -91,13 +94,23 @@ public class LauncherActivity extends Activity {
         return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_DISC_PATH, "");
     }
 
-    private static boolean hasStorageAccess() {
-        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager();
+    // Android 10 (the Quest 1) has no all-files access: reading a path in
+    // shared storage needs READ_EXTERNAL_STORAGE, granted at run time, plus
+    // requestLegacyExternalStorage in the manifest. Without it the file can
+    // still be found (stat works) but not opened, which is why the game got
+    // ValidationError=1 (IOError) for the disc the launcher saw (2026-11-04).
+    private boolean hasStorageAccess() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+        }
+        return Environment.isExternalStorageManager();
     }
 
     private void refresh() {
         String path = savedDiscPath();
-        boolean haveDisc = !path.isEmpty() && new File(path).isFile();
+        File disc = new File(path);
+        boolean haveDisc = !path.isEmpty() && disc.isFile() && disc.canRead();
         boolean storage = hasStorageAccess();
         if (path.isEmpty()) {
             discLabel.setText("Disc image: none chosen");
@@ -171,6 +184,8 @@ public class LauncherActivity extends Activity {
 
     private void requestStorageAccess() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            requestPermissions(new String[] {Manifest.permission.READ_EXTERNAL_STORAGE},
+                STORAGE_PERMISSION_REQUEST_CODE);
             return;
         }
         try {
@@ -180,6 +195,18 @@ public class LauncherActivity extends Activity {
             Log.e(TAG, "No all-files access settings screen", e);
             messageLabel.setText("Could not open the file access settings.");
         }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode != STORAGE_PERMISSION_REQUEST_CODE) {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+            return;
+        }
+        if (!hasStorageAccess()) {
+            messageLabel.setText("File access was not allowed, so the game can't read the disc.");
+        }
+        refresh();
     }
 
     private void startGame() {
