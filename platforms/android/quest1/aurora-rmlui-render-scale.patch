@@ -1,0 +1,82 @@
+diff --git a/include/aurora/rmlui.hpp b/include/aurora/rmlui.hpp
+index 37d3a88..9c83a84 100644
+--- a/include/aurora/rmlui.hpp
++++ b/include/aurora/rmlui.hpp
+@@ -29,6 +29,13 @@ bool is_initialized() noexcept;
+ void set_input_type(InputType type) noexcept;
+ void set_ui_scale(float scale) noexcept;
+ float get_ui_scale() noexcept;
++// Draws the UI at this fraction (0.25 to 1) of the presentation size, with the
++// same layout. Lower values cost fewer pixels; the result is scaled up where
++// it is shown. Default 1. Added by TPVR's Quest 1 patch, which defines
++// AURORA_RMLUI_HAS_RENDER_SCALE so callers build without the patch too.
++#define AURORA_RMLUI_HAS_RENDER_SCALE 1
++void set_render_scale(float scale) noexcept;
++float get_render_scale() noexcept;
+ void set_glass_light_dir(float x, float y) noexcept;
+ 
+ struct RuntimeTexture {
+diff --git a/lib/rmlui.cpp b/lib/rmlui.cpp
+index 41050e0..c456642 100644
+--- a/lib/rmlui.cpp
++++ b/lib/rmlui.cpp
+@@ -40,6 +40,8 @@ struct TrackedTouch {
+ uint32_t s_pressedMouseButtons = 0;
+ std::array<TrackedTouch, MaxTrackedTouches> s_trackedTouches{};
+ float s_uiScale = 0.0f;
++// Fraction of the presentation size the UI is drawn at (see set_render_scale()).
++float s_renderScale = 1.0f;
+ webgpu::TextureWithSampler s_renderTarget;
+ wgpu::BindGroup s_renderTargetCopyBindGroup;
+ bool s_forceNoBackdrop = false; // see set_force_no_backdrop()'s comment in rmlui.hpp
+@@ -61,14 +63,27 @@ Rml::Vector2i presentation_dimensions_from_window_size(const AuroraWindowSize& s
+   return dimensions_from_viewport(viewport);
+ }
+ 
+-void sync_context_metrics(Rml::Vector2i dimensions) noexcept {
+-  if (g_context == nullptr || dimensions.x <= 0 || dimensions.y <= 0) {
++// The presentation size scaled by s_renderScale: the size the context lays out
++// in and the render target is drawn at.
++Rml::Vector2i render_dimensions(Rml::Vector2i dimensions) noexcept {
++  return {
++      std::max(1, static_cast<int>(std::lround(static_cast<float>(dimensions.x) * s_renderScale))),
++      std::max(1, static_cast<int>(std::lround(static_cast<float>(dimensions.y) * s_renderScale))),
++  };
++}
++
++// Takes the presentation size. The pixel ratio is scaled with the dimensions,
++// so the layout in density-independent pixels stays the same at any render
++// scale: only the number of pixels drawn changes.
++void sync_context_metrics(Rml::Vector2i presentationDimensions) noexcept {
++  if (g_context == nullptr || presentationDimensions.x <= 0 || presentationDimensions.y <= 0) {
+     return;
+   }
++  const Rml::Vector2i dimensions = render_dimensions(presentationDimensions);
+   if (g_context->GetDimensions() != dimensions) {
+     g_context->SetDimensions(dimensions);
+   }
+-  const float ratio = s_uiScale > 0.0f ? s_uiScale : window::get_window_size().scale;
++  const float ratio = (s_uiScale > 0.0f ? s_uiScale : window::get_window_size().scale) * s_renderScale;
+   if (g_context->GetDensityIndependentPixelRatio() != ratio) {
+     g_context->SetDensityIndependentPixelRatio(ratio);
+   }
+@@ -389,6 +404,10 @@ bool is_initialized() noexcept { return g_context != nullptr; }
+ 
+ void set_ui_scale(float scale) noexcept { s_uiScale = scale > 0.0f ? std::clamp(scale, 0.25f, 4.0f) : 0.0f; }
+ 
++void set_render_scale(float scale) noexcept { s_renderScale = std::clamp(scale, 0.25f, 1.0f); }
++
++float get_render_scale() noexcept { return s_renderScale; }
++
+ float get_ui_scale() noexcept { return s_uiScale; }
+ 
+ void set_glass_light_dir(float x, float y) noexcept {
+@@ -457,7 +476,7 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
+ 
+   ZoneScoped;
+   const Rml::Vector2i dim = dimensions_from_viewport(presentViewport);
+-  ensure_render_target(dim);
++  ensure_render_target(render_dimensions(dim));
+   if (!s_renderTarget.view) {
+     return {};
+   }

@@ -93,6 +93,7 @@ UserSettings g_userSettings = {
         .vrScreenModeDepth {"game.vrScreenModeDepth", 1.0f},
         .vrSinglePassStereo {"game.vrSinglePassStereo", true},
         .vrRenderScale {"game.vrRenderScale", 1.0f},
+        .vrMenuResolution {"game.vrMenuResolution", kDefaultUiRenderScale},
         .vrHighClocks {"game.vrHighClocks", true},
         .vrDisplayRefreshRate {"game.vrDisplayRefreshRate", 72},
         .vrSuperResolution {"game.vrSuperResolution", true},
@@ -430,6 +431,8 @@ void registerSettings() {
     Register(g_userSettings.game.vrScreenModeDepth);
     Register(g_userSettings.game.vrSinglePassStereo);
     Register(g_userSettings.game.vrRenderScale);
+    Register(g_userSettings.game.vrMenuResolution,
+        [](const float&, const float&) { dusk::ui::apply_scale(); });
     Register(g_userSettings.game.vrHighClocks);
     Register(g_userSettings.game.vrDisplayRefreshRate);
     Register(g_userSettings.game.vrSuperResolution);

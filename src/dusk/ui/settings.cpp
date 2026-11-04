@@ -27,6 +27,7 @@
 
 #include <aurora/gfx.h>
 #include <aurora/lib/window.hpp>
+#include <aurora/rmlui.hpp>
 #include <borealis/file_select.hpp>
 #include <borealis/io.hpp>
 #if BOREALIS_HAS_SENTRY
@@ -1246,6 +1247,15 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             "more GPU headroom on the standalone headset -- 90% cuts the pixel count "
             "by a fifth. Takes effect the next time the game starts.",
             50, 100, 5);
+#ifdef AURORA_RMLUI_HAS_RENDER_SCALE
+        config_percent_select(leftPane, rightPane, getSettings().game.vrMenuResolution,
+            "Menu Resolution",
+            "Draws the Dusklight menu at this fraction of the window's resolution, with the "
+            "same layout. Lower values are softer but cost the GPU less; the headset shows "
+            "the menu smaller than the window, so most of the detail at 100% is never seen. "
+            "Applies immediately.",
+            25, 100, 5);
+#endif
 #if VR_SETTINGS_STANDALONE
         config_bool_select(leftPane, rightPane, getSettings().game.vrHighClocks,
             {

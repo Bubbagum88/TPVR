@@ -21,9 +21,16 @@ inline constexpr int kDefaultInternalResolutionScale = 1;
 // shows the menu as a VR billboard where 100% is unreadably small (user
 // settled on 200%, 2026-09-20); a desktop monitor wants the normal 100%.
 inline constexpr int kDefaultUiScalePercent = 200;
+// Fraction of the window size the Dusklight menu is drawn at. The Quest's
+// window is 2880x1600, larger than an eye image, while the headset shows the
+// menu as a billboard covering part of the view; at full size the Quest 1's
+// GPU spent 15 ms a frame on it in play and 48 ms with a menu open
+// (2026-11-04 gpuprof).
+inline constexpr float kDefaultUiRenderScale = 0.5f;
 #else
 inline constexpr int kDefaultInternalResolutionScale = 0;
 inline constexpr int kDefaultUiScalePercent = 100;
+inline constexpr float kDefaultUiRenderScale = 1.0f;
 #endif
 
 enum class BloomMode : int {
@@ -310,6 +317,9 @@ struct UserSettings {
         // Read once at VR startup (sizes the swapchain), so it takes effect
         // on the next launch.
         ConfigVar<float> vrRenderScale;
+        // Fraction of the window size the Dusklight menu is drawn at, with
+        // the same layout (aurora::rmlui::set_render_scale). Applies live.
+        ConfigVar<float> vrMenuResolution;
         // Standalone Quest (XR_EXT_performance_settings): request SUSTAINED_HIGH
         // CPU and GPU levels at VR startup instead of the runtime's default.
         // Off leaves the runtime's choice (cooler, longer battery). Read once

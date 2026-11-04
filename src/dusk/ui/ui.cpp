@@ -715,6 +715,9 @@ void apply_scale() noexcept {
             static_cast<float>(userScale) / 100.0f * (displayScale > 0.0f ? displayScale : 1.0f);
     }
     aurora::rmlui::set_ui_scale(scale);
+#ifdef AURORA_RMLUI_HAS_RENDER_SCALE
+    aurora::rmlui::set_render_scale(getSettings().game.vrMenuResolution.getValue());
+#endif
 }
 
 }  // namespace dusk::ui
