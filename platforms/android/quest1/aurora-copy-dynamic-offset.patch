@@ -1,0 +1,49 @@
+diff --git a/lib/gfx/tex_copy_conv.cpp b/lib/gfx/tex_copy_conv.cpp
+index 83c3786..0c959d9 100644
+--- a/lib/gfx/tex_copy_conv.cpp
++++ b/lib/gfx/tex_copy_conv.cpp
+@@ -474,6 +474,7 @@ void initialize() {
+           .buffer =
+               wgpu::BufferBindingLayout{
+                   .type = wgpu::BufferBindingType::Uniform,
++                  .hasDynamicOffset = true,
+               },
+       },
+   };
+@@ -500,6 +501,7 @@ void initialize() {
+           .buffer =
+               wgpu::BufferBindingLayout{
+                   .type = wgpu::BufferBindingType::Uniform,
++                  .hasDynamicOffset = true,
+               },
+       },
+   };
+@@ -581,7 +583,6 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
+         wgpu::BindGroupEntry{
+             .binding = 1,
+             .buffer = detail::resources().uniformBuffer,
+-            .offset = req.uniformRange.offset,
+             .size = req.uniformRange.size,
+         },
+     };
+@@ -605,7 +606,6 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
+         wgpu::BindGroupEntry{
+             .binding = 2,
+             .buffer = detail::resources().uniformBuffer,
+-            .offset = req.uniformRange.offset,
+             .size = req.uniformRange.size,
+         },
+     };
+@@ -633,7 +633,11 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
+   };
+   const auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+   pass.SetPipeline(pipeline);
+-  pass.SetBindGroup(0, bindGroup);
++  // The UV transform is bound at a dynamic offset into the shared uniform buffer, as every GX, RmlUi,
++  // water and particle draw binds its own. Through a static offset (the only reader that used one) every
++  // copy came out as one colour on the Quest 1 (found and fixed in the PrimedGun 2.0 port, same Aurora).
++  const uint32_t dynamicOffset = req.uniformRange.offset;
++  pass.SetBindGroup(0, bindGroup, 1, &dynamicOffset);
+   pass.Draw(3);
+   pass.End();
+ }
