@@ -16,15 +16,6 @@
 #include "JSystem/JUtility/JUTNameTab.h"
 #include "SSystem/SComponent/c_xyz.h"
 #include <utility>
-#if TARGET_PC
-#include <borealis/log.hpp>
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <cstring>
-#include <mutex>
-#include <unordered_map>
-#endif
 
 #if TARGET_PC
 static void AssignMaterialNames(const J3DModelLoader& loader) {
@@ -442,100 +433,6 @@ static void FixArrayEndian_24(void* arrayStart, void* arrayEnd) {
 #endif
 }
 
-// Quest 1 vertex diagnostics ([j3d-endian] in the log). The model file is
-// byte-swapped in place, with nothing to stop the same bytes being swapped a
-// second time, which would turn every value back to big-endian while the
-// array is still declared little-endian (positions near zero or junk).
-// Remember the first bytes each swap leaves behind; if a later swap starts
-// on exactly those bytes at the same address, it is a second swap.
-static constexpr borealis::Log sJ3DLoaderLog{"j3d::loader"};
-static std::mutex sSwappedMutex;
-static std::unordered_map<const void*, std::array<u8, 16>> sSwappedArrays;
-
-static std::array<u8, 16> FirstBytes(const void* start, const void* end) {
-    std::array<u8, 16> out{};
-    const size_t n = std::min<size_t>(out.size(), static_cast<size_t>((const u8*)end - (const u8*)start));
-    std::memcpy(out.data(), start, n);
-    return out;
-}
-
-static void CheckNotSwappedTwice(GXAttr attr, void* start, void* end) {
-    if (start == end) {
-        return;
-    }
-    const auto now = FirstBytes(start, end);
-    std::lock_guard lock{sSwappedMutex};
-    const auto it = sSwappedArrays.find(start);
-    if (it != sSwappedArrays.end() && it->second == now && now != std::array<u8, 16>{}) {
-        sJ3DLoaderLog.error("[j3d-endian] ERROR attr {} array {} ({} bytes) is being byte-swapped a second time: its "
-                            "bytes are exactly what the last swap left there, so it ends up big-endian while "
-                            "declared little-endian",
-                            static_cast<int>(attr), start, static_cast<size_t>((u8*)end - (u8*)start));
-    }
-}
-
-static void RememberSwapped(void* start, void* end) {
-    if (start == end) {
-        return;
-    }
-    std::lock_guard lock{sSwappedMutex};
-    sSwappedArrays[start] = FirstBytes(start, end);
-}
-
-// After the swap, float positions should be ordinary numbers. Count values
-// that are NaN, infinite, denormal-sized or huge, which is what a wrong
-// byte order or a wrong offset gives, and decode the first one both ways.
-// Model files pad each array to 0x20 bytes with the text "This is padding
-// data to align", which the loader's 32-bit swap turns into "sihT" and so on.
-// Those words are not positions: return how many trailing words are padding.
-static size_t PaddingWords(const u8* p, size_t count) {
-    static constexpr char kPad[] = "This is padding data to align";
-    constexpr size_t kPadLen = sizeof(kPad) - 1;
-    for (size_t s = count > 8 ? count - 8 : 0; s < count; ++s) {
-        bool match = true;
-        for (size_t b = 0; b < (count - s) * 4 && b < kPadLen && match; ++b) {
-            const size_t word = s + b / 4;
-            const u8 fileByte = p[word * 4 + (3 - b % 4)]; // undo the swap
-            match = fileByte == static_cast<u8>(kPad[b]);
-        }
-        if (match) {
-            return count - s;
-        }
-    }
-    return 0;
-}
-
-static void CheckPositionsSane(const void* start, const void* end) {
-    const u8* p = static_cast<const u8*>(start);
-    size_t count = static_cast<size_t>((const u8*)end - p) / 4;
-    count -= PaddingWords(p, count);
-    size_t junk = 0;
-    size_t firstJunk = SIZE_MAX;
-    for (size_t i = 0; i < count; ++i) {
-        f32 f;
-        std::memcpy(&f, p + i * 4, 4);
-        const f32 a = std::fabs(f);
-        if (!std::isfinite(f) || (a != 0.f && a < 1e-30f) || a > 1e8f) {
-            if (firstJunk == SIZE_MAX) {
-                firstJunk = i;
-            }
-            ++junk;
-        }
-    }
-    if (junk == 0) {
-        return;
-    }
-    const u8* q = p + firstJunk * 4;
-    f32 asLoaded;
-    std::memcpy(&asLoaded, q, 4);
-    const u8 swapped[4] = {q[3], q[2], q[1], q[0]};
-    f32 otherOrder;
-    std::memcpy(&otherOrder, swapped, 4);
-    sJ3DLoaderLog.error("[j3d-endian] ERROR position array {}: {} of {} floats are junk after the byte swap; first "
-                        "at float {}: bytes {:02X} {:02X} {:02X} {:02X} read {} (other byte order: {})",
-                        start, junk, count, firstJunk, q[0], q[1], q[2], q[3], asLoaded, otherOrder);
-}
-
 static void FixArrayEndian(void* arrayStart, void* arrayEnd, u32 stride) {
     switch (stride) {
     case 1:
@@ -655,12 +552,7 @@ void J3DModelLoader::readVertexData(const J3DVertexBlock& block, J3DVertexData& 
         u32 addrDiff = u32((u8*)endAddr - (u8*)startAddr);
         u32 num = addrDiff / vertStride;
         data.mVtxArrNum[attr - GX_VA_POS] = num;
-        CheckNotSwappedTwice(attr, startAddr, endAddr);
         FixArrayEndian(startAddr, endAddr, compStride);
-        RememberSwapped(startAddr, endAddr);
-        if (attr == GX_VA_POS && fmt.type == GX_F32) {
-            CheckPositionsSane(startAddr, endAddr);
-        }
 
         if (attr == GX_VA_POS) {
             // can be a little off due to 0x20 alignment, account for that
