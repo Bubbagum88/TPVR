@@ -1022,7 +1022,6 @@ int game_main(int argc, char* argv[]) {
                     dusk::DiscVerificationState::Unknown);
                 dusk::config::save();
                 dusk::IsGameLaunched = true;
-                skipPreLaunchUI = true;
             }
         } else {
             DuskLog.warn("DVD image from command line failed validation: {} (ValidationError={}), opening prelaunch UI",
