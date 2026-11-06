@@ -1,93 +1,95 @@
 <div align="center">
-  <img src="res/logo.png?v=2" alt="Logo" width="640">
-
-  <p align="center">
-    <a href="https://discord.gg/CxQJ9PjnjA">Join the Discord</a> • <a href="https://www.patreon.com/cw/JoeyAW">Sub to my Patreon</a>
-  </p>
+  <img src="res/logo.png?v=2" alt="TPVR logo" width="640">
 </div>
 
-# Overview
+# TPVR for Quest 1
 
-TPVR is a **vibecoded** VR mod for Dusklight, the PC of Twilight Princess. It is not affiliated with the Dusklight team in any way.
+Twilight Princess in VR on the **original Oculus Quest (Quest 1)**, standalone.
 
-It aims to be as accurate as possible to the original game while allowing you to experience the gameplay from a VR perspective.
+This is a Quest 1 build of [TPVR](https://github.com/JoeyAW/TPVR) by **JoeyAW**, a VR mod for [Dusklight](https://twilitrealm.dev/), the Twilight Princess PC port. All the VR work is JoeyAW's. This fork only changes what the Quest 1 needs to start, load the disc and draw the game. It isn't affiliated with the Dusklight team.
 
-More on why it uses AI generated code below.
+> [!IMPORTANT]
+> **Work in progress.** It plays, but the Quest 1's GPU struggles with this game and the frame rate drops, worst around water, mist and glow. See [Status](#status).
 
-# Features
+**No game content is included.** You need your own Twilight Princess GameCube disc image (USA, `GZ2E01`).
 
-- Full stereoscopic 3D with controller tracking
-- Physical sword swinging, shield bashing and aiming (aim with the right hand)
-- Quest 2/3 controller bindings; other headsets are untested
-- The ability to play the game in flatscreen for parts you want to skip in VR
-# Quest 2/3 Controller binds
+## What "Quest 1 support" means
+
+Upstream TPVR ships only a Windows build. The Quest code in it was made for the Quest 3, and on a Quest 1 it doesn't start or draws nothing. This build changes:
+
+- **The manifest lists the Quest 1** (`quest|quest2`). The Quest 1's VR runtime refuses an app whose manifest names a headset it doesn't know.
+- **A 2D launcher panel** to choose the disc and allow file access, which then starts the game in VR. Started straight into VR, the setup screen can't be seen on the Quest 1.
+- **Storage read access**, so the disc can be opened by its path. (Opening it through Android's file picker misread a good disc image.)
+- **Workarounds for the Quest 1's GPU driver** (Adreno 540, `vulkan.msm8998.so`): a crash in `vkCmdDrawIndexed`, `arrayLength()` reading 0 for the second storage buffer (every model collapsed), and screen copies coming out as one flat colour.
+- **VR > Performance > Menu Resolution** (25 to 100%, 50% by default): the menu layer is drawn at a fraction of the window size, which saved about 15 ms a frame.
+
+The renderer fixes are patch files in `platforms/android/quest1/`, applied by the CI workflow.
+
+## Status
+
+Tested on one Quest 1 (firmware v50) with release **quest1-v1.0**: the game starts from the launcher, loads the disc and plays in VR.
+
+- **Frame rate:** normal areas take about 22 ms a frame to draw. Water, mist and glow push that much higher, about 69 ms at the Ordon spring. Lowering **VR Render Resolution** helps; it only applies after restarting the game. Making those effects cheaper is the next piece of work.
+- That headset is rooted; nothing in the port uses root, but it hasn't been tried on an unrooted Quest 1.
+
+## Requirements
+
+- **Firmware:** tested on Quest 1 firmware **v50** only. Older firmware is untested.
+- **Android:** built for Android 9 and up (API 28). The Quest 1 on v50 runs Android 10.
+- **Graphics:** Vulkan, through Dawn. The Quest 1's driver reports Vulkan 1.1.
+- **OpenXR:** the Khronos OpenXR loader 1.1.63, built from source and bundled in the APK, uses the headset's own OpenXR runtime.
+
+## Install
+
+You need Developer Mode on the headset and either [SideQuest](https://sidequestvr.com/setup-howto) or `adb` (Android platform-tools) on your PC.
+
+1. Download the APK from the [quest1-v1.0 release](https://github.com/Bubbagum88/TPVR/releases/tag/quest1-v1.0) and save it as `TPVR-quest1-v1.0.apk`.
+2. Install it with SideQuest's **Install APK** button, or with adb.
+3. Copy your disc image to `/sdcard/Android/data/com.joeyaw.tpvr/files/GZ2E01.iso`.
+   **Uninstalling TPVR deletes this folder**, so copy the disc again after any uninstall.
+4. In the headset, open **TPVR** from **App Library > Unknown Sources**. In the launcher panel choose the disc image, tap **Allow file access**, then **Play**.
+
+### The same steps with adb
+
+In PowerShell, in your platform-tools folder (where `adb.exe` is), with the APK and your disc image saved there as `TPVR-quest1-v1.0.apk` and `GZ2E01.iso`:
+
+```powershell
+.\adb install TPVR-quest1-v1.0.apk
+.\adb shell mkdir -p /sdcard/Android/data/com.joeyaw.tpvr/files
+.\adb push GZ2E01.iso /sdcard/Android/data/com.joeyaw.tpvr/files/GZ2E01.iso
+```
+
+## Known issues
+
+- **Low frame rate**, as above.
+- **Leaving the game can crash it** (pausing to the Quest menu, or the headset going to sleep): recreating the display surface fails on the Quest 1.
+- **Signed with a public test key** (in this repository), so CI builds install over each other. Windows and Google have flagged the APK; this is believed to be a false positive from that key, but it hasn't been confirmed.
+
+If something breaks, please [open an issue](https://github.com/Bubbagum88/TPVR/issues) with a log:
+
+```powershell
+.\adb logcat -d > tpvr-log.txt
+```
+
+## Controls
+
+The controls are upstream TPVR's Quest bindings, shown below. The Quest 1's Touch controllers have the same buttons as the Quest 2's.
+
 <div align="center">
-<img src="Graphic design/TPVR controls.png" alt="Logo" width="1920">
-  
+<img src="Graphic design/TPVR controls.png" alt="TPVR controls" width="1920">
 </div>
 
+## Building
 
-# Setup
+The [Quest 1 APK workflow](.github/workflows/quest1-apk.yml) builds the APK on GitHub Actions on every push to this branch (or by hand from the **Actions** tab). The APK is in the run's `tpvr-quest1-apk` artifact. For other platforms, see upstream's [build instructions](docs/building.md).
 
-> [!IMPORTANT]
-> TPVR does *not* provide any copyrighted assets. You must provide your own copy of the original game.
+## Credits
 
-> [!IMPORTANT]
-> At a minimum, TPVR requires a GPU with support for D3D12. It is only supported on Windows so far. Your experience with specific hardware, operating systems, VR software and drivers may vary. Virtual Desktop with VDXR is your best bet at the moment.
+- **JoeyAW**: [TPVR](https://github.com/JoeyAW/TPVR). Join JoeyAW's [Discord](https://discord.gg/CxQJ9PjnjA) or support the work on [Patreon](https://www.patreon.com/cw/JoeyAW). JoeyAW's statement on AI-generated code is in [upstream's README](https://github.com/JoeyAW/TPVR#statement-on-ai-generated-code).
+- The [Dusklight](https://twilitrealm.dev/) team and all [Dusklight contributors](https://github.com/TwilitRealm/dusklight/graphs/contributors), the [Twilight Princess decompilation](https://github.com/zeldaret/tp) team and the GC/Wii decompilation community, the [Aurora](https://github.com/encounter/aurora) developers, and everyone else in [upstream's credits](https://github.com/JoeyAW/TPVR#credits).
+- Quest 1 build: **Bubbagum88**.
 
-### 1. Dump your game
-
-You must dump your own copy of the game. Please see [this article](https://wiki.dolphin-emu.org/index.php?title=Ripping_Games) for instructions. After dumping, you can use a program like [Dolphin](https://dolphin-emu.org/) or [nodtool](https://github.com/encounter/nod/releases) to convert the `.iso` to `.rvz` to save space.
-
-Dusklight currently supports all commercial discs except for Wii's Korean release.
-
-> [!NOTE]
-> Dusklight is based on the [Twilight Princess decompilation](https://github.com/zeldaret/tp), which is currently only matching for GameCube. As a result, even when playing Dusklight with a Wii disc, you will be presented with the GameCube version's HUD and certain other specificities.
-
-### 2. Install TPVR
-
-Download the latest release, extract the zip file, and run Dusklight.exe with your choice of VR streamer open.
-
-# Building
-
-If you'd like to build TPVR from source, please read the [build instructions](docs/building.md).
-
-# Statement on AI-generated code
-<details>
-<summary>Expand</summary>
-I do not know how to code. The furthest my knowledge goes is a little bit of HTML and CSS. I simply wanted a way to play Twilight Princess in VR and scoured the internet for anyone who mentioned a Dusklight mod/port in the works, but came up with nothing, so I decided to take matters into my own hands with Claude Code. This has taken hours of almost daily work in the last 3 weeks.
-
-I do not condone the usage of AI for writing, "art", deepfakes, and music (especially music, screw Suno and its garbage that is polluting streaming services). It should not be people's go-to for asking questions or replacing a search engine; it has repeatedly been shown to hallucinate and take certain statements out of context, spreading misinformation. It should be used as a tool and you must guide that tool. 
-
-With that being said, for a task like this, I believe it is acceptable to create a project that does not currently exist by writing the code using AI as long as you actually take the time to refine the experience and do not harm other people's repos or code in the process. In this case, I simply forked Dusklight and modified it in a separate instance over the course of multiple weeks, without pestering the devs with possible spaghetti-code pull requests. I wrote this statement and edited the README in my own words, and I made the logo using Paint.NET despite having very little graphic design experience. I have not and do not plan to ever use or create AI-generated assets, only code.
-
-I have seen many recent projects spring up in the same vein: vibecoded VR ports of existing games. Everybody is entitled to their own opinion, and different backgrounds will lead people to take different stances. However, I believe that you can either take this VR port of the original game and enjoy it for what it is, regardless of AI or not, or you can simply ignore it and play the game in flatscreen—it's still a fantastic experience.
-
-And yes—I used an em-dash there. You can type it with on your keyboard with Alt+0151. Thanks ChatGPT for ruining informal basic writing.
-</details>
-
-# Credits
-
-Special thanks to the [Dusklight](https://twilitrealm.dev/) team, [TP decompilation](https://github.com/zeldaret/tp) team, the GC/Wii decompilation community, the [Aurora](https://github.com/encounter/aurora) developers, [Automata](https://github.com/automata-rtx/dusklight-mods), the [TP speedrunning community](https://zsrtp.link), [danieltobey](https://github.com/danieltobey), [999sian](https://github.com/999sian), and all [Dusklight contributors](https://github.com/TwilitRealm/dusklight/graphs/contributors).
-
-# **Also a huge thanks to my Patrons:**
-
-AaronCLS
-
-Joe Gill
-
-Collin Drennen
-
-Ryan Faaborg
-
-Mitch Mordy
-
-MarioBruthaGangsta
-
-Nard Marley
-
-
-
+This is a fan project, not affiliated with or endorsed by Nintendo. The Legend of Zelda and Twilight Princess are trademarks of Nintendo. See [LICENSE.md](LICENSE.md).
 
 <br/>
 <div align="center">
