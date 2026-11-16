@@ -86,6 +86,7 @@
 
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>  // XrGraphicsRequirementsVulkanKHR, XrGraphicsBindingVulkanKHR
+#include <aurora/lib/logging.hpp>       // TEMP DIAGNOSTIC: XR extension list at startup (to the log file)
 #include <cstdint>
 #include <cstring>
 #include <iterator>  // std::size(requiredExtensions) in initialize() below
@@ -307,6 +308,38 @@ inline Bootstrap initialize() {
     XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     checkResult(xrGetSystem(boot.instance, &systemInfo, &boot.systemId), "xrGetSystem");
+
+    // TEMP DIAGNOSTIC (Quest 1 rendering cost, 2026-11-16): what the runtime
+    // offers and what we turned on, one line each.
+    {
+        std::string line = "[dusk::vr::startup] XR extensions enabled:";
+        for (const char* name : enabledExtensions) {
+            line += ' ';
+            line += name;
+        }
+        constexpr aurora::Module StartupLog{"dusk::vr"};
+        StartupLog.info("{}", line);
+        uint32_t count = 0;
+        line = "[dusk::vr::startup] XR extensions available:";
+        if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr))) {
+            std::vector<XrExtensionProperties> props(count, XrExtensionProperties{XR_TYPE_EXTENSION_PROPERTIES});
+            if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, count, &count, props.data()))) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    line += ' ';
+                    line += props[i].extensionName;
+                }
+            }
+        }
+        StartupLog.info("{}", line);
+        XrSystemProperties sysProps{XR_TYPE_SYSTEM_PROPERTIES};
+        if (XR_SUCCEEDED(xrGetSystemProperties(boot.instance, boot.systemId, &sysProps))) {
+            StartupLog.info("[dusk::vr::startup] XR system '{}' vendor {:#x}: max swapchain {}x{}, max layers {}",
+                            sysProps.systemName, sysProps.vendorId,
+                            sysProps.graphicsProperties.maxSwapchainImageWidth,
+                            sysProps.graphicsProperties.maxSwapchainImageHeight,
+                            sysProps.graphicsProperties.maxLayerCount);
+        }
+    }
 
     checkResult(
         xrGetInstanceProcAddr(boot.instance, "xrGetVulkanGraphicsRequirements2KHR",

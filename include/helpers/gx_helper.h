@@ -20,6 +20,15 @@
         name(__VA_ARGS__);        \
         GXPopDebugGroup();        \
     } while (0)
+#elif defined(AURORA_HAS_PERF_DIAG)
+// TEMP DIAGNOSTIC (Quest 1 build, aurora-perf-diag.patch): name each draw list for Aurora's
+// per-list draw statistics and GPU timing. #name is a string literal, so it lives forever.
+#define GX_DEBUG_GROUP(name, ...)          \
+    do {                                   \
+        GXAuroraPerfGroupPush(#name);      \
+        name(__VA_ARGS__);                 \
+        GXAuroraPerfGroupPop();            \
+    } while (0)
 #else
 #define GX_DEBUG_GROUP(name, ...) name(__VA_ARGS__)
 #endif

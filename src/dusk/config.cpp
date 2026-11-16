@@ -565,6 +565,7 @@ void save() {
     } catch (const std::exception& e) {
         DuskConfigLog.error("Failed to save config to '{}': {}", configPathString, e.what());
     }
+    log_settings_diag("on save");
 }
 
 void ClearAllActionBindings(int port) {
@@ -581,6 +582,50 @@ ConfigVarBase* GetConfigVar(std::string_view name) {
     }
 
     return nullptr;
+}
+
+namespace {
+// TEMP DIAGNOSTIC (TPVR Quest 1 rendering cost, 2026-11-16): settings as last logged.
+absl::flat_hash_map<std::string, std::string> s_loggedSettings;
+
+const char* layer_name(ConfigVarLayer layer) {
+    switch (layer) {
+    case ConfigVarLayer::Default:
+        return "default";
+    case ConfigVarLayer::Value:
+        return "set";
+    case ConfigVarLayer::Override:
+        return "launch override";
+    case ConfigVarLayer::Speedrun:
+        return "speedrun override";
+    }
+    return "?";
+}
+}  // namespace
+
+void log_settings_diag(const char* when) {
+    const bool first = s_loggedSettings.empty();
+    std::vector<std::pair<std::string, std::string> > changed;
+    for (const auto& [name, cVar] : RegisteredConfigVars) {
+        std::string line;
+        try {
+            line = fmt::format("{} ({})", cVar->getImpl()->dumpToJson(*cVar).dump(),
+                               layer_name(cVar->getLayer()));
+        } catch (const std::exception& e) {
+            line = fmt::format("(unreadable: {})", e.what());
+        }
+        auto& logged = s_loggedSettings[name];
+        if (logged != line) {
+            logged = line;
+            changed.emplace_back(name, std::move(line));
+        }
+    }
+    std::sort(changed.begin(), changed.end());
+    DuskConfigLog.info("[perfdiag] settings {}: {} {}", when, changed.size(),
+                       first ? "registered" : "changed");
+    for (const auto& [name, line] : changed) {
+        DuskConfigLog.info("[perfdiag] setting {} = {}", name, line);
+    }
 }
 
 void EnumerateRegistered(std::function<void(ConfigVarBase&)> callback) {

@@ -115,6 +115,12 @@ void shutdown();
 void save();
 
 /**
+ * TEMP DIAGNOSTIC (TPVR Quest 1 rendering cost, 2026-11-16): log every setting the first
+ * time, then only the ones that changed since the last call. `when` labels the lines.
+ */
+void log_settings_diag(const char* when);
+
+/**
  * \brief Get a registered CVar by name.
  *
  * @return null if the CVar does not exist.

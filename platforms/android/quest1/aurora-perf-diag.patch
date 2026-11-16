@@ -1,0 +1,604 @@
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index 52efe06..0d8525b 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -19,6 +19,7 @@ add_library(aurora_gx STATIC
+         lib/gx/regs.cpp
+         lib/gx/dl.cpp
+         lib/gx/fifo.cpp
++        lib/gx/perf_diag.cpp
+         lib/gx/gx.cpp
+         lib/gx/texture.cpp
+         lib/gx/pipeline.cpp
+diff --git a/include/dolphin/gx/GXAurora.h b/include/dolphin/gx/GXAurora.h
+index 1626d56..8f7d34b 100644
+--- a/include/dolphin/gx/GXAurora.h
++++ b/include/dolphin/gx/GXAurora.h
+@@ -57,6 +57,17 @@ extern "C" {
+  */
+ #define GX_AURORA_DEBUG_MARKER_INSERT 0x0022
+ 
++/**
++ * TEMP DIAGNOSTIC (TPVR Quest 1 perf_diag): opens a named draw list for per-list draw statistics and
++ * GPU timing. Must be followed by a 64-bit pointer to a string with static lifetime.
++ */
++#define GX_AURORA_PERF_GROUP_PUSH 0x0023
++
++/**
++ * TEMP DIAGNOSTIC: closes the draw list opened by GX_AURORA_PERF_GROUP_PUSH. Followed by nothing.
++ */
++#define GX_AURORA_PERF_GROUP_POP 0x0024
++
+ #define GX_AURORA_LOAD_TEXOBJ 0x0030
+ 
+ #define GX_AURORA_LOAD_TLUT 0x0031
+@@ -145,6 +156,14 @@ void GXPushDebugGroup(const char* label);
+  */
+ void GXPopDebugGroup();
+ 
++/**
++ * TEMP DIAGNOSTIC (TPVR Quest 1): names the draws that follow, until the matching pop, for Aurora's
++ * per-list draw statistics and GPU timing (lib/gx/perf_diag). The label must have static lifetime.
++ */
++#define AURORA_HAS_PERF_DIAG 1
++void GXAuroraPerfGroupPush(const char* staticLabel);
++void GXAuroraPerfGroupPop();
++
+ /**
+  * Sends a debug marker to the backend graphics API. These may show in debugging tools such as RenderDoc.
+  */
+diff --git a/lib/dolphin/gx/GXAurora.cpp b/lib/dolphin/gx/GXAurora.cpp
+index f4572a1..1173d96 100644
+--- a/lib/dolphin/gx/GXAurora.cpp
++++ b/lib/dolphin/gx/GXAurora.cpp
+@@ -27,6 +27,13 @@ void GXPushDebugGroup(const char* label) {
+ 
+ void GXPopDebugGroup() { GX_WRITE_AURORA(GX_AURORA_DEBUG_GROUP_POP); }
+ 
++void GXAuroraPerfGroupPush(const char* staticLabel) {
++  GX_WRITE_AURORA(GX_AURORA_PERF_GROUP_PUSH);
++  GX_WRITE_U64(reinterpret_cast<u64>(staticLabel));
++}
++
++void GXAuroraPerfGroupPop() { GX_WRITE_AURORA(GX_AURORA_PERF_GROUP_POP); }
++
+ void GXInsertDebugMarker(const char* label) {
+   GX_WRITE_AURORA(GX_AURORA_DEBUG_MARKER_INSERT);
+   GXWriteString(label);
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index 3cc2a95..6bf13a0 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -13,6 +13,7 @@
+ #include "../gx/fifo.hpp"
+ #include "../gx/gx.hpp"
+ #include "../gx/pipeline.hpp"
++#include "../gx/perf_diag.hpp"
+ #ifdef AURORA_ENABLE_RMLUI
+ #include "../rmlui/pipeline.hpp"
+ #endif
+@@ -622,6 +623,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
+   g_recorder.cachedScissor = gx::map_logical_scissor(gx::g_gxState.logicalScissor);
+   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
++  perf_diag::frame_begin();
+ }
+ 
+ RecordedFrame end_recording() {
+@@ -637,6 +639,9 @@ RecordedFrame end_recording() {
+   frame.stats.lastIndexSize = frame.indices.size();
+   frame.stats.lastStorageSize = frame.storage.size();
+   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
++  perf_diag::frame_end(frame.verts.size(), frame.uniforms.size(), frame.indices.size(), frame.storage.size(),
++                       frame.textureUpload.size(), g_recorder.drawCallCount, g_recorder.mergedDrawCallCount,
++                       static_cast<uint32_t>(frame.renderPasses.size()));
+ 
+   for (auto& array : gx::g_gxState.arrays) {
+     array.cachedRange = {};
+@@ -975,6 +980,58 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
+   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+ }
+ 
++bool perf_split_pass(const char* group) {
++  if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX) {
++    return false;
++  }
++  auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
++  if (!prevPass.externalTarget || prevPass.sealed) {
++    return false;
++  }
++  const std::string label = fmt::format("@{}", group);
++  if (!prevPass.hasDraws) {
++    // Nothing drawn since the last split: name this segment after the new group instead.
++    prevPass.label = label;
++    return false;
++  }
++  const bool wasProtectedPass = g_recorder.inOffscreen && g_recorder.protectedOffscreenPassId != 0 &&
++                                prevPass.id == g_recorder.protectedOffscreenPassId;
++  enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
++
++  // Same targets, loaded (not cleared), as resolve_pass_into() continues a pass.
++  RenderPass newPass{
++      .label = label,
++      .colorAttachments = prevPass.colorAttachments,
++      .colorAttachmentCount = prevPass.colorAttachmentCount,
++      .depthStencilView = prevPass.depthStencilView,
++      .depthStencilFormat = prevPass.depthStencilFormat,
++      .copySourceTexture = prevPass.copySourceTexture,
++      .copySourceView = prevPass.copySourceView,
++      .copySourceDepthView = prevPass.copySourceDepthView,
++      .copySourceNormalTexture = prevPass.copySourceNormalTexture,
++      .msaaSamples = prevPass.msaaSamples,
++      .clearDepthValue = prevPass.clearDepthValue,
++      .clearDepth = false,
++      .hasDepth = prevPass.hasDepth,
++      .hasStencil = prevPass.hasStencil,
++  };
++  newPass.externalTarget = true;
++  newPass.stereoReplay = prevPass.stereoReplay;
++  for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
++    newPass.colorAttachments[i].loadOp = wgpu::LoadOp::Undefined;
++    newPass.colorAttachments[i].clear = false;
++  }
++  newPass.commands.reserve(512);
++  current_render_passes().emplace_back(std::move(newPass));
++  ++g_recorder.currentRenderPass;
++  if (wasProtectedPass) {
++    g_recorder.protectedOffscreenPassId = current_render_passes()[g_recorder.currentRenderPass].id;
++  }
++  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
++  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
++  return true;
++}
++
+ void queue_palette_conv(tex_palette_conv::ConvRequest req) {
+   auto& renderPass = current_render_passes()[g_recorder.currentRenderPass];
+   AURORA_ASSERT(!renderPass.sealed, "Attempted to append palette conversion to sealed render pass {}",
+diff --git a/lib/gfx/recording.hpp b/lib/gfx/recording.hpp
+index c799d7a..fb35f72 100644
+--- a/lib/gfx/recording.hpp
++++ b/lib/gfx/recording.hpp
+@@ -106,4 +106,8 @@ void set_viewport(const Viewport& viewport) noexcept;
+ void set_scissor(const ClipRect& scissor) noexcept;
+ void push_debug_group(std::string label);
+ void insert_debug_marker(std::string label);
++// TEMP DIAGNOSTIC (perf_diag): ends the headset eye pass here and continues it in a new pass
++// labelled "@<group>", so gpu_prof times the draws after this point on their own. Only splits
++// an externally owned target (the eye pass). Returns true if a new pass was started.
++bool perf_split_pass(const char* group);
+ } // namespace aurora::gfx
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index d51516f..eb485ab 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -6,6 +6,7 @@
+ #include "dolphin/gd/GDGeometry.h"
+ #include "dolphin/gx/GXAurora.h"
+ #include "gx.hpp"
++#include "perf_diag.hpp"
+ #include "pipeline.hpp"
+ #include "regs.hpp"
+ #include "shader_info.hpp"
+@@ -523,6 +524,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+     gfx::mark_current_pass_stereo();
+   }
+   cache.lastDrawFmt = fmt;
++  perf_diag::on_gx_draw(cache.config, cache.shaderInfo, static_cast<uint64_t>(cache.pipelineRef), vtxCount, numIndices,
++                        instanceCount);
+   gfx::push_draw_command(DrawData{
+       .pipeline = cache.pipelineRef,
+       .vertRange = vertRange,
+@@ -606,6 +609,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+     }
+     lastDraw->vtxCount += vtxCount;
+     lastDraw->indexCount += numIndices;
++    perf_diag::on_merged_draw(vtxCount, numIndices);
+     gfx::detail::increment_merged_draw_count();
+     return;
+   }
+@@ -850,6 +854,10 @@ void handle_aurora(ByteReader& reader) noexcept {
+     gfx::push_debug_group(std::move(label));
+   } else if (subCmd == GX_AURORA_DEBUG_GROUP_POP) {
+     pop_debug_group();
++  } else if (subCmd == GX_AURORA_PERF_GROUP_PUSH) {
++    perf_diag::group_push(reinterpret_cast<const char*>(reader.read<u64>()));
++  } else if (subCmd == GX_AURORA_PERF_GROUP_POP) {
++    perf_diag::group_pop();
+   } else if (subCmd == GX_AURORA_DEBUG_MARKER_INSERT) {
+     auto label = reader.read_string();
+     gfx::insert_debug_marker(std::move(label));
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index bcaba60..f77bd75 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include "../thread.hpp"
+ #include "command_processor.hpp"
++#include "perf_diag.hpp"
++
++#include <chrono>
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -49,6 +52,14 @@ void wake_worker() noexcept {
+ }
+ 
+ void process_to(uint64_t target, std::memory_order order) noexcept {
++  // TEMP DIAGNOSTIC (perf_diag): GX command processing time per frame.
++  struct FifoTimer {
++    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    ~FifoTimer() {
++      perf_diag::add_fifo_ns(static_cast<uint64_t>(
++          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
++    }
++  } fifoTimer;
+   uint64_t processed = sProcessed.load(std::memory_order_relaxed);
+   while (processed < target) {
+     ProcessResult result{};
+diff --git a/lib/gx/perf_diag.cpp b/lib/gx/perf_diag.cpp
+new file mode 100644
+index 0000000..566b80e
+--- /dev/null
++++ b/lib/gx/perf_diag.cpp
+@@ -0,0 +1,237 @@
++#include "perf_diag.hpp"
++
++#include "../gfx/recording.hpp"
++#include "../internal.hpp"
++#include "gx.hpp"
++#include "pipeline.hpp"
++
++#include <absl/container/flat_hash_map.h>
++#include <absl/container/flat_hash_set.h>
++
++#include <algorithm>
++#include <atomic>
++#include <string>
++#include <vector>
++
++namespace aurora::perf_diag {
++namespace {
++constexpr Module Log{"aurora::perf_diag"};
++
++// Frames per summary, and the frame (of each window) whose eye pass is split.
++constexpr uint32_t WindowFrames = 120;
++constexpr uint32_t SplitFrameInWindow = 60;
++// gpu_prof times at most 127 passes a frame; keep the splits well inside that.
++constexpr uint32_t MaxSplitsPerFrame = 90;
++
++constexpr const char* NoGroup = "(no list)";
++constexpr const char* BetweenGroups = "(between lists)";
++
++struct Key {
++  const char* name;
++  uint32_t width;
++  uint32_t height;
++
++  bool operator==(const Key&) const = default;
++  template <typename H>
++  friend H AbslHashValue(H h, const Key& k) {
++    return H::combine(std::move(h), k.name, k.width, k.height);
++  }
++};
++
++struct Stats {
++  uint64_t draws = 0;
++  uint64_t mergedDraws = 0;
++  uint64_t verts = 0;
++  uint64_t indices = 0;
++  uint64_t blend = 0;
++  uint64_t alphaTest = 0;
++  uint64_t noDepthWrite = 0;
++  uint64_t noDepthTest = 0;
++  uint64_t fog = 0;
++  uint64_t ortho = 0;
++  uint64_t lines = 0;
++  uint64_t stereo = 0;
++  uint64_t tevStages = 0;
++  uint32_t tevMax = 0;
++  uint64_t indDraws = 0;
++  uint64_t lit = 0;
++  uint64_t textures = 0;
++  uint64_t texels = 0;
++  uint64_t copyReads = 0;
++  absl::flat_hash_set<uint64_t> pipelines;
++};
++
++// FIFO thread state.
++std::vector<const char*> sGroupStack;
++absl::flat_hash_map<Key, Stats> sStats;
++Stats* sLastStats = nullptr; // target of on_merged_draw
++bool sSplitFrame = false;
++uint32_t sSplitsThisFrame = 0;
++
++// Frame-boundary state.
++uint32_t sFrames = 0;
++uint64_t sFrameCounter = 0;
++std::atomic<uint64_t> sFifoNs{0};
++uint64_t sVertBytes = 0;
++uint64_t sUniformBytes = 0;
++uint64_t sIndexBytes = 0;
++uint64_t sStorageBytes = 0;
++uint64_t sTextureUploadBytes = 0;
++uint64_t sDrawCalls = 0;
++uint64_t sMergedDrawCalls = 0;
++uint64_t sRenderPasses = 0;
++
++// Draw stats go to the innermost list; eye-pass splits happen at top-level lists only.
++const char* current_group() noexcept { return sGroupStack.empty() ? NoGroup : sGroupStack.back(); }
++
++void split(const char* name) noexcept {
++  if (!sSplitFrame || sSplitsThisFrame >= MaxSplitsPerFrame) {
++    return;
++  }
++  if (gfx::perf_split_pass(name)) {
++    ++sSplitsThisFrame;
++  }
++}
++
++double per_frame(uint64_t v) noexcept { return static_cast<double>(v) / static_cast<double>(sFrames); }
++
++void log_summary() noexcept {
++  Log.info("[perfdiag] {} frames: engine per frame: GX FIFO processing {:.2f} ms | draws {:.0f} (+{:.0f} merged) | "
++           "render passes {:.1f} | uploads: verts {:.0f} KB, uniforms {:.0f} KB, indices {:.0f} KB, storage {:.0f} KB, "
++           "textures {:.0f} KB",
++           sFrames, per_frame(sFifoNs.exchange(0, std::memory_order_relaxed)) * 1e-6, per_frame(sDrawCalls),
++           per_frame(sMergedDrawCalls), per_frame(sRenderPasses), per_frame(sVertBytes) / 1024.0,
++           per_frame(sUniformBytes) / 1024.0, per_frame(sIndexBytes) / 1024.0, per_frame(sStorageBytes) / 1024.0,
++           per_frame(sTextureUploadBytes) / 1024.0);
++
++  std::vector<std::pair<const Key*, const Stats*>> rows;
++  rows.reserve(sStats.size());
++  for (const auto& [key, stats] : sStats) {
++    rows.emplace_back(&key, &stats);
++  }
++  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
++    return a.second->draws + a.second->mergedDraws > b.second->draws + b.second->mergedDraws;
++  });
++  for (const auto& [key, s] : rows) {
++    const double draws = per_frame(s->draws);
++    Log.info("[perfdiag] list {} @{}x{}: draws {:.1f} (+{:.1f} merged), verts {:.0f}, indices {:.0f} | "
++             "blend {:.1f}, alpha test {:.1f}, no depth write {:.1f}, no depth test {:.1f}, fog {:.1f}, "
++             "screen-space {:.1f}, lines/points {:.1f}, stereo {:.1f}, lit {:.1f} | TEV stages avg {:.1f} max {}, "
++             "indirect {:.1f} | textures {:.1f}, texels {:.0f}K, screen-copy reads {:.1f} | pipelines {}",
++             key->name, key->width, key->height, draws, per_frame(s->mergedDraws), per_frame(s->verts),
++             per_frame(s->indices), per_frame(s->blend), per_frame(s->alphaTest), per_frame(s->noDepthWrite),
++             per_frame(s->noDepthTest), per_frame(s->fog), per_frame(s->ortho), per_frame(s->lines),
++             per_frame(s->stereo), per_frame(s->lit),
++             s->draws != 0 ? static_cast<double>(s->tevStages) / static_cast<double>(s->draws) : 0.0, s->tevMax,
++             per_frame(s->indDraws), per_frame(s->textures), per_frame(s->texels) / 1000.0,
++             per_frame(s->copyReads), s->pipelines.size());
++  }
++}
++} // namespace
++
++void group_push(const char* name) noexcept {
++  if (name == nullptr) {
++    name = "(unnamed)";
++  }
++  sGroupStack.push_back(name);
++  if (sGroupStack.size() == 1) {
++    split(name);
++  }
++}
++
++void group_pop() noexcept {
++  if (sGroupStack.empty()) {
++    Log.warn("[perfdiag] list pop with no list open");
++    return;
++  }
++  sGroupStack.pop_back();
++  if (sGroupStack.empty()) {
++    split(BetweenGroups);
++  }
++}
++
++void on_gx_draw(const gx::PipelineConfig& config, const gx::ShaderInfo& info, uint64_t pipeline, uint32_t vtxCount,
++                uint32_t indexCount, uint32_t instanceCount) noexcept {
++  const auto size = gfx::get_render_target_size();
++  auto& s = sStats[Key{current_group(), size.x, size.y}];
++  sLastStats = &s;
++  const auto& shader = config.shaderConfig;
++  ++s.draws;
++  s.verts += static_cast<uint64_t>(vtxCount) * instanceCount;
++  s.indices += indexCount;
++  s.blend += config.blendMode != GX_BM_NONE ? 1 : 0;
++  s.alphaTest += shader.alphaCompare ? 1 : 0;
++  s.noDepthWrite += config.depthUpdate ? 0 : 1;
++  s.noDepthTest += config.depthCompare ? 0 : 1;
++  s.fog += info.usesFog ? 1 : 0;
++  s.ortho += gx::g_gxState.projType == GX_ORTHOGRAPHIC ? 1 : 0;
++  s.lines += info.lineMode != 0 ? 1 : 0;
++  s.stereo += info.stereo ? 1 : 0;
++  s.lit += info.lightingEnabled ? 1 : 0;
++  s.tevStages += shader.tevStageCount;
++  s.tevMax = std::max(s.tevMax, shader.tevStageCount);
++  s.indDraws += info.usedIndStages.any() ? 1 : 0;
++  for (uint32_t i = 0; i < gx::MaxTextures; ++i) {
++    if (!info.sampledTextures.test(i)) {
++      continue;
++    }
++    const auto& tex = gx::g_gxState.loadedTextures[i];
++    ++s.textures;
++    s.texels += static_cast<uint64_t>(tex.width()) * tex.height();
++    if (tex.data != nullptr && gx::g_gxState.copyTextures.contains(tex.data)) {
++      ++s.copyReads;
++    }
++  }
++  s.pipelines.insert(pipeline);
++}
++
++void on_merged_draw(uint32_t vtxCount, uint32_t indexCount) noexcept {
++  if (sLastStats == nullptr) {
++    return;
++  }
++  ++sLastStats->mergedDraws;
++  sLastStats->verts += vtxCount;
++  sLastStats->indices += indexCount;
++}
++
++void add_fifo_ns(uint64_t ns) noexcept { sFifoNs.fetch_add(ns, std::memory_order_relaxed); }
++
++void frame_begin() noexcept {
++  sSplitFrame = sFrameCounter % WindowFrames == SplitFrameInWindow;
++  sSplitsThisFrame = 0;
++  if (!sGroupStack.empty()) {
++    Log.warn("[perfdiag] {} list(s) still open at frame start (innermost {}); clearing", sGroupStack.size(),
++             sGroupStack.back());
++    sGroupStack.clear();
++  }
++}
++
++void frame_end(uint64_t vertBytes, uint64_t uniformBytes, uint64_t indexBytes, uint64_t storageBytes,
++               uint64_t textureUploadBytes, uint32_t drawCalls, uint32_t mergedDrawCalls,
++               uint32_t renderPasses) noexcept {
++  if (sSplitFrame) {
++    Log.info("[perfdiag] split frame {}: eye pass split {} times (GPU times: next [gpuprof-split] line)",
++             sFrameCounter, sSplitsThisFrame);
++  }
++  sSplitFrame = false;
++  sLastStats = nullptr;
++  ++sFrameCounter;
++  ++sFrames;
++  sVertBytes += vertBytes;
++  sUniformBytes += uniformBytes;
++  sIndexBytes += indexBytes;
++  sStorageBytes += storageBytes;
++  sTextureUploadBytes += textureUploadBytes;
++  sDrawCalls += drawCalls;
++  sMergedDrawCalls += mergedDrawCalls;
++  sRenderPasses += renderPasses;
++  if (sFrames < WindowFrames) {
++    return;
++  }
++  log_summary();
++  sStats.clear();
++  sFrames = 0;
++  sVertBytes = sUniformBytes = sIndexBytes = sStorageBytes = sTextureUploadBytes = 0;
++  sDrawCalls = sMergedDrawCalls = sRenderPasses = 0;
++}
++} // namespace aurora::perf_diag
+diff --git a/lib/gx/perf_diag.hpp b/lib/gx/perf_diag.hpp
+new file mode 100644
+index 0000000..883e2af
+--- /dev/null
++++ b/lib/gx/perf_diag.hpp
+@@ -0,0 +1,39 @@
++#pragma once
++
++// TEMP DIAGNOSTIC (TPVR Quest 1 rendering cost, 2026-11-16). Remove once the
++// costly effects are found and fixed.
++//
++// Tags every GX draw with the game's draw list it came from (the game sends
++// GXAuroraPerfGroupPush/Pop around each list), and logs, every 120 frames:
++// - per list and render target: draws, vertices, and how many draws blend,
++//   alpha test (discard), skip depth writes, use fog, are screen-space
++//   (orthographic), their TEV/indirect stages, textures and texels read and
++//   screen copies read;
++// - engine counters: GX FIFO processing time and bytes uploaded per frame;
++// - on one frame in 120, the headset eye pass is split at each list so the
++//   GPU timers (gpu_prof) time each list on its own ("[gpuprof-split]").
++
++#include <cstdint>
++
++namespace aurora::gx {
++struct PipelineConfig;
++struct ShaderInfo;
++} // namespace aurora::gx
++
++namespace aurora::perf_diag {
++// FIFO thread (GX command processing).
++void group_push(const char* name) noexcept;
++void group_pop() noexcept;
++void on_gx_draw(const gx::PipelineConfig& config, const gx::ShaderInfo& info, uint64_t pipeline, uint32_t vtxCount,
++                uint32_t indexCount, uint32_t instanceCount) noexcept;
++void on_merged_draw(uint32_t vtxCount, uint32_t indexCount) noexcept;
++
++// Any thread.
++void add_fifo_ns(uint64_t ns) noexcept;
++
++// Frame boundaries (gfx recording).
++void frame_begin() noexcept;
++void frame_end(uint64_t vertBytes, uint64_t uniformBytes, uint64_t indexBytes, uint64_t storageBytes,
++               uint64_t textureUploadBytes, uint32_t drawCalls, uint32_t mergedDrawCalls,
++               uint32_t renderPasses) noexcept;
++} // namespace aurora::perf_diag
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index 0da5cab..5924cd2 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -1109,6 +1109,19 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+     constexpr std::array disableToggles{
+         "timestamp_quantization",
+     };
++    // TEMP DIAGNOSTIC (perf_diag): which Dawn toggles this device runs with. Robustness (shader
++    // bounds checks) and validation stay on unless listed as enabled here.
++    {
++      std::string toggleList = "enabled:";
++      for (const char* toggle : enableToggles) {
++        toggleList += fmt::format(" {}", toggle);
++      }
++      toggleList += " | disabled:";
++      for (const char* toggle : disableToggles) {
++        toggleList += fmt::format(" {}", toggle);
++      }
++      Log.info("[perfdiag] Dawn device toggles: {}", toggleList);
++    }
+     wgpu::DawnTogglesDescriptor togglesDescriptor(wgpu::DawnTogglesDescriptor::Init{
+         .nextInChain = &cacheDescriptor,
+         .enabledToggleCount = enableToggles.size(),
+diff --git a/lib/webgpu/gpu_prof.cpp b/lib/webgpu/gpu_prof.cpp
+index e1faacf..1c4878c 100644
+--- a/lib/webgpu/gpu_prof.cpp
++++ b/lib/webgpu/gpu_prof.cpp
+@@ -185,7 +185,49 @@ uint32_t g_logFrames = 0;
+ 
+ // Top-level zones only (passes and encoder-level zones at depth 0); nested
+ // zones are folded into their parent.
++// TEMP DIAGNOSTIC (perf_diag): a frame whose eye pass was split per draw list (passes named
++// "@<list>") is logged on its own, every top-level zone in order, so each list's GPU time shows.
++void log_split_frame(const Slot& slot, const uint64_t* ts, uint64_t frameBegin, uint64_t frameEnd) {
++  bool split = false;
++  for (const auto& event : slot.events) {
++    if (event.kind != EventKind::End && event.name != nullptr && event.name[0] == '@') {
++      split = true;
++      break;
++    }
++  }
++  if (!split) {
++    return;
++  }
++  std::string out = fmt::format("[gpuprof-split] GPU frame {:.2f} ms, passes in order:",
++                                double(frameEnd - frameBegin) * 1e-6);
++  uint32_t depth = 0;
++  const char* topName = nullptr;
++  uint64_t topBegin = 0;
++  for (const auto& event : slot.events) {
++    if (event.kind == EventKind::End) {
++      if (depth == 0) {
++        continue;
++      }
++      if (--depth == 0 && topName != nullptr) {
++        const uint64_t t = ts[event.query];
++        out += fmt::format(" | {} {:.2f}ms", topName, t > topBegin ? double(t - topBegin) * 1e-6 : 0.0);
++        topName = nullptr;
++      }
++    } else {
++      if (ts[event.query] == 0 && ts[event.query + 1] == 0) {
++        continue;
++      }
++      if (depth++ == 0) {
++        topName = event.name;
++        topBegin = ts[event.query];
++      }
++    }
++  }
++  Log.info("{}", out);
++}
++
+ void log_frame(const Slot& slot, const uint64_t* ts, uint64_t frameBegin, uint64_t frameEnd) {
++  log_split_frame(slot, ts, frameBegin, frameEnd);
+   g_logFrameNs += frameEnd - frameBegin;
+   ++g_logFrames;
+   uint32_t depth = 0;

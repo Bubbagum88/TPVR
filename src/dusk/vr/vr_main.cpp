@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -53,6 +54,18 @@
 #include "dusk/vr/vr_xr_submit.hpp"             // dusk::vr::Session
 #include "dusk/vr/vr_menu_gamepad.hpp"          // dusk::vr::ensureVrMenuGamepadAttached, etc.
 #include "dusk/vr/vr_main.hpp"
+#include "dusk/vr/vr_device_stats.hpp"        // TEMP DIAGNOSTIC: clocks/temps once a second
+#include <dolphin/gx/GXAurora.h>               // TEMP DIAGNOSTIC: GXAuroraPerfGroupPush/Pop
+
+// TEMP DIAGNOSTIC (Quest 1 rendering cost, 2026-11-16): names the VR mod's own
+// draws in Aurora's per-list statistics (aurora-perf-diag.patch).
+#if defined(AURORA_HAS_PERF_DIAG)
+#define VR_PERF_GROUP_PUSH(label) GXAuroraPerfGroupPush(label)
+#define VR_PERF_GROUP_POP() GXAuroraPerfGroupPop()
+#else
+#define VR_PERF_GROUP_PUSH(label) ((void)0)
+#define VR_PERF_GROUP_POP() ((void)0)
+#endif
 
 // TEMP DIAGNOSTIC (VR black-screen-after-save investigation): plain,
 // unmangled, non-namespaced global mirroring g_renderedToHeadsetThisFrame
@@ -1016,6 +1029,7 @@ bool startup() {
         //    are back on SUSTAINED_HIGH.) Gated by game.vrHighClocks.
         if (!dusk::getSettings().game.vrHighClocks.getValue()) {
             duskVrLog("[dusk::vr::startup] High Clocks off -- runtime default clocks\n");
+            VrLog.info("[dusk::vr::startup] High Clocks off -- runtime default clocks");
         } else if (boot.hasPerformanceSettings && boot.xrPerfSettingsSetPerformanceLevelEXT_) {
             const XrResult cpuRes = boot.xrPerfSettingsSetPerformanceLevelEXT_(
                 session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
@@ -1026,9 +1040,15 @@ bool startup() {
                           "[dusk::vr::startup] XR_EXT_performance_settings: SUSTAINED_HIGH cpu=%d gpu=%d\n",
                           static_cast<int>(cpuRes), static_cast<int>(gpuRes));
             duskVrLog(msg);
+            VrLog.info("{}", msg);  // TEMP DIAGNOSTIC: clocks requested, to the log file too
         } else {
             duskVrLog("[dusk::vr::startup] XR_EXT_performance_settings not available -- runtime default clocks\n");
+            VrLog.info("[dusk::vr::startup] XR_EXT_performance_settings not available -- runtime default clocks");
         }
+
+        // TEMP DIAGNOSTIC (Quest 1 rendering cost, 2026-11-16): clocks, GPU busy and
+        // temperatures once a second, so a slow stretch can be matched to them.
+        device_stats::start();
 
         // 2. XR_KHR_android_thread_settings: tell the runtime which of our
         //    threads are the hot ones so it keeps them on the big cores.
@@ -1066,6 +1086,7 @@ bool startup() {
                           mainTid, static_cast<int>(mainRes), renderTid, static_cast<int>(renderRes),
                           fifoTid, static_cast<int>(fifoRes));
             duskVrLog(msg);
+            VrLog.info("{}", msg);  // TEMP DIAGNOSTIC: to the log file too
         } else {
             duskVrLog("[dusk::vr::startup] XR_KHR_android_thread_settings not available\n");
         }
@@ -1690,6 +1711,13 @@ static void applyDisplayRefreshRate(XrSession session) {
     std::snprintf(msg, sizeof(msg), "[dusk::vr] display refresh rate: setting %d Hz -> requested %.0f Hz res=%d\n",
                   wanted, best, static_cast<int>(res));
     duskVrLog(msg);
+    // TEMP DIAGNOSTIC (Quest 1 rendering cost): the rates offered, to the log file.
+    std::string offered;
+    for (const float rate : rates) {
+        offered += fmt::format(" {:.0f}", rate);
+    }
+    VrLog.info("display refresh rate: setting {} Hz -> requested {:.0f} Hz res={} (offered:{})", wanted, best,
+               static_cast<int>(res), offered);
 }
 
 static aurora::gfx::ResolvedTargets renderScreenModeGamePass(uint32_t width, uint32_t height,
@@ -3541,8 +3569,10 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
             view_class* view = dComIfGd_getView();
             // Link's shadow is his whole normal body (user choice
             // 2026-10-16), not the first-person hidden version.
+            VR_PERF_GROUP_PUSH("vr: shadow maps");
             vr_link::withVrShadowCasterModelsShown(
                 [view] { dComIfGd_imageDrawShadow(view->viewMtx); });
+            VR_PERF_GROUP_POP();
             GXSetProjection(view->projMtx, GX_PERSPECTIVE);
             g_vrShadowRegistrationLocked = true;
             g_vrShadowsActive = true;
@@ -3554,7 +3584,9 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         PerfClock::time_point perfT1 = PerfClock::now();
         g_perfEyeBeginMs += perfMs(perfT0, perfT1);
 
+        VR_PERF_GROUP_PUSH("vr: actor draw (fpcM_DrawIterater)");
         fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
+        VR_PERF_GROUP_POP();
         PerfClock::time_point perfT2 = PerfClock::now();
         g_perfEyeIterMs += perfMs(perfT1, perfT2);
         cAPIGph_Painter();
@@ -3563,15 +3595,19 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
 
         if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
             if (link->getAimSightVisible() && !dusk::getSettings().game.vrHideAimCrosshair.getValue()) {
+                VR_PERF_GROUP_PUSH("vr: aim crosshair");
                 vr_render::drawAimCrosshair(*link->getLineTopPosP());
+                VR_PERF_GROUP_POP();
             }
         }
         if (menuVisible) {
+            VR_PERF_GROUP_PUSH("vr: menu billboard");
             if (!dusk::ui::is_prelaunch_open()) {
                 vr_render::drawMenuBillboardBackdrop(vr_render::g_menuBillboardAspectHeightOverWidth);
             }
             vr_render::drawMenuBillboard(&vr_render::g_menuBillboardTexObj,
                                           vr_render::g_menuBillboardAspectHeightOverWidth);
+            VR_PERF_GROUP_POP();
         }
 
         PerfClock::time_point perfT4 = PerfClock::now();
@@ -3678,7 +3714,9 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
             vr_render::drawScreenModeBillboard(static_cast<int>(eye));
             g_perfEyePainterMs += perfMs(screenDrawStart, PerfClock::now());
         } else {
+        VR_PERF_GROUP_PUSH("vr: actor draw (fpcM_DrawIterater)");
         fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
+        VR_PERF_GROUP_POP();
         PerfClock::time_point perfEyeT2 = PerfClock::now();
         g_perfEyeIterMs += perfMs(perfEyeT1, perfEyeT2);
         cAPIGph_Painter();
@@ -3694,7 +3732,9 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         // (vr_stereo_render.hpp) for the full "all items" scoping.
         if (auto* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer())) {
             if (link->getAimSightVisible() && !dusk::getSettings().game.vrHideAimCrosshair.getValue()) {
+                VR_PERF_GROUP_PUSH("vr: aim crosshair");
                 vr_render::drawAimCrosshair(*link->getLineTopPosP());
+                VR_PERF_GROUP_POP();
             }
         }
 
@@ -3722,11 +3762,13 @@ void tick(const dusk::game_clock::FrameTiming& pacing) {
         // drawMenuBillboard() below, just without the opaque quad behind
         // it, so it reads through to the real VR surroundings.
         if (menuVisible) {
+            VR_PERF_GROUP_PUSH("vr: menu billboard");
             if (!dusk::ui::is_prelaunch_open()) {
                 vr_render::drawMenuBillboardBackdrop(vr_render::g_menuBillboardAspectHeightOverWidth);
             }
             vr_render::drawMenuBillboard(&vr_render::g_menuBillboardTexObj,
                                           vr_render::g_menuBillboardAspectHeightOverWidth);
+            VR_PERF_GROUP_POP();
         }
         }
 
