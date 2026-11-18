@@ -1,0 +1,376 @@
+diff --git a/include/aurora/gfx.hpp b/include/aurora/gfx.hpp
+index 337dda3..45be13c 100644
+--- a/include/aurora/gfx.hpp
++++ b/include/aurora/gfx.hpp
+@@ -8,7 +8,9 @@
+ 
+ namespace aurora::gfx {
+ 
+-inline constexpr size_t InlineDrawPayloadSize = 128;
++// 144: gx::DrawData's prepassPipeline (an alpha-tested draw's depth prepass)
++// took it past 128.
++inline constexpr size_t InlineDrawPayloadSize = 144;
+ inline constexpr size_t MaxColorAttachments = 8;
+ inline constexpr uint32_t SceneColorAttachmentIndex = 0;
+ 
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index eb485ab..ed37204 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -136,6 +136,9 @@ struct DrawCache {
+   PipelineConfig config{};
+   ShaderInfo shaderInfo{};
+   gfx::PipelineRef pipelineRef{};
++  // AlphaPrepass (pipeline.hpp): the depth pass's pipeline, 0 when the draw
++  // is drawn once. pipelineRef is then the shading pass's.
++  gfx::PipelineRef prepassRef{};
+   GXBindGroups bindGroups{};
+   uint64_t bindGeneration = 0;
+   GXVtxFmt fmt = GX_MAX_VTXFMT;
+@@ -154,6 +157,15 @@ struct DrawCache {
+ };
+ DrawCache sDrawCache;
+ 
++// An opaque alpha-tested draw that writes depth with a less/less-equal test
++// is drawn as a depth prepass and a shading pass (pipeline.hpp, AlphaPrepass).
++bool use_alpha_prepass(const PipelineConfig& config, wgpu::TextureFormat depthFormat) noexcept {
++  return depthFormat != wgpu::TextureFormat::Undefined && config.shaderConfig.lineMode == 0 &&
++         config.depthCompare && config.depthUpdate && config.colorUpdate && config.blendMode == GX_BM_NONE &&
++         (config.depthFunc == GX_LEQUAL || config.depthFunc == GX_LESS) &&
++         alpha_compare_varies(config.shaderConfig.alphaCompare);
++}
++
+ // Draws sampling a fresh-only copy destination are dropped unless every such
+ // destination was GXCopyTex'd during the current frame.
+ static void collect_fresh_only_dests(DrawCache& cache) noexcept {
+@@ -443,7 +455,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+ 
+   const u8 lineMode = line_mode_for_prim(prim);
+   const bool stereo = stereo_active();
+-  const auto targetLayoutKey = gfx::get_render_target_layout().key;
++  const auto targetLayout = gfx::get_render_target_layout();
++  const auto targetLayoutKey = targetLayout.key;
+   // stereo is compared directly rather than through DirtyPipeline: it can
+   // flip without any GX command (the stereo pass opening/closing, a nested
+   // capture pass suspending it).
+@@ -456,7 +469,19 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
+     populate_pipeline_config(cache.config, prim, fmt);
+     cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
+-    cache.pipelineRef = gfx::pipeline_ref(cache.config);
++    if (use_alpha_prepass(cache.config, targetLayout.depthStencilFormat)) {
++      PipelineConfig depth = cache.config;
++      depth.alphaPrepass = AlphaPrepass::Depth;
++      depth.shaderConfig.depthPrepass = true;
++      PipelineConfig shade = cache.config;
++      shade.alphaPrepass = AlphaPrepass::Shade;
++      shade.depthFunc = GX_LEQUAL;
++      cache.prepassRef = gfx::pipeline_ref(depth);
++      cache.pipelineRef = gfx::pipeline_ref(shade);
++    } else {
++      cache.prepassRef = {};
++      cache.pipelineRef = gfx::pipeline_ref(cache.config);
++    }
+     cache.targetLayoutKey = targetLayoutKey;
+     cache.fmt = fmt;
+     cache.lineMode = lineMode;
+@@ -537,6 +562,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+       .instanceCount = instanceCount,
+       .bindGroups = cache.bindGroups,
+       .dstAlpha = state.dstAlpha,
++      .prepassPipeline = cache.prepassRef,
+   });
+ }
+ 
+diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
+index 6b98be4..f182652 100644
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -364,9 +364,13 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
+   const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
+   const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
+   const bool writesDepth = config.depthCompare && config.depthUpdate;
++  // AlphaPrepass (pipeline.hpp): the Depth pass writes depth and no colour;
++  // the Shade pass writes every colour target the draw would, but not depth.
++  const bool depthPass = config.alphaPrepass == AlphaPrepass::Depth;
++  const bool shadePass = config.alphaPrepass == AlphaPrepass::Shade;
+   const wgpu::DepthStencilState depthStencil{
+       .format = layout.depthStencilFormat,
+-      .depthWriteEnabled = writesDepth,
++      .depthWriteEnabled = writesDepth && !shadePass,
+       .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
+       .depthBias = round_away_from_zero<int32_t>(depthBias),
+       .depthBiasSlopeScale = depthBiasSlopeScale,
+@@ -378,13 +382,15 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
+   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+     colorTargets[i] = {
+         .format = layout.colorAttachments[i].format,
+-        .writeMask = layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth
+-                         ? wgpu::ColorWriteMask::All
+-                         : wgpu::ColorWriteMask::None,
++        .writeMask =
++            layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth && !depthPass
++                ? wgpu::ColorWriteMask::All
++                : wgpu::ColorWriteMask::None,
+     };
+   }
+   colorTargets[gfx::SceneColorAttachmentIndex].blend = &blendState;
+-  colorTargets[gfx::SceneColorAttachmentIndex].writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate);
++  colorTargets[gfx::SceneColorAttachmentIndex].writeMask =
++      depthPass ? wgpu::ColorWriteMask::None : to_write_mask(config.colorUpdate, config.alphaUpdate);
+   // The GX shader's vbuf_words / abuf_words: the sizes of the two storage
+   // buffers in group 0, in 32-bit words (shader.cpp).
+   const auto& resources = gfx::detail::resources();
+diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
+index 71213a3..bd293c9 100644
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -534,7 +534,10 @@ struct ShaderConfig {
+   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
+   u8 fogRangeEnabled : 1 = false;
+   u8 stereo : 1 = false; // single-pass stereo instancing (GXState::stereo)
+-  u8 pad1 : 4 = 0;
++  // Depth prepass of an alpha-tested draw: the fragment shader keeps only
++  // the alpha compare (pipeline.hpp, AlphaPrepass).
++  u8 depthPrepass : 1 = false;
++  u8 pad1 : 3 = 0;
+   u8 pad2 = 0;
+   std::array<AttrConfig, MaxVtxAttr> attrs;
+   std::array<TevSwap, MaxTevSwap> tevSwapTable;
+@@ -583,6 +586,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
+                                     const char* label) noexcept;
+ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment = UINT32_MAX) noexcept;
+ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout) noexcept;
++// Whether the alpha compare discards some fragments and keeps others.
++bool alpha_compare_varies(const AlphaCompare& alphaCompare) noexcept;
+ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
+ 
+ u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
+diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
+index f0e4207..0bee916 100644
+--- a/lib/gx/pipeline.cpp
++++ b/lib/gx/pipeline.cpp
+@@ -21,7 +21,15 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const gfx::Re
+ }
+ 
+ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+-  if (!gfx::bind_pipeline(data.pipeline, pass)) {
++  // AlphaPrepass (pipeline.hpp): both passes are needed, so the draw waits,
++  // like any draw whose pipeline is still being built, until both are.
++  if (data.prepassPipeline != 0) {
++    wgpu::RenderPipeline unused;
++    if (!gfx::get_pipeline(data.prepassPipeline, unused) || !gfx::get_pipeline(data.pipeline, unused)) {
++      return;
++    }
++  }
++  if (!gfx::bind_pipeline(data.prepassPipeline != 0 ? data.prepassPipeline : data.pipeline, pass)) {
+     return;
+   }
+ 
+@@ -39,10 +47,21 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
+     pass.SetBlendConstant(&color);
+   }
+-  if (data.indexCount == 0) {
+-    pass.Draw(data.vtxCount, data.instanceCount);
+-  } else {
+-    pass.DrawIndexed(data.indexCount, data.instanceCount);
++  const auto draw = [&] {
++    if (data.indexCount == 0) {
++      pass.Draw(data.vtxCount, data.instanceCount);
++    } else {
++      pass.DrawIndexed(data.indexCount, data.instanceCount);
++    }
++  };
++  draw();
++  if (data.prepassPipeline != 0) {
++    // The shading pass: same bindings, its own pipeline.
++    if (!gfx::bind_pipeline(data.pipeline, pass)) {
++      return;
++    }
++    pass.SetImmediates(0, &immediates, sizeof(immediates));
++    draw();
+   }
+ }
+ 
+diff --git a/lib/gx/pipeline.hpp b/lib/gx/pipeline.hpp
+index b679362..10b8766 100644
+--- a/lib/gx/pipeline.hpp
++++ b/lib/gx/pipeline.hpp
+@@ -15,9 +15,26 @@ struct DrawData {
+   uint32_t instanceCount;
+   GXBindGroups bindGroups;
+   uint32_t dstAlpha;
++  // Set for an alpha-tested draw drawn in two passes (AlphaPrepass): this
++  // pipeline lays down the depth first, then `pipeline` shades. 0 otherwise.
++  gfx::PipelineRef prepassPipeline;
+ };
+ 
+-constexpr uint32_t GXPipelineConfigVersion = 14; // 14: ShaderConfig::stereo
++// An opaque alpha-tested draw that writes depth (foliage, grass, fences) is
++// drawn in two passes. A discard in a shader that also writes depth makes
++// tile GPUs such as the Quest 1's Adreno 540 test depth only after the full
++// shader has run, so every overlapping layer of a grass patch was shaded.
++// The Depth pass runs a shader that keeps only the alpha compare and writes
++// depth alone; the Shade pass runs the full shader with depth writes off
++// and LEQUAL, so the depth test can run before the shader and only the
++// front-most layer of each pixel is shaded. The result is the same image.
++enum class AlphaPrepass : uint8_t {
++  None = 0,
++  Depth = 1,
++  Shade = 2,
++};
++
++constexpr uint32_t GXPipelineConfigVersion = 15; // 15: alphaPrepass, ShaderConfig::depthPrepass
+ struct PipelineConfig {
+   uint32_t version = GXPipelineConfigVersion;
+   uint32_t msaaSamples = 1; // deprecated
+@@ -32,6 +49,8 @@ struct PipelineConfig {
+   uint32_t polygonOffsetScaleBits;
+   uint32_t polygonOffsetClampBits;
+   bool depthCompare, depthUpdate, alphaUpdate, colorUpdate;
++  AlphaPrepass alphaPrepass = AlphaPrepass::None;
++  std::array<uint8_t, 3> pad{};
+ };
+ static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+ 
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 9e53752..43a2dd2 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -541,6 +541,30 @@ AlphaCompareExpr alpha_compare(GXCompare comp, u8 ref) {
+   }
+ }
+ 
++// The condition under which the alpha compare discards a fragment; constant
++// 1 or 0 when it always or never does.
++AlphaCompareExpr alpha_compare_discard(const AlphaCompare& ac) {
++  const auto comp0 = alpha_compare(ac.comp0, ac.ref0);
++  const auto comp1 = alpha_compare(ac.comp1, ac.ref1);
++  AlphaCompareExpr pass;
++  switch (ac.op) {
++    DEFAULT_FATAL("invalid alpha compare op {}", underlying(ac.op));
++  case GX_AOP_AND:
++    pass = alpha_compare_and(comp0, comp1);
++    break;
++  case GX_AOP_OR:
++    pass = alpha_compare_or(comp0, comp1);
++    break;
++  case GX_AOP_XOR:
++    pass = alpha_compare_xor(comp0, comp1);
++    break;
++  case GX_AOP_XNOR:
++    pass = alpha_compare_xnor(comp0, comp1);
++    break;
++  }
++  return alpha_compare_not(pass);
++}
++
+ std::string_view tev_scale(GXTevScale scale) {
+   switch (scale) {
+     DEFAULT_FATAL("invalid tev scale {}", underlying(scale));
+@@ -1646,25 +1670,7 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+     fragmentFn += "\n    prev.a = tev_overflow_f32(prev.a);";
+   }
+   if (config.alphaCompare) {
+-    const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
+-    const auto comp1 = alpha_compare(config.alphaCompare.comp1, config.alphaCompare.ref1);
+-    AlphaCompareExpr pass;
+-    switch (config.alphaCompare.op) {
+-      DEFAULT_FATAL("invalid alpha compare op {}", underlying(config.alphaCompare.op));
+-    case GX_AOP_AND:
+-      pass = alpha_compare_and(comp0, comp1);
+-      break;
+-    case GX_AOP_OR:
+-      pass = alpha_compare_or(comp0, comp1);
+-      break;
+-    case GX_AOP_XOR:
+-      pass = alpha_compare_xor(comp0, comp1);
+-      break;
+-    case GX_AOP_XNOR:
+-      pass = alpha_compare_xnor(comp0, comp1);
+-      break;
+-    }
+-    const auto discard = alpha_compare_not(pass);
++    const auto discard = alpha_compare_discard(config.alphaCompare);
+     if (discard.constant == 1) {
+       fragmentFn += "\n    // Alpha compare\n    discard;";
+     } else if (discard.constant != 0) {
+@@ -1678,9 +1684,16 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
+   }
+ 
++  // Depth prepass of an alpha-tested draw (pipeline.hpp, AlphaPrepass): only
++  // the alpha compare matters, so nothing after it reads the colour and the
++  // compiler drops the colour math. prev.a stays an input so the alpha math
++  // and the buffer-length check below stay in the shader.
++  const bool depthPrepass = config.depthPrepass;
++
+   std::string fragmentOutput;
+   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
+-  std::string fragmentReturn = "\n    return prev;"s;
++  std::string fragmentReturn =
++      depthPrepass ? "\n    return vec4f(0.0, 0.0, 0.0, prev.a);"s : "\n    return prev;"s;
+   if (normalAttachment != UINT32_MAX) {
+     fragmentOutput = fmt::format(
+         "\nstruct FragmentOutput {{\n"
+@@ -1690,7 +1703,10 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+         normalAttachment);
+     fragmentOutputType = "FragmentOutput"sv;
+     fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;";
+-    if (useNormalTarget) {
++    if (depthPrepass) {
++      fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = vec4f(0.0, 0.0, 0.0, prev.a);"
++                       "\n    out.normal = vec4f(0.0);";
++    } else if (useNormalTarget) {
+       fragmentReturn +=
+           "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+           "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
+@@ -1701,6 +1717,12 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
+     fragmentReturn += "\n    return out;";
+   }
+ 
++  // An alpha-tested draw may be drawn twice, a depth prepass and then the
++  // shading pass testing against that depth (pipeline.hpp, AlphaPrepass).
++  // The two shaders are different programs, so the position is declared
++  // invariant for the depths to match exactly.
++  const std::string_view positionInvariant = alpha_compare_varies(config.alphaCompare) ? " @invariant"sv : ""sv;
++
+   const auto shaderSource =
+       fmt::format(R"""(
+ fn bswap32(v: u32, le: bool) -> u32 {{
+@@ -2061,11 +2083,11 @@ override abuf_words: u32;
+ var<uniform> ubuf: Uniform;{1}
+ 
+ struct VertexOutput {{
+-    @builtin(position) pos: vec4f,{2}
++    @builtin(position){12} pos: vec4f,{2}
+ }};
+ 
+ struct FragmentInput {{
+-    @builtin(position) pos: vec4f,{2}
++    @builtin(position){12} pos: vec4f,{2}
+ }};
+ 
+ @vertex
+@@ -2100,7 +2122,8 @@ fn fs_main(in: FragmentInput) -> {10} {{{6}{5}
+ }}
+ )""",
+                   uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn, fragmentFnPre,
+-                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn);
++                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn,
++                  positionInvariant);
+   if (EnableDebugPrints) {
+     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
+   }
+@@ -2108,6 +2131,10 @@ fn fs_main(in: FragmentInput) -> {10} {{{6}{5}
+   return shaderSource;
+ }
+ 
++bool alpha_compare_varies(const AlphaCompare& alphaCompare) noexcept {
++  return alphaCompare && alpha_compare_discard(alphaCompare).constant == -1;
++}
++
+ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout) noexcept {
+   ZoneScoped;
+   uint32_t normalAttachment = UINT32_MAX;
