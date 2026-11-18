@@ -921,6 +921,9 @@ int game_main(int argc, char* argv[]) {
             static_cast<uint16_t>(std::clamp(dusk::getSettings().game.textureFiltering.getValue(), 1, 16));
         auroraInfo = aurora_initialize(argc, argv, &config);
     }
+#ifdef AURORA_HAS_SET_ALPHA_PREPASS
+    aurora_set_alpha_prepass(dusk::getSettings().game.cutoutTwoPass.getValue());
+#endif
 
     dusk::presentation::update_frame_rate_preference();
 

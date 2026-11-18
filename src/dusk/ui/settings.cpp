@@ -871,6 +871,35 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
 #endif
                     " 16x by default.");
             });
+        leftPane.register_control(
+            leftPane.add_select_button({
+                .key = "Cut-out Grass",
+                .getValue =
+                    [] { return Rml::String(getSettings().game.cutoutTwoPass.getValue() ? "Two-pass" : "Normal"); },
+                .isModified =
+                    [] {
+                        return getSettings().game.cutoutTwoPass.getValue() !=
+                               getSettings().game.cutoutTwoPass.getDefaultValue();
+                    },
+            }),
+            rightPane, [](Pane& pane) {
+                for (const bool choice : {false, true}) {
+                    pane.add_button({
+                            .text = choice ? "Two-pass" : "Normal",
+                            .isSelected = [choice] { return getSettings().game.cutoutTwoPass.getValue() == choice; },
+                        })
+                        .on_pressed([choice] {
+                            mDoAud_seStartMenu(kSoundItemChange);
+                            getSettings().game.cutoutTwoPass.setValue(choice);
+                            config::save();
+                        });
+                }
+                pane.add_rml(
+                    "<br/>How cut-out surfaces such as grass, leaves and fences are drawn. "
+                    "Two-pass first finds the front-most surface of each pixel, then colours only that one, "
+                    "so layers hidden behind it cost nothing to shade. Normal colours every layer. "
+                    "Both look the same. Applies immediately. Two-pass by default.");
+            });
         graphics_tuner_control(*this, leftPane, rightPane,
             GraphicsTunerProps{
                 .option = GraphicsOption::Resampler,

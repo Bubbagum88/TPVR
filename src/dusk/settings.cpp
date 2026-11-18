@@ -84,6 +84,7 @@ UserSettings g_userSettings = {
         .internalResolutionScale {"game.internalResolutionScale", kDefaultInternalResolutionScale},
         .shadowResolutionMultiplier {"game.shadowResolutionMultiplier", 1},
         .textureFiltering {"game.textureFiltering", 16},
+        .cutoutTwoPass {"game.cutoutTwoPass", true},
         .resampler {"game.resampler", Resampler::Bilinear},
         .enableMapBackground {"game.enableMapBackground", true},
         .disableCutscenePillarboxing {"game.disableCutscenePillarboxing", false},
@@ -426,6 +427,11 @@ void registerSettings() {
     Register(g_userSettings.game.textureFiltering, [](const int& value, const int&) {
 #ifdef AURORA_HAS_SET_MAX_TEXTURE_ANISOTROPY
         aurora_set_max_texture_anisotropy(static_cast<uint16_t>(std::clamp(value, 1, 16)));
+#endif
+    });
+    Register(g_userSettings.game.cutoutTwoPass, [](const bool& value, const bool&) {
+#ifdef AURORA_HAS_SET_ALPHA_PREPASS
+        aurora_set_alpha_prepass(value);
 #endif
     });
     Register(g_userSettings.game.enableMapBackground);

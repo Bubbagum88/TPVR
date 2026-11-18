@@ -287,6 +287,9 @@ struct UserSettings {
         ConfigVar<int> shadowResolutionMultiplier;
         // Most anisotropic filtering a texture gets: 1 (off), 2, 4, 8 or 16.
         ConfigVar<int> textureFiltering;
+        // Cut-out (alpha-tested) geometry such as grass drawn in two passes:
+        // depth first, then shading only the front-most surface.
+        ConfigVar<bool> cutoutTwoPass;
         ConfigVar<Resampler> resampler;
         ConfigVar<bool> enableMapBackground;
         ConfigVar<bool> disableCutscenePillarboxing;
