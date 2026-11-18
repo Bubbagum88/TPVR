@@ -7,6 +7,7 @@
 #include "m_Do/m_Do_main.h"
 #include <dolphin/vi.h>
 #include <cstring>
+#include <algorithm>  // std::clamp: texture filtering setting
 #if defined(TARGET_PC) && defined(_WIN32)
 #include <windows.h>  // RenderDoc capture-trigger hooks below (GetModuleHandleA/GetAsyncKeyState/etc.)
 #endif
@@ -916,6 +917,8 @@ int game_main(int argc, char* argv[]) {
         config.pauseOnFocusLost = dusk::getSettings().game.pauseOnFocusLost;
         config.imGuiInitCallback = &aurora_imgui_init_callback;
         config.allowTextureDumps = false;
+        config.maxTextureAnisotropy =
+            static_cast<uint16_t>(std::clamp(dusk::getSettings().game.textureFiltering.getValue(), 1, 16));
         auroraInfo = aurora_initialize(argc, argv, &config);
     }
 

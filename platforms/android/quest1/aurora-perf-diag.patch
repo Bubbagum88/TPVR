@@ -238,16 +238,17 @@ index bcaba60..f77bd75 100644
      ProcessResult result{};
 diff --git a/lib/gx/perf_diag.cpp b/lib/gx/perf_diag.cpp
 new file mode 100644
-index 0000000..566b80e
+index 0000000..67cfc9d
 --- /dev/null
 +++ b/lib/gx/perf_diag.cpp
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,251 @@
 +#include "perf_diag.hpp"
 +
 +#include "../gfx/recording.hpp"
 +#include "../internal.hpp"
 +#include "gx.hpp"
 +#include "pipeline.hpp"
++#include "../gfx/texture.hpp"
 +
 +#include <absl/container/flat_hash_map.h>
 +#include <absl/container/flat_hash_set.h>
@@ -302,6 +303,8 @@ index 0000000..566b80e
 +  uint64_t textures = 0;
 +  uint64_t texels = 0;
 +  uint64_t copyReads = 0;
++  uint64_t aniso2 = 0; // textures the game asked to filter at GX_ANISO_2
++  uint64_t aniso4 = 0; // ... at GX_ANISO_4
 +  absl::flat_hash_set<uint64_t> pipelines;
 +};
 +
@@ -316,6 +319,11 @@ index 0000000..566b80e
 +uint32_t sFrames = 0;
 +uint64_t sFrameCounter = 0;
 +std::atomic<uint64_t> sFifoNs{0};
++
++std::string filtering_name() {
++  const uint16_t aniso = gfx::max_texture_anisotropy();
++  return aniso <= 1 ? std::string("off") : fmt::format("{}x", aniso);
++}
 +uint64_t sVertBytes = 0;
 +uint64_t sUniformBytes = 0;
 +uint64_t sIndexBytes = 0;
@@ -340,10 +348,10 @@ index 0000000..566b80e
 +double per_frame(uint64_t v) noexcept { return static_cast<double>(v) / static_cast<double>(sFrames); }
 +
 +void log_summary() noexcept {
-+  Log.info("[perfdiag] {} frames: engine per frame: GX FIFO processing {:.2f} ms | draws {:.0f} (+{:.0f} merged) | "
++  Log.info("[perfdiag] {} frames, anisotropic filtering {}: engine per frame: GX FIFO processing {:.2f} ms | draws {:.0f} (+{:.0f} merged) | "
 +           "render passes {:.1f} | uploads: verts {:.0f} KB, uniforms {:.0f} KB, indices {:.0f} KB, storage {:.0f} KB, "
 +           "textures {:.0f} KB",
-+           sFrames, per_frame(sFifoNs.exchange(0, std::memory_order_relaxed)) * 1e-6, per_frame(sDrawCalls),
++           sFrames, filtering_name(), per_frame(sFifoNs.exchange(0, std::memory_order_relaxed)) * 1e-6, per_frame(sDrawCalls),
 +           per_frame(sMergedDrawCalls), per_frame(sRenderPasses), per_frame(sVertBytes) / 1024.0,
 +           per_frame(sUniformBytes) / 1024.0, per_frame(sIndexBytes) / 1024.0, per_frame(sStorageBytes) / 1024.0,
 +           per_frame(sTextureUploadBytes) / 1024.0);
@@ -361,13 +369,15 @@ index 0000000..566b80e
 +    Log.info("[perfdiag] list {} @{}x{}: draws {:.1f} (+{:.1f} merged), verts {:.0f}, indices {:.0f} | "
 +             "blend {:.1f}, alpha test {:.1f}, no depth write {:.1f}, no depth test {:.1f}, fog {:.1f}, "
 +             "screen-space {:.1f}, lines/points {:.1f}, stereo {:.1f}, lit {:.1f} | TEV stages avg {:.1f} max {}, "
-+             "indirect {:.1f} | textures {:.1f}, texels {:.0f}K, screen-copy reads {:.1f} | pipelines {}",
++             "indirect {:.1f} | textures {:.1f} (game asks aniso 2x {:.1f}, 4x {:.1f}), texels {:.0f}K, "
++             "screen-copy reads {:.1f} | pipelines {}",
 +             key->name, key->width, key->height, draws, per_frame(s->mergedDraws), per_frame(s->verts),
 +             per_frame(s->indices), per_frame(s->blend), per_frame(s->alphaTest), per_frame(s->noDepthWrite),
 +             per_frame(s->noDepthTest), per_frame(s->fog), per_frame(s->ortho), per_frame(s->lines),
 +             per_frame(s->stereo), per_frame(s->lit),
 +             s->draws != 0 ? static_cast<double>(s->tevStages) / static_cast<double>(s->draws) : 0.0, s->tevMax,
-+             per_frame(s->indDraws), per_frame(s->textures), per_frame(s->texels) / 1000.0,
++             per_frame(s->indDraws), per_frame(s->textures), per_frame(s->aniso2), per_frame(s->aniso4),
++             per_frame(s->texels) / 1000.0,
 +             per_frame(s->copyReads), s->pipelines.size());
 +  }
 +}
@@ -421,6 +431,8 @@ index 0000000..566b80e
 +    }
 +    const auto& tex = gx::g_gxState.loadedTextures[i];
 +    ++s.textures;
++    s.aniso2 += tex.max_aniso() == GX_ANISO_2 ? 1 : 0;
++    s.aniso4 += tex.max_aniso() == GX_ANISO_4 ? 1 : 0;
 +    s.texels += static_cast<uint64_t>(tex.width()) * tex.height();
 +    if (tex.data != nullptr && gx::g_gxState.copyTextures.contains(tex.data)) {
 +      ++s.copyReads;
@@ -440,6 +452,7 @@ index 0000000..566b80e
 +
 +void add_fifo_ns(uint64_t ns) noexcept { sFifoNs.fetch_add(ns, std::memory_order_relaxed); }
 +
++
 +void frame_begin() noexcept {
 +  sSplitFrame = sFrameCounter % WindowFrames == SplitFrameInWindow;
 +  sSplitsThisFrame = 0;
@@ -454,8 +467,9 @@ index 0000000..566b80e
 +               uint64_t textureUploadBytes, uint32_t drawCalls, uint32_t mergedDrawCalls,
 +               uint32_t renderPasses) noexcept {
 +  if (sSplitFrame) {
-+    Log.info("[perfdiag] split frame {}: eye pass split {} times (GPU times: next [gpuprof-split] line)",
-+             sFrameCounter, sSplitsThisFrame);
++    Log.info("[perfdiag] split frame {}, anisotropic filtering {}: eye pass split {} times (GPU times: next "
++             "[gpuprof-split] line)",
++             sFrameCounter, filtering_name(), sSplitsThisFrame);
 +  }
 +  sSplitFrame = false;
 +  sLastStats = nullptr;
@@ -481,10 +495,10 @@ index 0000000..566b80e
 +} // namespace aurora::perf_diag
 diff --git a/lib/gx/perf_diag.hpp b/lib/gx/perf_diag.hpp
 new file mode 100644
-index 0000000..883e2af
+index 0000000..b26821f
 --- /dev/null
 +++ b/lib/gx/perf_diag.hpp
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,42 @@
 +#pragma once
 +
 +// TEMP DIAGNOSTIC (TPVR Quest 1 rendering cost, 2026-11-16). Remove once the
@@ -499,6 +513,9 @@ index 0000000..883e2af
 +// - engine counters: GX FIFO processing time and bytes uploaded per frame;
 +// - on one frame in 120, the headset eye pass is split at each list so the
 +//   GPU timers (gpu_prof) time each list on its own ("[gpuprof-split]").
++// Each summary names the texture filtering in use (aurora_set_max_texture_
++// anisotropy), and each list counts the textures the game asks to filter
++// anisotropically.
 +
 +#include <cstdint>
 +

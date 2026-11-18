@@ -285,6 +285,8 @@ struct UserSettings {
         ConfigVar<FrameInterpMode> enableFrameInterpolation;
         ConfigVar<int> internalResolutionScale;
         ConfigVar<int> shadowResolutionMultiplier;
+        // Most anisotropic filtering a texture gets: 1 (off), 2, 4, 8 or 16.
+        ConfigVar<int> textureFiltering;
         ConfigVar<Resampler> resampler;
         ConfigVar<bool> enableMapBackground;
         ConfigVar<bool> disableCutscenePillarboxing;

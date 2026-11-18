@@ -1,0 +1,107 @@
+diff --git a/include/aurora/aurora.h b/include/aurora/aurora.h
+index 56c7aae..50097d3 100644
+--- a/include/aurora/aurora.h
++++ b/include/aurora/aurora.h
+@@ -136,6 +136,11 @@ void aurora_set_log_level(AuroraLogLevel level);
+ void aurora_set_pause_on_focus_lost(bool value);
+ void aurora_set_background_input(bool value);
+ void aurora_set_resampler(AuroraSampler sampler);
++/** Sets the most anisotropic filtering any texture gets (1 = off, up to 16), in place of
++ * AuroraConfig::maxTextureAnisotropy. Applies from the next draw. Added by TPVR's Quest 1
++ * patch, which defines AURORA_HAS_SET_MAX_TEXTURE_ANISOTROPY so callers build without it. */
++#define AURORA_HAS_SET_MAX_TEXTURE_ANISOTROPY 1
++void aurora_set_max_texture_anisotropy(uint16_t value);
+ /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
+ void aurora_set_timescale(float scale);
+ 
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 5063eb1..bc450f0 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -3,6 +3,7 @@
+ 
+ #ifdef AURORA_ENABLE_GX
+ #include "gfx/resources.hpp"
++#include "gfx/texture.hpp"
+ #include "gfx/frame.hpp"
+ #include "gfx/recording.hpp"
+ #include "gfx/encoding.hpp"
+@@ -475,6 +476,7 @@ const AuroraBackend* aurora_get_available_backends(size_t* count) {
+ }
+ void aurora_set_log_level(AuroraLogLevel level) { aurora::g_config.logLevel = level; }
+ void aurora_set_pause_on_focus_lost(bool value) { aurora::g_config.pauseOnFocusLost = value; }
++void aurora_set_max_texture_anisotropy(uint16_t value) { aurora::gfx::set_max_texture_anisotropy(value); }
+ void aurora_set_background_input(bool value) {
+   aurora::g_config.allowJoystickBackgroundEvents = value;
+   aurora::window::set_background_input(value);
+diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
+index 029a3d0..4e7ee7f 100644
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -7,8 +7,10 @@
+ #include "texture.hpp"
+ #include "texture_convert.hpp"
+ #include "../gx/gx_fmt.hpp"
++#include "../gx/texture.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
+ #include <utility>
+@@ -83,16 +85,20 @@ std::pair<wgpu::FilterMode, wgpu::MipmapFilterMode> wgpu_filter_mode(GXTexFilter
+   }
+ }
+ 
++// Set by set_max_texture_anisotropy(); 0 until then (use the startup config).
++std::atomic<u16> s_maxAnisotropy{0};
++
+ u16 wgpu_aniso(GXAnisotropy aniso) {
++  const u16 maxAniso = max_texture_anisotropy();
+   switch (aniso) {
+     DEFAULT_FATAL("invalid aniso {}", static_cast<int>(aniso));
+   case GX_ANISO_1:
+   case GX_MAX_ANISOTROPY:
+     return 1;
+   case GX_ANISO_2:
+-    return std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy / 2, 1);
++    return std::max<u16>(maxAniso / 2, 1);
+   case GX_ANISO_4:
+-    return std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy, 1);
++    return std::max<u16>(maxAniso, 1);
+   }
+ }
+ } // namespace
+@@ -303,6 +309,17 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
+   }
+ }
+ 
++void set_max_texture_anisotropy(uint16_t value) noexcept {
++  s_maxAnisotropy.store(std::clamp<u16>(value, 1, 16), std::memory_order_relaxed);
++  // Cached bind groups hold samplers made with the old value.
++  gx::texture::invalidate_bindings();
++}
++
++uint16_t max_texture_anisotropy() noexcept {
++  const u16 value = s_maxAnisotropy.load(std::memory_order_relaxed);
++  return value != 0 ? value : webgpu::g_graphicsConfig.textureAnisotropy;
++}
++
+ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
+   auto [minFilter, mipFilter] = wgpu_filter_mode(texObj.min_filter());
+   auto [magFilter, _] = wgpu_filter_mode(texObj.mag_filter());
+diff --git a/lib/gfx/texture.hpp b/lib/gfx/texture.hpp
+index 600a430..5c07059 100644
+--- a/lib/gfx/texture.hpp
++++ b/lib/gfx/texture.hpp
+@@ -143,4 +143,10 @@ struct TextureBind {
+   [[nodiscard]] wgpu::SamplerDescriptor get_descriptor() const noexcept;
+   operator bool() const noexcept { return ref.operator bool(); }
+ };
++
++// The most anisotropic filtering any texture gets: 1 (off) to 16. Starts at
++// AuroraConfig::maxTextureAnisotropy. Setting it rebuilds the texture bindings,
++// so the next draws use it. Any thread.
++void set_max_texture_anisotropy(uint16_t value) noexcept;
++uint16_t max_texture_anisotropy() noexcept;
+ } // namespace aurora::gfx

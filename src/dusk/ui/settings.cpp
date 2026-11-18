@@ -94,6 +94,24 @@ constexpr std::array kLetterboxModes = {
     "Only During Cutscenes",
 };
 
+// Texture Filtering choices: the setting's value (most anisotropic filtering) and its label.
+constexpr std::array<std::pair<int, const char*>, 5> kTextureFilteringChoices = {{
+    {1, "Off"},
+    {2, "2x"},
+    {4, "4x"},
+    {8, "8x"},
+    {16, "16x"},
+}};
+
+const char* texture_filtering_label(int value) {
+    for (const auto& [choice, label] : kTextureFilteringChoices) {
+        if (choice == value) {
+            return label;
+        }
+    }
+    return "Custom";
+}
+
 constexpr std::array kVrLightingModeLabels = {
     "Original",
     "Sun/Moon",
@@ -818,6 +836,40 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                 .option = GraphicsOption::ShadowResolution,
                 .title = "Shadow Resolution",
                 .helpText = kShadowResolutionHelpText,
+            });
+        leftPane.register_control(
+            leftPane.add_select_button({
+                .key = "Texture Filtering",
+                .getValue =
+                    [] { return Rml::String(texture_filtering_label(getSettings().game.textureFiltering.getValue())); },
+                .isModified =
+                    [] {
+                        return getSettings().game.textureFiltering.getValue() !=
+                               getSettings().game.textureFiltering.getDefaultValue();
+                    },
+            }),
+            rightPane, [](Pane& pane) {
+                for (const auto& [choice, label] : kTextureFilteringChoices) {
+                    pane.add_button({
+                            .text = label,
+                            .isSelected = [choice] { return getSettings().game.textureFiltering.getValue() == choice; },
+                        })
+                        .on_pressed([choice] {
+                            mDoAud_seStartMenu(kSoundItemChange);
+                            getSettings().game.textureFiltering.setValue(choice);
+                            config::save();
+                        });
+                }
+                pane.add_rml(
+                    "<br/>Anisotropic filtering keeps textures sharp on surfaces seen at a low angle, "
+                    "such as ground stretching away from you. Higher values look sharper in the distance "
+                    "but cost the GPU more, mostly on large open ground."
+#ifdef AURORA_HAS_SET_MAX_TEXTURE_ANISOTROPY
+                    " Applies immediately."
+#else
+                    " Takes effect the next time the game starts."
+#endif
+                    " 16x by default.");
             });
         graphics_tuner_control(*this, leftPane, rightPane,
             GraphicsTunerProps{

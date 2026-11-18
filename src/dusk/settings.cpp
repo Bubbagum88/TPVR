@@ -6,6 +6,7 @@
 #include "dusk/ui/ui.hpp"
 
 #include <aurora/aurora.h>
+#include <algorithm>
 #include <dolphin/vi.h>
 
 namespace dusk {
@@ -82,6 +83,7 @@ UserSettings g_userSettings = {
         .enableFrameInterpolation {"game.enableFrameInterpolation", FrameInterpMode::Off},
         .internalResolutionScale {"game.internalResolutionScale", kDefaultInternalResolutionScale},
         .shadowResolutionMultiplier {"game.shadowResolutionMultiplier", 1},
+        .textureFiltering {"game.textureFiltering", 16},
         .resampler {"game.resampler", Resampler::Bilinear},
         .enableMapBackground {"game.enableMapBackground", true},
         .disableCutscenePillarboxing {"game.disableCutscenePillarboxing", false},
@@ -421,6 +423,11 @@ void registerSettings() {
     Register(g_userSettings.game.resampler,
         [](const Resampler& value, const Resampler&) { applyResampler(value); });
     Register(g_userSettings.game.shadowResolutionMultiplier);
+    Register(g_userSettings.game.textureFiltering, [](const int& value, const int&) {
+#ifdef AURORA_HAS_SET_MAX_TEXTURE_ANISOTROPY
+        aurora_set_max_texture_anisotropy(static_cast<uint16_t>(std::clamp(value, 1, 16)));
+#endif
+    });
     Register(g_userSettings.game.enableMapBackground);
     Register(g_userSettings.game.disableCutscenePillarboxing);
     Register(g_userSettings.game.disableLetterboxing);
