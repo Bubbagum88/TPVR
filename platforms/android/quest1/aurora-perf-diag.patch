@@ -238,10 +238,10 @@ index bcaba60..f77bd75 100644
      ProcessResult result{};
 diff --git a/lib/gx/perf_diag.cpp b/lib/gx/perf_diag.cpp
 new file mode 100644
-index 0000000..67cfc9d
+index 0000000..a5df7a2
 --- /dev/null
 +++ b/lib/gx/perf_diag.cpp
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,282 @@
 +#include "perf_diag.hpp"
 +
 +#include "../gfx/recording.hpp"
@@ -254,6 +254,7 @@ index 0000000..67cfc9d
 +#include <absl/container/flat_hash_set.h>
 +
 +#include <algorithm>
++#include <cstring>
 +#include <atomic>
 +#include <string>
 +#include <vector>
@@ -314,6 +315,7 @@ index 0000000..67cfc9d
 +Stats* sLastStats = nullptr; // target of on_merged_draw
 +bool sSplitFrame = false;
 +uint32_t sSplitsThisFrame = 0;
++uint32_t sDrawInGroup = 0; // draws so far in the innermost list (per-draw split labels)
 +
 +// Frame-boundary state.
 +uint32_t sFrames = 0;
@@ -388,6 +390,7 @@ index 0000000..67cfc9d
 +    name = "(unnamed)";
 +  }
 +  sGroupStack.push_back(name);
++  sDrawInGroup = 0;
 +  if (sGroupStack.size() == 1) {
 +    split(name);
 +  }
@@ -439,6 +442,34 @@ index 0000000..67cfc9d
 +    }
 +  }
 +  s.pipelines.insert(pipeline);
++
++  // On the split frame, each draw of the terrain lists (names containing
++  // "BG") gets its own pass, so the GPU timers time it alone. The label says
++  // what the draw is: k = alpha test (discard), b = blend, z = depth write,
++  // f = fog, l = lit; tev stages; textures and the first one's size; cull
++  // mode (0 none, 1 front, 2 back, 3 all).
++  ++sDrawInGroup;
++  if (sSplitFrame && std::strstr(current_group(), "BG") != nullptr) {
++    uint32_t texW = 0;
++    uint32_t texH = 0;
++    uint32_t texCount = 0;
++    for (uint32_t i = 0; i < gx::MaxTextures; ++i) {
++      if (info.sampledTextures.test(i)) {
++        if (texCount == 0) {
++          texW = gx::g_gxState.loadedTextures[i].width();
++          texH = gx::g_gxState.loadedTextures[i].height();
++        }
++        ++texCount;
++      }
++    }
++    const std::string label =
++        fmt::format("{} #{} v{} i{} {}{}{}{}{} tev{} tex{} {}x{} cull{}", current_group(), sDrawInGroup,
++                    static_cast<uint64_t>(vtxCount) * instanceCount, indexCount, shader.alphaCompare ? "k" : "-",
++                    config.blendMode != GX_BM_NONE ? "b" : "-", config.depthUpdate ? "z" : "-",
++                    info.usesFog ? "f" : "-", info.lightingEnabled ? "l" : "-", shader.tevStageCount, texCount, texW,
++                    texH, static_cast<int>(config.cullMode));
++    split(label.c_str());
++  }
 +}
 +
 +void on_merged_draw(uint32_t vtxCount, uint32_t indexCount) noexcept {
