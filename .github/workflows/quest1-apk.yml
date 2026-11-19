@@ -48,6 +48,7 @@ jobs:
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-texture-filtering.patch
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-perf-diag.patch
           git -C extern/aurora apply ../../platforms/android/quest1/aurora-alpha-prepass.patch
+          git -C extern/aurora apply ../../platforms/android/quest1/aurora-ui-pass-diag.patch
 
       - name: Install dependencies
         run: |

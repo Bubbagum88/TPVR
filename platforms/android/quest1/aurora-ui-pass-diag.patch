@@ -1,0 +1,113 @@
+diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
+index f0f16b4..205bdd7 100644
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -291,6 +291,40 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+     };
+     depthStencilAttachmentPtr = &depthStencilAttachment;
+   }
++  // TEMP DIAGNOSTIC (TPVR Quest 1 rendering cost, 2026-11-19): how each large
++  // pass (the eye pass) uses tile memory: every attachment's format and
++  // load/store ops, MSAA, and whether depth is stored or read back. Quest 1
++  // has 1 MB of tile memory, so bytes per pixel decide the bin count, and
++  // stores cost a full-size write to RAM. Logged once per distinct setup.
++  if (passInfo.colorAttachments[SceneColorAttachmentIndex].size.width >= 1000) {
++    static std::vector<std::string> s_loggedPassSetups;
++    std::string setup = fmt::format("[passdiag] '{}' {}x{} msaa {} | colour targets {}:", passInfo.label,
++                                    passInfo.colorAttachments[SceneColorAttachmentIndex].size.width,
++                                    passInfo.colorAttachments[SceneColorAttachmentIndex].size.height,
++                                    passInfo.msaaSamples, passInfo.colorAttachmentCount);
++    for (uint32_t i = 0; i < passInfo.colorAttachmentCount; ++i) {
++      const auto& a = attachments[i];
++      setup += fmt::format(" [{} semantic {} format {} load {} store {} resolve {}]", i,
++                           static_cast<int>(passInfo.colorAttachments[i].semantic),
++                           static_cast<int>(passInfo.colorAttachments[i].format), static_cast<int>(a.loadOp),
++                           static_cast<int>(a.storeOp), a.resolveTarget ? 1 : 0);
++    }
++    if (depthStencilAttachmentPtr != nullptr) {
++      setup += fmt::format(" | depth format {} load {} store {} stencil load {} store {} | depth snapshot {}",
++                           static_cast<int>(passInfo.depthStencilFormat),
++                           static_cast<int>(depthStencilAttachment.depthLoadOp),
++                           static_cast<int>(depthStencilAttachment.depthStoreOp),
++                           static_cast<int>(depthStencilAttachment.stencilLoadOp),
++                           static_cast<int>(depthStencilAttachment.stencilStoreOp),
++                           passInfo.captureDepthSnapshot ? 1 : 0);
++    } else {
++      setup += " | no depth";
++    }
++    if (std::find(s_loggedPassSetups.begin(), s_loggedPassSetups.end(), setup) == s_loggedPassSetups.end()) {
++      s_loggedPassSetups.push_back(setup);
++      Log.info("{}", setup);
++    }
++  }
+   const auto& sceneSize = passInfo.colorAttachments[SceneColorAttachmentIndex].size;
+   const auto label = passInfo.label.empty()
+                          ? fmt::format("Render pass {}", passIndex)
+diff --git a/lib/rmlui.cpp b/lib/rmlui.cpp
+index c456642..7d85e79 100644
+--- a/lib/rmlui.cpp
++++ b/lib/rmlui.cpp
+@@ -469,6 +469,52 @@ void handle_event(SDL_Event& event) noexcept {
+   RmlSDL::InputEventHandler(g_context, window::get_sdl_window(), event);
+ }
+ 
++// TEMP DIAGNOSTIC (TPVR Quest 1 rendering cost, 2026-11-19): in gameplay the
++// RmlUi passes cost about 4 ms of GPU a frame, so something is drawn. Logs,
++// each time it changes, every shown document and its visible elements (tag,
++// id, classes, size, and whether it has a filter or backdrop filter).
++static void describe_visible(Rml::Element* element, std::string& out, int& budget, int depth) noexcept {
++  if (budget <= 0 || element == nullptr || !element->IsVisible()) {
++    return;
++  }
++  const auto size = element->GetBox().GetSize(Rml::BoxArea::Border);
++  if (size.x > 0.f && size.y > 0.f) {
++    --budget;
++    const bool hasFilter = element->GetProperty(Rml::PropertyId::Filter) != nullptr &&
++                           !element->GetProperty(Rml::PropertyId::Filter)->ToString().empty() &&
++                           element->GetProperty(Rml::PropertyId::Filter)->ToString() != "none";
++    const bool hasBackdrop = element->GetProperty(Rml::PropertyId::BackdropFilter) != nullptr &&
++                             !element->GetProperty(Rml::PropertyId::BackdropFilter)->ToString().empty() &&
++                             element->GetProperty(Rml::PropertyId::BackdropFilter)->ToString() != "none";
++    out += fmt::format(" {}{}{}{}{} {:.0f}x{:.0f}{}{};", std::string(static_cast<size_t>(depth), '>'),
++                       element->GetTagName(), element->GetId().empty() ? "" : "#", element->GetId(),
++                       element->GetClassNames().empty() ? "" : "." + element->GetClassNames(), size.x, size.y,
++                       hasFilter ? " filter" : "", hasBackdrop ? " backdrop" : "");
++  }
++  for (int i = 0; i < element->GetNumChildren(); ++i) {
++    describe_visible(element->GetChild(i), out, budget, depth + 1);
++  }
++}
++
++static void log_visible_documents(bool rendered) noexcept {
++  static std::string s_last;
++  std::string out = fmt::format("[uidiag] rendered {} | documents {}:", rendered ? 1 : 0,
++                                g_context->GetNumDocuments());
++  for (int i = 0; i < g_context->GetNumDocuments(); ++i) {
++    auto* doc = g_context->GetDocument(i);
++    if (doc == nullptr || !doc->IsVisible()) {
++      continue;
++    }
++    out += fmt::format(" || document '{}' '{}':", doc->GetSourceURL(), doc->GetTitle());
++    int budget = 40;
++    describe_visible(doc, out, budget, 0);
++  }
++  if (out != s_last) {
++    s_last = out;
++    Log.info("{}", out);
++  }
++}
++
+ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
+   if (g_context == nullptr) {
+     return {};
+@@ -494,7 +540,9 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
+   g_context->Render();
+   Backend::PresentFrame();
+ 
+-  if (!renderInterface->EndFrame()) {
++  const bool rendered = renderInterface->EndFrame();
++  log_visible_documents(rendered);
++  if (!rendered) {
+     // We didn't render anything
+     return {};
+   }

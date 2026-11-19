@@ -898,7 +898,7 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                     "<br/>How cut-out surfaces such as grass, leaves and fences are drawn. "
                     "Two-pass first finds the front-most surface of each pixel, then colours only that one, "
                     "so layers hidden behind it cost nothing to shade. Normal colours every layer. "
-                    "Both look the same. Applies immediately. Two-pass by default.");
+                    "Two-pass is experimental: it drew grass wrongly on the Quest 1 and was not faster. Applies immediately. Normal by default.");
             });
         graphics_tuner_control(*this, leftPane, rightPane,
             GraphicsTunerProps{

@@ -84,7 +84,7 @@ UserSettings g_userSettings = {
         .internalResolutionScale {"game.internalResolutionScale", kDefaultInternalResolutionScale},
         .shadowResolutionMultiplier {"game.shadowResolutionMultiplier", 1},
         .textureFiltering {"game.textureFiltering", 16},
-        .cutoutTwoPass {"game.cutoutTwoPass", true},
+        .cutoutTwoPass {"game.cutoutTwoPass", false},
         .resampler {"game.resampler", Resampler::Bilinear},
         .enableMapBackground {"game.enableMapBackground", true},
         .disableCutscenePillarboxing {"game.disableCutscenePillarboxing", false},
